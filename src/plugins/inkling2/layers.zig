@@ -38,8 +38,8 @@ pub const Conv = union(enum) {
 };
 
 /// A looped layer's message gates, stacked q, k, v, mlp: `down` `[4, rank, 2 hidden]`, `forget` and `message`
-/// `[4, hidden, rank]`, each in its stored dtype (the release's bf16 is read as half the bytes of an f32 copy).
-pub const Gates = struct { down: Array, forget: Array, message: Array };
+/// `[4, hidden, rank]` (or `[4, rank, hidden]` when `transposed` for coalesced GPU loads).
+pub const Gates = struct { down: Array, forget: Array, message: Array, transposed: bool = false };
 
 pub const Layer = struct {
     global: bool,
@@ -95,6 +95,13 @@ pub const Body = struct {
     /// Ones `[hidden]` and `[head_dim]` f32: the unweighted norms' weight.
     ones: Array,
     ones_head: Array,
+    /// Pre-allocated small constant parameter tensors (avoids ~336 host->device allocs per decode token).
+    c_eps: Array = .{},
+    c_mid_pr: Array = .{},
+    c_route_scale: Array = .{},
+    c_caps: Array = .{},
+    c_conv_scale: Array = .{},
+    c_attn_scale: Array = .{},
 };
 
 pub const projectRows = head_block.project;
@@ -122,8 +129,10 @@ fn messageGate(g: *Graph, w: *const Body, gates: *const Gates, i: c_int, hidden:
     const h = try g.astype(hidden, .float32);
     const both = try g.concat(&.{ try plainNorm(g, h, w.ones), try plainNorm(g, message, w.ones) }, 2);
     const st = try g.astype(try g.matmul(try g.astype(both, ops.dtype(gates.down)), try downs(g, gates, i, 1)), .float32);
-    const forget = try g.tanh(try g.linear(st, try g.astype(try stacked(g, gates.forget, i), .float32), null));
-    const gain = try g.tanh(try g.linear(st, try g.astype(try stacked(g, gates.message, i), .float32), null));
+    const f_w = try g.astype(try stacked(g, gates.forget, i), .float32);
+    const m_w = try g.astype(try stacked(g, gates.message, i), .float32);
+    const forget = try g.tanh(if (gates.transposed) try g.matmul(st, f_w) else try g.linear(st, f_w, null));
+    const gain = try g.tanh(if (gates.transposed) try g.matmul(st, m_w) else try g.linear(st, m_w, null));
     return g.add(try g.mul(try g.sub(try g.scalar(1, .float32), forget), h), try g.mul(gain, message));
 }
 
@@ -409,15 +418,17 @@ pub fn gather(g: *Graph, x: Array, bank: *const Bank, sel: Array, sorted: bool) 
         return e;
     };
     const out = try g.adopt(y);
-    return if (rows == dt) out else g.astype(out, dt);
+    // Keep bf16 when fp16 input was promoted for NVFP4/MXFP8 so callers apply global_scale in f32 before narrowing.
+    return if (rows == dt or (dt == .float16 and rows == .bfloat16)) out else g.astype(out, dt);
 }
 
 /// The dtype a gather reads its rows in. A GPU before Apple9 (M1 g13, M2 g14) has no bf16 ALU, and MLX's gather over
 /// bf16 rows runs at about half the speed of fp16 ones: an affine bank's bf16 rows go in as fp16 (exact over the
 /// stream's range) and the result rounds back. The release's NVFP4 and MXFP8 banks stay bf16: their codes times the
-/// block scales carry the per-expert multiplier's inverse, so raw outputs overflow fp16 (the answer was `!!`). An
-/// unknown generation (0) and a CPU stream keep the rows' own dtype.
+/// block scales carry the per-expert multiplier's inverse, so raw outputs overflow fp16 (the answer was `!!`).
+/// Likewise, when the model runs in fp16 on M1/M2, NVFP4/MXFP8 prefill gathers promote x to bf16 to avoid overflow.
 pub fn gatherRowsDtype(dt: ops.Dtype, mode: QuantMode, gpu: bool, gen: u32) ops.Dtype {
+    if (dt == .float16 and mode != .affine) return .bfloat16;
     return if (dt == .bfloat16 and mode == .affine and gpu and gen != 0 and gen < 15) .float16 else dt;
 }
 

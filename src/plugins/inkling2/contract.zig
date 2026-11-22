@@ -613,7 +613,7 @@ const Act = struct {
         var g = ops.Graph.init(self.rig.a, self.rig.stream());
         defer g.deinit();
         const x = self.args;
-        return self.rig.bytesOf(&.{try kernels.activation(&g, x[0], x[1], x[2], x[3], scaled(self.shape))});
+        return self.rig.bytesOf(&.{try kernels.activation(&g, x[0], x[1], x[2], x[3], scaled(self.shape), ops.dtype(x[0]))});
     }
 };
 
@@ -823,7 +823,7 @@ const Sum = struct {
         var g = ops.Graph.init(self.rig.a, self.rig.stream());
         defer g.deinit();
         const x = self.args;
-        const o = try kernels.pickSum(&g, x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7], x[8], PICKS, scaled(self.shape));
+        const o = try kernels.pickSum(&g, x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7], x[8], PICKS, scaled(self.shape), ops.dtype(x[0]));
         return self.rig.bytesOf(&o);
     }
 };

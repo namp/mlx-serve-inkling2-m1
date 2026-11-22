@@ -80,10 +80,20 @@ pub const Drafter = struct {
     rnn_bias: Array = .{},
     rnn_norm: Array = .{},
     fold: Array = .{},
+    /// Per-row f32 scales `[rank]` when `fold` is symmetric INT8; null when `fold` is half.
+    fold_scale: ?Array = null,
     fold_bias: Array = .{},
+    /// Cap on drafted tokens per round (0 = full cfg.block - 1).
+    max_steps: u32 = 0,
+
+    pub fn load(ctx: *const abi.LoadCtx, cfg: config.Draft, hidden: u32, head: *const Linear, s: mlx.mlx_stream) !?*Drafter {
+        return loadOpt(ctx, cfg, hidden, head, s, false);
+    }
 
     /// The drafter beside the pack, its Markov head folded over the trunk's `head`; null when the pack ships none.
-    pub fn load(ctx: *const abi.LoadCtx, cfg: config.Draft, hidden: u32, head: *const Linear, s: mlx.mlx_stream) !?*Drafter {
+    /// When `use_f16` (M1/M2), casts weights to FP16 and optionally quantizes the 3 drafter transformer layers' dense
+    /// projections to 4-bit (or 8-bit via INKLING_DRAFT_BITS) affine for 3.5x less drafter memory traffic.
+    pub fn loadOpt(ctx: *const abi.LoadCtx, cfg: config.Draft, hidden: u32, head: *const Linear, s: mlx.mlx_stream, use_f16: bool) !?*Drafter {
         if (!ctx.dir.exists(ctx.dir.ctx, abi.Str.of(config.draft_file))) return null;
         var w = try reader.headWeights(ctx, &.{config.draft_file}, "fuse_weight", "\x00");
         defer w.deinit();
@@ -94,7 +104,27 @@ pub const Drafter = struct {
         errdefer d.release();
         var g = Graph.init(gpa, s);
         defer g.deinit();
-        var at: At = .{ .d = d, .w = &w, .g = &g };
+        const qbits: u32 = blk: {
+            if (!use_f16) break :blk 16;
+            if (std.c.getenv("INKLING_DRAFT_BITS")) |raw| {
+                const sp = std.mem.span(raw);
+                if (std.mem.eql(u8, sp, "4")) break :blk 4;
+                if (std.mem.eql(u8, sp, "6")) break :blk 6;
+                if (std.mem.eql(u8, sp, "8")) break :blk 8;
+                if (std.mem.eql(u8, sp, "16")) break :blk 16;
+            }
+            break :blk 8;
+        };
+        if (use_f16) {
+            if (std.c.getenv("INKLING_DRAFT_MAX")) |raw| {
+                const v = std.fmt.parseInt(u32, std.mem.span(raw), 10) catch (cfg.block - 1);
+                d.max_steps = @min(v, cfg.block - 1);
+            } else {
+                d.max_steps = cfg.block - 1;
+            }
+            @import("../../sdk/util/log.zig").info("[inkling2-draft] M1/M2 FP16 drafter loaded: layer_bits={d} max_steps={d} fold_q8={}\n", .{ qbits, d.max_steps, std.c.getenv("INKLING_NO_FOLD_Q8") == null });
+        }
+        var at: At = .{ .d = d, .w = &w, .g = &g, .use_f16 = use_f16, .layer_bits = qbits };
 
         if (cfg.layers > max_layers) return error.Inkling2DraftGeometry;
         d.layers = try gpa.alloc(Layer, cfg.layers);
@@ -133,9 +163,25 @@ pub const Drafter = struct {
         const rank: c_int = @intCast(cfg.rank);
         if (ops.shape(d.prev_rows)[1] != rank or ops.shape(d.rnn.w)[0] != 3 * rank) return error.Inkling2DraftGeometry;
         // `head(hidden_out(latent))` = latent over `head(hidden_out's columns)` plus `head(hidden_out's bias)`.
-        const out_w = try at.raw("markov_head.hidden_out.weight");
-        const out_b = try at.raw("markov_head.hidden_out.bias");
-        d.fold = try at.keep(try g.reshape(try project(&g, head, try g.reshape(try g.transpose(out_w, &.{ 1, 0 }), &.{ 1, rank, @intCast(hidden) })), &.{ rank, -1 }));
+        var out_w = try at.raw("markov_head.hidden_out.weight");
+        var out_b = try at.raw("markov_head.hidden_out.bias");
+        if (use_f16) {
+            out_w = try g.astype(out_w, .float16);
+            out_b = try g.astype(out_b, .float16);
+        }
+        const fold_raw = try g.reshape(try project(&g, head, try g.reshape(try g.transpose(out_w, &.{ 1, 0 }), &.{ 1, rank, @intCast(hidden) })), &.{ rank, -1 });
+        if (use_f16 and std.c.getenv("INKLING_NO_FOLD_Q8") == null) {
+            const f32_fold = try g.astype(fold_raw, .float32);
+            const amax = try g.maximum(try g.max(try g.abs(f32_fold), 1, true), try g.scalar(1e-8, .float32));
+            const scale = try g.mulScalar(amax, 1.0 / 127.0);
+            const scaled = try g.div(f32_fold, scale);
+            const rounded = try g.call(mlx.mlx_round, .{ scaled, @as(c_int, 0) });
+            const clipped = try g.call(mlx.mlx_clip, .{ rounded, try g.scalar(-127.0, .float32), try g.scalar(127.0, .float32) });
+            d.fold = try at.keep(try g.astype(clipped, .int8));
+            d.fold_scale = try at.keep(try g.reshape(scale, &.{rank}));
+        } else {
+            d.fold = try at.keep(fold_raw);
+        }
         d.fold_bias = try at.keep(try project(&g, head, try g.reshape(out_b, &.{ 1, 1, @intCast(hidden) })));
         return d;
     }
@@ -238,7 +284,8 @@ pub const Drafter = struct {
             const mlp = try project(&lg, &L.down, try lg.mul(try lg.silu(try project(&lg, &L.gate, y)), try project(&lg, &L.up, y)));
             h = try g.keep(try lg.add(mid, mlp));
         }
-        const rows = try g.sliceAxis(try g.rmsNorm(h, d.norm, cfg.eps), 1, 1, block);
+        const want_steps: c_int = if (d.max_steps > 0 and d.max_steps < cfg.block - 1) @intCast(d.max_steps) else block - 1;
+        const rows = try g.sliceAxis(try g.rmsNorm(h, d.norm, cfg.eps), 1, 1, 1 + want_steps);
         const base = try g.astype(try project(g, head, rows), .float32);
 
         if (cache) |cc| cc.end = at;
@@ -259,10 +306,11 @@ pub const Drafter = struct {
         var drafted: [abi.max_round_tokens]Array = undefined;
         var sure: [abi.max_round_tokens]Array = undefined;
         const dense_rows = try g.contiguous(rows);
+        const fold_dense = if (!fused and d.fold_scale != null) try g.astype(try g.mul(try g.astype(d.fold, .float32), try g.reshape(d.fold_scale.?, &.{ rank, 1 })), dt) else d.fold;
         for (0..steps) |i| {
             const at: c_int = @intCast(i);
             if (fused) {
-                const st = try kernels.markovStep(g, d.rnn.w, d.rnn_bias, state, d.prev_rows, dense_rows, newest, prev, d.fold, d.fold_bias, base, at, vocab, softcap);
+                const st = try kernels.markovStepOpt(g, d.rnn.w, d.rnn_bias, state, d.prev_rows, dense_rows, newest, prev, d.fold, d.fold_scale, d.fold_bias, base, at, vocab, softcap);
                 state = st.state;
                 prev = st.token;
                 drafted[i] = st.token;
@@ -276,7 +324,7 @@ pub const Drafter = struct {
             const blend = try g.mul(try g.sub(try g.scalar(1, dt), keep), try g.astype(try g.tanh(try g.sliceAxis(p, 2, rank, 2 * rank)), dt));
             state = try g.add(try g.mul(keep, state), blend);
             const latent = try g.astype(try g.tanh(try g.sliceAxis(p, 2, 2 * rank, 3 * rank)), dt);
-            const bias = try g.astype(try g.add(try g.matmul(latent, d.fold), d.fold_bias), .float32);
+            const bias = try g.astype(try g.add(try g.matmul(latent, fold_dense), d.fold_bias), .float32);
             // The soft cap is monotonic: the pick over the real rows is the capped logits'; the probability is not.
             const logits = try g.sliceAxis(try g.add(try g.sliceAxis(base, 1, at, at + 1), bias), 2, 0, vocab);
             prev = try g.astype(try g.reshape(try g.argmax(logits, -1, false), &.{1}), .int32);
@@ -294,6 +342,8 @@ const At = struct {
     w: *const Weights,
     g: *Graph,
     layer: ?u32 = null,
+    use_f16: bool = false,
+    layer_bits: u32 = 16,
 
     /// A new handle the graph owns.
     fn raw(a: At, leaf: []const u8) !Array {
@@ -311,16 +361,34 @@ const At = struct {
     }
 
     fn need(a: At, leaf: []const u8) !Array {
-        return a.keep(try a.raw(leaf));
+        var x = try a.raw(leaf);
+        if (a.use_f16 and ops.dtype(x) == .bfloat16) x = try a.g.astype(x, .float16);
+        return a.keep(x);
     }
 
     fn float(a: At, leaf: []const u8) !Array {
         return a.keep(try a.g.astype(try a.raw(leaf), .float32));
     }
 
-    /// A projection in the checkpoint's layout, `[out, in]`.
+    /// A projection in the checkpoint's layout, `[out, in]`. For drafter transformer layers on M1/M2,
+    /// optionally quantizes to affine FP16 (`layer_bits` in {4, 6, 8}) to slash drafter bandwidth.
     fn linear(a: At, base: []const u8) !Linear {
         var buf: [160]u8 = undefined;
-        return .{ .w = try a.need(try std.fmt.bufPrint(&buf, "{s}.weight", .{base})) };
+        const wname = try std.fmt.bufPrint(&buf, "{s}.weight", .{base});
+        if (a.layer != null and a.layer_bits < 16) {
+            var wf = try a.raw(wname);
+            if (a.use_f16 and ops.dtype(wf) == .bfloat16) wf = try a.g.astype(wf, .float16);
+            var q = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(q);
+            try mlx.check(mlx.mlx_quantize(&q, wf, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(@intCast(a.layer_bits)), "affine", .{ .ctx = null }, a.g.s));
+            var parts: [3]Array = undefined;
+            for (&parts, 0..) |*p, i| {
+                var t = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_vector_array_get(&t, q, i));
+                p.* = try a.keep(try a.g.adopt(t));
+            }
+            return .{ .w = parts[0], .s = parts[1], .b = parts[2], .bits = a.layer_bits, .group_size = 64, .mode = .affine };
+        }
+        return .{ .w = try a.need(wname) };
     }
 };

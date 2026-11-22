@@ -15,14 +15,27 @@ const uint lane = thread_index_in_simdgroup;
 const uint sg = t / 32;
 const uint V = FOLD_shape[1];
 const size_t at = size_t(AT[0]);
-for (uint r = t; r < R; r += TG) lat[r] = float(T(metal::precise::tanh(P[2 * R + r])));
+for (uint r = t; r < R; r += TG) lat[r] = float(T(metal::precise::tanh(P[2 * R + r]))) * (Q8 ? FSCALE[r] : 1.0f);
 threadgroup_barrier(mem_flags::mem_threadgroup);
 const uint v0 = (tg * TG + t) * VPT;
 float acc[VPT];
 for (uint j = 0; j < VPT; j++) acc[j] = 0.0f;
-if (v0 < VOCAB) for (uint r = 0; r < R; r++) {
-    const vec<T, VPT> f = *(const device vec<T, VPT>*)(FOLD + size_t(r) * V + v0);
-    for (uint j = 0; j < VPT; j++) acc[j] += lat[r] * float(f[j]);
+if (v0 < VOCAB) {
+    if (Q8) {
+        const device char* fq = (const device char*)FOLD;
+        for (uint r = 0; r < R; r++) {
+            const vec<char, VPT> f = *(const device vec<char, VPT>*)(fq + size_t(r) * V + v0);
+            const float lr = lat[r];
+            for (uint j = 0; j < VPT; j++) acc[j] += lr * float(f[j]);
+        }
+    } else {
+        const device T* ft = (const device T*)FOLD;
+        for (uint r = 0; r < R; r++) {
+            const vec<T, VPT> f = *(const device vec<T, VPT>*)(ft + size_t(r) * V + v0);
+            const float lr = lat[r];
+            for (uint j = 0; j < VPT; j++) acc[j] += lr * float(f[j]);
+        }
+    }
 }
 float lg[VPT];
 float m = -INFINITY;

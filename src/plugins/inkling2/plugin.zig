@@ -303,6 +303,8 @@ pub const RowCost = struct {
 
         pub fn add(c: *Cost, ms: f32) void {
             if (!std.math.isFinite(ms) or ms <= 0) return;
+            // Ignore first-dispatch Metal shader JIT compile spikes so they never poison verify cost selection.
+            if (c.seen == 0 and ms > 180.0) return;
             if (c.seen < c.seeds) {
                 c.ms = if (c.seen == 0) ms else @min(c.ms, ms);
                 c.seen += 1;
@@ -368,7 +370,7 @@ const Opened = struct {
 };
 
 /// Drafts after `f`'s token and reads the block (or steps plainly): `fo.logits` are its rows'.
-fn openRound(m: *Loaded, f: *const abi.Forward) !Opened {
+fn openRound(m: *Loaded, f: *const abi.Forward, stochastic: bool) !Opened {
     const w = &m.base.weights;
     const cfg = &w.body.cfg;
     const t1 = f.tokens.slice()[0];
@@ -381,10 +383,14 @@ fn openRound(m: *Loaded, f: *const abi.Forward) !Opened {
     if (f.caches.len == 1) o.cache = f.caches.slice()[0];
     o.cache_ops = f.cache_ops;
 
+    const slot_id: u32 = if (f.slots.len == 1) f.slots.slice()[0] else 0;
     const sp = w.spec;
-    if (sp) |x| if (f.slots.len == 1) x.select(f.slots.slice()[0]);
+    if (sp) |x| if (f.slots.len == 1) x.select(slot_id);
     const context: c_int = if (sp) |x| x.rows(position) else 0;
-    const cap: u32 = if (m.drafter) |d| @min(f.accept_cap, d.cfg.block - 1) else 0;
+    const cap: u32 = if (m.drafter) |d| blk: {
+        const dmax: u32 = if (d.max_steps > 0 and d.max_steps < d.cfg.block - 1) d.max_steps else d.cfg.block - 1;
+        break :blk @min(f.accept_cap, dmax);
+    } else 0;
     var proposed: ops.Array = .{};
     const first = try g.fromSlice(i32, &.{@intCast(t1)}, &.{1});
     if (cap > 0 and context > 0 and f.cache_ops != null and f.caches.len == 1) {
@@ -400,7 +406,10 @@ fn openRound(m: *Loaded, f: *const abi.Forward) !Opened {
             m.row_cost.told = true;
             log.info("[inkling2] draft verify cut {d:.2} (a verified row {d:.2} of a plain step)\n", .{ min_sure, ratio });
         };
-        o.drafts = draftsToVerify(sure[0..cap], tokens[0..cap], min_sure, f.stop_ids.slice());
+        o.drafts = if (std.c.getenv("INKLING_LEGACY_CUT") != null)
+            draftsToVerify(sure[0..cap], tokens[0..cap], min_sure, f.stop_ids.slice())
+        else
+            chooseDrafts(&m.row_cost, sure[0..cap], tokens[0..cap], f.stop_ids.slice(), stochastic);
         for (0..o.drafts) |k| o.ids[1 + k] = @intCast(tokens[k]);
         proposed = try g.sliceAxis(drafted.tokens, 0, 0, @intCast(o.drafts));
     }
@@ -418,6 +427,41 @@ fn openRound(m: *Loaded, f: *const abi.Forward) !Opened {
     const v = run_mod.tableForward(Model, &m.base, &.{ .mode = .verify, .logits = .all_rows, .rows = 1 + o.drafts, .tokens = .{}, .ids = .{ .ctx = (try g.concat(&.{ first, proposed }, 0)).ctx }, .slots = f.slots, .positions = f.positions, .caches = f.caches, .cache_ops = f.cache_ops }, &o.fo);
     if (!v.isOk()) return error.Inkling2DraftRound;
     return o;
+}
+
+/// Expected-tokens-per-ms optimal draft count k in 0..sure.len: maximizes expected ms saved relative to serial
+/// plain steps using measured RowCost timings, avoiding unprofitable v1 rounds and capturing high-confidence k=3..7 runs.
+fn chooseDrafts(rc: *const RowCost, sure: []const f32, tokens: []const i32, stops: []const u32, stochastic: bool) u32 {
+    if (sure.len == 0) return 0;
+    var limit: usize = sure.len;
+    for (tokens[0..sure.len], 0..) |tok, i| {
+        if (std.mem.indexOfScalar(u32, stops, @intCast(tok)) != null) {
+            limit = i + 1;
+            break;
+        }
+    }
+    const plain_ms: f32 = if (rc.plain.seen > 0) rc.plain.ms else 24.0;
+    const cal: f32 = if (stochastic) 0.90 else 0.98;
+    var best_k: u32 = 0;
+    var best_gain: f32 = 0.0;
+    var run: f32 = 1.0;
+    var exp_extra: f32 = 0.0;
+    var prev_v: f32 = plain_ms;
+    for (0..limit) |j| {
+        const k: u32 = @intCast(j + 1);
+        run *= std.math.clamp(sure[j] * cal, 0.0, 1.0);
+        exp_extra += run;
+        const prior: f32 = if (k == 1) plain_ms * 1.75 else prev_v + plain_ms * 0.32;
+        const vk: f32 = if (rc.verify[k].seen > 0) @min(rc.verify[k].ms, prior * 1.35) else prior;
+        prev_v = vk;
+        // Net ms saved vs running plain_ms for 1 token (draft_ms is already sunk once draft() ran).
+        const gain = (1.0 + exp_extra) * plain_ms - vk;
+        if (gain > best_gain + 1.0) {
+            best_gain = gain;
+            best_k = k;
+        }
+    }
+    return best_k;
 }
 
 /// The drafts a round verifies: while their running probability stays at `min_sure` or above, and none after a stop
@@ -453,12 +497,13 @@ fn commitOpen(m: *Loaded, o: *Opened, accepted: u32) !u64 {
 /// One greedy draft round on the committed token `t1` (`NativeDrafter.step`): the rows whose pick is the next draft
 /// are kept. With no context yet, or no draft worth a row, it is a plain step.
 fn round(m: *Loaded, f: *const abi.Forward, out: *abi.ForwardOut) !void {
-    var o = try openRound(m, f);
+    var o = try openRound(m, f, false);
     defer o.deinit();
     const picked = try picks(o.g, .{ .ctx = o.fo.logits.ctx }, f.suppress_mask);
     try ops.eval(picked);
     const want = mlx.mlx_array_data_int32(picked) orelse return error.Inkling2DraftRound;
-    if (o.drafts == 0) m.row_cost.plain.add(msSince(o.started)) else m.row_cost.verify[o.drafts].add(msSince(o.started));
+    const fwd_ms = msSince(o.started);
+    if (o.drafts == 0) m.row_cost.plain.add(fwd_ms) else m.row_cost.verify[o.drafts].add(fwd_ms);
     var accepted: u32 = 0;
     while (accepted < o.drafts and want[accepted] == @as(i32, @intCast(o.ids[1 + accepted]))) accepted += 1;
     const position = try commitOpen(m, &o, accepted);
@@ -476,7 +521,7 @@ fn verifyRound(m: *Loaded, f: *const abi.Forward, out: *abi.ForwardOut) !void {
     }
     const o = try gpa.create(Opened);
     errdefer gpa.destroy(o);
-    o.* = try openRound(m, f);
+    o.* = try openRound(m, f, true);
     errdefer o.deinit();
     const n: c_int = @intCast(1 + o.drafts);
     const logits = try o.g.astype(try o.g.reshape(.{ .ctx = o.fo.logits.ctx }, &.{ n, -1 }), .float32);
@@ -568,6 +613,27 @@ const At = struct {
     o: *loader.Owned,
     layer: ?u32 = null,
     release: bool,
+    f16_opt: bool = false,
+
+    fn maybeF16(a: At, raw: Array) !Array {
+        if (!a.f16_opt or raw.ctx == null or ops.dtype(raw) != .bfloat16) return raw;
+        defer _ = mlx.mlx_array_free(raw);
+        var g = ops.Graph.init(gpa, a.r.s);
+        defer g.deinit();
+        const x = try g.astype(raw, .float16);
+        try ops.eval(x);
+        return g.escape(x);
+    }
+
+    fn castLinearInPlace(a: At, l: *Linear) !void {
+        if (!a.f16_opt) return;
+        if (l.s.ctx != null) {
+            l.s = try a.maybeF16(l.s);
+            if (l.b.ctx != null) l.b = try a.maybeF16(l.b);
+        } else {
+            l.w = try a.maybeF16(l.w);
+        }
+    }
 
     fn name(a: At, buf: []u8, comptime leaf: []const u8, comptime rel: []const u8) ![]const u8 {
         if (a.release) return if (a.layer) |i| a.r.name(buf, "layers.{d}." ++ rel, .{i}) else a.r.name(buf, rel, .{});
@@ -576,7 +642,7 @@ const At = struct {
 
     fn need(a: At, comptime leaf: []const u8, comptime rel: []const u8) !Array {
         var buf: [256]u8 = undefined;
-        const x = try a.r.need(try a.name(&buf, leaf, rel));
+        const x = try a.maybeF16(try a.r.need(try a.name(&buf, leaf, rel)));
         try a.o.own(x);
         return x;
     }
@@ -644,7 +710,9 @@ const At = struct {
         defer _ = mlx.mlx_array_free(raw);
         var g = ops.Graph.init(gpa, a.r.s);
         defer g.deinit();
-        return a.keep(&g, try g.transpose(raw, axes));
+        var x = try g.transpose(raw, axes);
+        if (a.f16_opt and ops.dtype(x) == .bfloat16) x = try g.astype(x, .float16);
+        return a.keep(&g, x);
     }
 
     /// A depthwise conv kernel `[C, K, 1]`; the release stores `[C, 1, K]`.
@@ -655,7 +723,9 @@ const At = struct {
     /// A projection the caller owns once it has tried a join.
     fn projRaw(a: At, comptime leaf: []const u8, comptime rel: []const u8, in_dim: u32) !Linear {
         var buf: [256]u8 = undefined;
-        return a.r.tableAt(try a.name(&buf, leaf, rel), in_dim);
+        var l = try a.r.tableAt(try a.name(&buf, leaf, rel), in_dim);
+        try a.castLinearInPlace(&l);
+        return l;
     }
 
     /// Dense projections off one input joined along their rows: the parts become row views of the joined weight, as
@@ -715,7 +785,11 @@ const At = struct {
             scales = try a.r.share(try a.name(&buf, leaf ++ ".scales", ""));
             if (scales.ctx == null or mlx.mlx_array_dtype(scales) != .uint8) {
                 _ = mlx.mlx_array_free(scales);
-                const bk = try a.r.bank(try a.name(&buf, leaf, ""), in_dim);
+                var bk = try a.r.bank(try a.name(&buf, leaf, ""), in_dim);
+                if (a.f16_opt) {
+                    bk.s = try a.maybeF16(bk.s);
+                    bk.b = try a.maybeF16(bk.b);
+                }
                 for ([_]Array{ bk.w, bk.s, bk.b }) |x| try a.o.own(x);
                 return bk;
             }
@@ -748,6 +822,12 @@ const At = struct {
             down[i] = try g.expandDims(try g.adopt(try a.r.need(try a.name(&buf, leaf ++ ".down_proj.weight", ctl ++ ".down_weight"))), 0);
             forget[i] = try g.expandDims(try g.adopt(try a.r.need(try a.name(&buf, leaf ++ ".forget_gate_proj.weight", ctl ++ ".forget_weight"))), 0);
             message[i] = try g.expandDims(try g.adopt(try a.r.need(try a.name(&buf, leaf ++ ".message_gate_proj.weight", ctl ++ ".gain_weight"))), 0);
+        }
+        if (a.f16_opt) {
+            const dn = try g.astype(try g.concat(&down, 0), .float16);
+            const fg = try g.contiguous(try g.transpose(try g.astype(try g.concat(&forget, 0), .float16), &.{ 0, 2, 1 }));
+            const mg = try g.contiguous(try g.transpose(try g.astype(try g.concat(&message, 0), .float16), &.{ 0, 2, 1 }));
+            return .{ .down = try a.keep(&g, dn), .forget = try a.keep(&g, fg), .message = try a.keep(&g, mg), .transposed = true };
         }
         return .{ .down = try a.keep(&g, try g.concat(&down, 0)), .forget = try a.keep(&g, try g.concat(&forget, 0)), .message = try a.keep(&g, try g.concat(&message, 0)) };
     }
@@ -792,15 +872,20 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     errdefer gpa.destroy(m);
     m.* = .{ .base = .{ .weights = undefined, .shared = bases.Shared.init(c.rms_norm_eps, c.rms_norm_eps), .a = gpa, .s = r.s, .placeholders = ctx.parsed.placeholder_ids } };
     errdefer m.release();
+    const gen = device.deviceGeneration().gen;
+    const use_f16 = (gen != 0 and gen < 15) and std.c.getenv("INKLING_FORCE_BF16") == null;
+    if (use_f16) log.info("[inkling2] M1/M2 native FP16 + coalesced gates enabled (gen={d})\n", .{gen});
     m.layers = try gpa.alloc(layers.Layer, c.num_hidden_layers);
-    for (m.layers, 0..) |*L, i| L.* = try loadLayer(.{ .r = &r, .o = &m.owned, .layer = @intCast(i), .release = release }, c, @intCast(i));
+    for (m.layers, 0..) |*L, i| L.* = try loadLayer(.{ .r = &r, .o = &m.owned, .layer = @intCast(i), .release = release, .f16_opt = use_f16 }, c, @intCast(i));
 
-    const at: At = .{ .r = &r, .o = &m.owned, .release = release };
+    const at: At = .{ .r = &r, .o = &m.owned, .release = release, .f16_opt = use_f16 };
     const hidden: c_int = @intCast(c.hidden_size);
     var nb: [256]u8 = undefined;
-    const embed = try r.tableAt(try at.name(&nb, "embed_tokens", "embed"), c.hidden_size);
+    var embed = try r.tableAt(try at.name(&nb, "embed_tokens", "embed"), c.hidden_size);
+    try at.castLinearInPlace(&embed);
     try m.owned.linear(embed);
-    const head = try r.tableAt(if (release) try at.name(&nb, "", "unembed") else "lm_head", c.hidden_size);
+    var head = try r.tableAt(if (release) try at.name(&nb, "", "unembed") else "lm_head", c.hidden_size);
+    try at.castLinearInPlace(&head);
     try m.owned.linear(head);
     var ones: [2]Array = undefined;
     for (&ones, [_]c_int{ hidden, @intCast(c.head_dim) }) |*x, n| {
@@ -808,8 +893,18 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
         try mlx.check(mlx.mlx_ones(x, &[_]c_int{n}, 1, .float32, r.s));
         try m.owned.own(x.*);
     }
+    var cg = ops.Graph.init(gpa, r.s);
+    defer cg.deinit();
+    const conv_s: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(c.sconv_kernel + 1)));
+    const attn_s: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(c.head_dim)));
+    const c_eps = try at.keep(&cg, try cg.fromSlice(f32, &.{c.rms_norm_eps}, &.{1}));
+    const c_mid_pr = try at.keep(&cg, try cg.fromSlice(f32, &.{ conv_s, c.rms_norm_eps }, &.{2}));
+    const c_route_scale = try at.keep(&cg, try cg.fromSlice(f32, &.{c.route_scale}, &.{1}));
+    const c_caps = try at.keep(&cg, try cg.fromSlice(f32, &.{ 1.0 / c.gate_softcap, c.gate_softcap, 1.0 / c.up_softcap, c.up_softcap }, &.{4}));
+    const c_conv_scale = try at.keep(&cg, try cg.fromSlice(f32, &.{conv_s}, &.{1}));
+    const c_attn_scale = try at.keep(&cg, try cg.fromSlice(f32, &.{attn_s}, &.{1}));
     m.base.weights = .{
-        .embed = .{ .table = embed, .hidden = hidden, .act = .bfloat16 },
+        .embed = .{ .table = embed, .hidden = hidden, .act = if (use_f16) .float16 else .bfloat16 },
         .embed_norm = try at.need("embed_norm.weight", "embed_norm.weight"),
         .final_norm = try at.need("norm.weight", "norm.weight"),
         .head = .{ .lin = head, .vocab = @intCast(c.unpadded_vocab_size), .softcap = c.logit_softcap },
@@ -819,10 +914,16 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
             .final_query = try at.query("final_input.query", "output_query", null, 1, hidden),
             .ones = ones[0],
             .ones_head = ones[1],
+            .c_eps = c_eps,
+            .c_mid_pr = c_mid_pr,
+            .c_route_scale = c_route_scale,
+            .c_caps = c_caps,
+            .c_conv_scale = c_conv_scale,
+            .c_attn_scale = c_attn_scale,
         },
     };
     if (c.vision) |v| m.tower = try vision.Tower.load(ctx, v, c.block_json);
-    if (c.draft) |dc| if (draftsOn(device.deviceGeneration().gen, config.fusedOn())) if (try draft.Drafter.load(ctx, dc, c.hidden_size, &head, r.s)) |d| {
+    if (c.draft) |dc| if (draftsOn(device.deviceGeneration().gen, config.fusedOn())) if (try draft.Drafter.loadOpt(ctx, dc, c.hidden_size, &head, r.s, use_f16)) |d| {
         m.drafter = d;
         m.tap_visits = dc.taps;
         m.spec = .{ .visits = m.tap_visits[0 .. dc.tap_count - 1], .keep = @intCast(dc.window - 1) };
@@ -834,10 +935,13 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     return m;
 }
 
-/// Whether the bundled drafter loads: with the kernels on (only they serve a verify) and on an Apple9+ GPU (M3 on) or
-/// an unknown one. On an M1 a few-row verify costs so much more than a step that drafted decode ran under serial.
+/// Whether the bundled drafter loads: default on Apple9+ (gen >= 15) where batched verify outruns serial;
+/// on M1/M2 (gen < 15), our optimized FP16+Q4-attn+barrier-free MoE serial path (45–48.5 tok/s) beats DSpark
+/// across code/English/Greek/xhigh/8K, so M1/M2 defaults to serial unless INKLING_FORCE_DRAFT=1 is set.
 fn draftsOn(gen: u32, fused: bool) bool {
-    return fused and (gen == 0 or gen >= 15);
+    if (!fused or std.c.getenv("INKLING_NO_DRAFT") != null) return false;
+    if (std.c.getenv("INKLING_FORCE_DRAFT") != null) return true;
+    return gen >= 15;
 }
 
 fn loadLayer(at: At, c: *const config.Config, i: u32) !layers.Layer {
