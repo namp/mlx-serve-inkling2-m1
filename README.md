@@ -74,7 +74,7 @@ cd mlx-serve-inkling2-m1
 zig build -Doptimize=ReleaseFast -Dunits=true -j4
 ```
 
-Serve with 1M context, Q4 KV caching, and tiered RAM + SSD prefix caching (sized for 64 GB Macs running long multi-turn agentic sessions):
+Serve with 1M context, Q4 KV caching, and an 8 GB SSD prefix cache (sized for 64 GB Macs running long multi-turn agentic sessions):
 
 ```bash
 ./zig-out/bin/mlx-serve \
@@ -83,11 +83,11 @@ Serve with 1M context, Q4 KV caching, and tiered RAM + SSD prefix caching (sized
   --ctx-size 1048576 --max-tokens 65536 \
   --os-reserve-gib 16 --max-concurrent 1 \
   --kv-quant 4 --no-vision \
-  --prefix-cache-entries 8 --prefix-cache-mem 6GB --prefix-cache-disk 8GB \
+  --prefix-cache-entries 8 --no-prefix-cache-ram --prefix-cache-disk 8GB \
   --temp 1.0 --top-p 1.0 --top-k 0
 ```
 
-> **Prefix-cache sizing tip:** Under `--kv-quant 4`, a `50K–120K`-token session uses `~0.6–1.3 GB` of KV/checkpoint state. Giving the hot RAM tier `6GB` alongside an `8GB` SSD tier avoids LRU eviction races during rapid tool-call loops or multi-thread switching (fall back to `--no-prefix-cache-ram --prefix-cache-disk 2GB` only on tighter RAM/disk budgets; `mlx-serve` keeps a `min(64 GiB, 10% volume)` free-disk reserve before arming the SSD tier).
+> **Prefix-cache sizing tip:** Under `--kv-quant 4`, a `50K–135K`-token session uses `~0.6–1.5 GB` of KV/checkpoint state, so `2GB` on disk can trigger LRU eviction races between rapid tool-call turns or multiple agent threads — `8GB` keeps 5–12 large sessions warm (`~0.25–0.37s` restore from SSD). Keep `--no-prefix-cache-ram` when using `--ctx-size 1048576` on 64 GB: `mlx-serve` reserves the full manual context at load time, clamping `--prefix-cache-mem` to `0 MB` while downgrading the SSD tier (`2048 -> 512 MB/flush`, `16 -> 8` SSM checkpoints/entry). Only remove `--no-prefix-cache-ram` if you also lower `--ctx-size` (e.g. `262144`) so RAM headroom remains. Note that `mlx-serve` reserves `min(64 GiB, 10% volume)` of free disk before arming the SSD tier.
 
 ### Runtime Environment Knobs
 
