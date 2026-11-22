@@ -74,7 +74,7 @@ cd mlx-serve-inkling2-m1
 zig build -Doptimize=ReleaseFast -Dunits=true -j4
 ```
 
-Serve with 1M context, Q4 KV caching, and 2 GB SSD prefix cache:
+Serve with 1M context, Q4 KV caching, and tiered RAM + SSD prefix caching (sized for 64 GB Macs running long multi-turn agentic sessions):
 
 ```bash
 ./zig-out/bin/mlx-serve \
@@ -83,9 +83,11 @@ Serve with 1M context, Q4 KV caching, and 2 GB SSD prefix cache:
   --ctx-size 1048576 --max-tokens 65536 \
   --os-reserve-gib 16 --max-concurrent 1 \
   --kv-quant 4 --no-vision \
-  --prefix-cache-entries 4 --no-prefix-cache-ram --prefix-cache-disk 2GB \
+  --prefix-cache-entries 8 --prefix-cache-mem 6GB --prefix-cache-disk 8GB \
   --temp 1.0 --top-p 1.0 --top-k 0
 ```
+
+> **Prefix-cache sizing tip:** Under `--kv-quant 4`, a `50K–120K`-token session uses `~0.6–1.3 GB` of KV/checkpoint state. Giving the hot RAM tier `6GB` alongside an `8GB` SSD tier avoids LRU eviction races during rapid tool-call loops or multi-thread switching (fall back to `--no-prefix-cache-ram --prefix-cache-disk 2GB` only on tighter RAM/disk budgets; `mlx-serve` keeps a `min(64 GiB, 10% volume)` free-disk reserve before arming the SSD tier).
 
 ### Runtime Environment Knobs
 
