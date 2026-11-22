@@ -1,14 +1,14 @@
 # mlx-serve-inkling2-m1
 
-Apple M1 / M2 optimizations for **Thinking Machines' Inkling 2 Mini (`inkling2_loop`)** on top of [ddalcu/mlx-serve](https://github.com/ddalcu/mlx-serve) (`2fe9be8`, MIT License), plus a virtually lossless Q4-attention / Q6-head requantization tool and streaming SSE reasoning fix.
+Apple M1 / M2 optimizations for **Inkling 2 Mini (`inkling2_loop`)** — developed and benchmarked on **Inkling 2 Mini Uncensored** (and compatible with any Inkling 2 Mini MLX/canonical checkpoint) on top of [ddalcu/mlx-serve](https://github.com/ddalcu/mlx-serve) (`2fe9be8`, MIT License), plus a virtually lossless Q4-attention / Q6-head requantization tool and streaming SSE reasoning fix.
 
 > **Upstream credit & license:** Based on [ddalcu/mlx-serve](https://github.com/ddalcu/mlx-serve) commit `2fe9be834a601c70ef1a597563026340f0e722fe` by David Dalcu, preserved under the original [MIT License](LICENSE) (see [NOTICE](NOTICE) and [README_UPSTREAM.md](README_UPSTREAM.md) for full upstream documentation). No model weights are distributed in this repository.
 
 ---
 
-## Highlights (Apple M1 Max, 64 GB, `--kv-quant 4`, `--ctx-size 1048576`)
+## Highlights (Inkling 2 Mini Uncensored on Apple M1 Max, 64 GB, `--kv-quant 4`, `--ctx-size 1048576`)
 
-Bracketed back-to-back head-to-head benchmark (`OPT_1` → `STOCK` → `OPT_2`) against stock `ddalcu/mlx-serve` (`2fe9be8` + SSE fix) serving the canonical 8-bit-attention / NVFP4-expert Inkling-2-Mini pack:
+Bracketed back-to-back head-to-head benchmark (`OPT_1` → `STOCK` → `OPT_2`) on the **Inkling 2 Mini Uncensored** (TokenAI-zer / OpenUncensored-derived mixed-precision) checkpoint, comparing stock `ddalcu/mlx-serve` (`2fe9be8` + SSE fix) serving the canonical 8-bit-attention / NVFP4-expert uncensored pack against this build serving the Q4-attention / Q6-head uncensored pack:
 
 | Workload | Stock `mlx-serve` (`tok/s` / TTFT) | This Repo Mean (`tok/s` / TTFT) | Peak Observed | Speedup |
 |---|---:|---:|---:|---:|
@@ -48,17 +48,17 @@ All engine optimizations live cleanly inside `src/plugins/inkling2/`, plus one s
 
 ## Virtually Lossless Q4-Attention / Q6-Head Pack (`tools/requant_inkling2_q4attn.py`)
 
-Because Inkling-2-Mini runs 48 visits per token, stock 8-bit `self_attn` projections (`~1,374 MB/tok`) and 8-bit `lm_head` (`~492 MB/tok`) dominate non-MoE bandwidth on M1 Max. Requantizing **only** `self_attn.*_proj` to 4-bit affine (`gs=64`) and `embed_tokens`/`lm_head` to 6-bit affine (`gs=64`) — while keeping **all 24 layers' MoE experts 100% bit-for-bit untouched** — cuts model size from `15.6 GB` to `15.0 GB` and unlocks MLX's 4-bit `qmv_fast` / `verifyQmm` lanes with virtually zero quality loss:
+Because Inkling-2-Mini runs 48 visits per token, stock 8-bit `self_attn` projections (`~1,374 MB/tok`) and 8-bit `lm_head` (`~492 MB/tok`) dominate non-MoE bandwidth on M1 Max. Requantizing **only** `self_attn.*_proj` to 4-bit affine (`gs=64`) and `embed_tokens`/`lm_head` to 6-bit affine (`gs=64`) — while keeping **all 24 layers' MoE experts 100% bit-for-bit untouched** from the source checkpoint (including the uncensored weights, with zero safety/refusal wrappers added) — cuts model size from `15.6 GB` to `15.0 GB` and unlocks MLX's 4-bit `qmv_fast` / `verifyQmm` lanes with virtually zero quality loss:
 
-- **KLD (`tests/inkling2_kld.py`, 2,726 positions across Zig/Python/Markdown):**
+- **KLD on Inkling 2 Mini Uncensored (`tests/inkling2_kld.py`, 2,726 positions across Zig/Python/Markdown):**
   - Mean KLD: `0.0269 ± 0.0015` (median `0.0064`)
   - Top-1 agreement: `93.4%`
   - Perplexity: `3.912` vs `3.902` (`+0.010` ppl)
 
 ```bash
 python3 tools/requant_inkling2_q4attn.py \
-  --src /path/to/inkling2-mlx-canonical \
-  --dst /path/to/inkling2-mlx-q4attn
+  --src /path/to/inkling2-uncensored-mlx-canonical \
+  --dst /path/to/inkling2-uncensored-mlx-q4attn
 ```
 
 ---
