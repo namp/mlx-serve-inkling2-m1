@@ -156,7 +156,8 @@ fn thinkCloseIsToolCallPayload(text: []const u8, pos: usize) bool {
 
 /// Length of the trailing bytes of `buf` that could still GROW into a think
 /// close tag with more streamed bytes — either family: `</think>`, the
-/// Hy3-suffixed `</think:opensource>`, or Gemma's `<channel|>`. Streaming
+/// Hy3-suffixed `</think:opensource>`, Gemma's `<channel|>`, or Inkling's
+/// `<|end_message|>`. Streaming
 /// reasoning flushes must hold this suffix back: flushing half a close tag
 /// splits it across the flush boundary, so the retained remainder never
 /// matches and the stream stays "inside thinking" forever (tag bytes leak
@@ -171,6 +172,7 @@ pub fn partialThinkCloseSuffixLen(buf: []const u8) usize {
         const tail = buf[i..];
         if (isPartialSuffixedTag(tail, "</think")) return tail.len;
         if (tail.len < "<channel|>".len and std.mem.startsWith(u8, "<channel|>", tail)) return tail.len;
+        if (tail.len < "<|end_message|>".len and std.mem.startsWith(u8, "<|end_message|>", tail)) return tail.len;
     }
     return 0;
 }
@@ -234,10 +236,11 @@ pub const ThinkSplit = struct {
 
 /// A think block the MODEL opens when the template did not: a bare `<think>` token, or
 /// Gemma 4's TWO tokens, the `<|channel>` marker (dropped from visible deltas) then the
-/// word `thought`. `channel_armed` = the previous delta was that marker and nothing visible
+/// word `thought`, or Inkling's `<|content_thinking|>`. `channel_armed` = the previous delta was that marker and nothing visible
 /// has been emitted. Returns the opener to seed `think_buf` with.
 pub fn modelThinkOpener(channel_armed: bool, token_text: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, std.mem.trimEnd(u8, token_text, "\n"), "<think>")) return "<think>";
+    if (std.mem.eql(u8, std.mem.trimEnd(u8, token_text, "\n"), "<|content_thinking|>")) return "<|content_thinking|>";
     if (channel_armed and std.mem.eql(u8, token_text, "thought")) return "<|channel>thought";
     return null;
 }
@@ -433,6 +436,53 @@ test "a model-opened think block latches from its own opener token" {
     try std.testing.expect(modelThinkOpener(true, "thoughts") == null);
     try std.testing.expect(modelThinkOpener(true, "\n") == null);
     try std.testing.expect(modelThinkOpener(false, "<think>x") == null);
+}
+
+test "Inkling model-opened reasoning is latched before channel-marker filtering" {
+    try testing.expectEqualStrings("<|content_thinking|>", modelThinkOpener(false, "<|content_thinking|>").?);
+    try testing.expectEqualStrings("<|content_thinking|>", modelThinkOpener(false, "<|content_thinking|>\n").?);
+    for ([_][]const u8{ "<|content_text|>", "<|end_message|>", "<|message_model|>", "<|content_thinking|>prose" }) |text| {
+        try testing.expect(modelThinkOpener(false, text) == null);
+    }
+}
+
+test "Inkling close survives every split boundary before final content" {
+    const close = "<|end_message|>";
+    const reason = "private analysis";
+    const final = "<|message_model|><|content_text|>Public answer<|end_message|>";
+    for (1..close.len) |cut| {
+        const first = try std.mem.concat(testing.allocator, u8, &.{ reason, close[0..cut] });
+        defer testing.allocator.free(first);
+        const held = partialThinkCloseSuffixLen(first);
+        try testing.expectEqual(cut, held);
+        const emitted = first[0 .. first.len - held];
+        try testing.expectEqualStrings(reason, emitted);
+        // The real flush path keeps only this suffix, then appends the next chunk.
+        const pending = try std.mem.concat(testing.allocator, u8, &.{ first[first.len - held ..], close[cut..], final });
+        defer testing.allocator.free(pending);
+        try testing.expectEqual(@as(usize, 0), std.mem.indexOf(u8, pending, close).?);
+        // Compare the flushed+retained bytes with the dedicated full-message parser.
+        const complete = try std.mem.concat(testing.allocator, u8, &.{ modelThinkOpener(false, "<|content_thinking|>").?, emitted, pending });
+        defer testing.allocator.free(complete);
+        const parsed = splitThinkBlock(complete, true, false);
+        try testing.expectEqualStrings(reason, parsed.reasoning_content.?);
+        try testing.expectEqualStrings("Public answer", parsed.content);
+    }
+    try testing.expectEqual(@as(usize, 0), partialThinkCloseSuffixLen(close));
+    try testing.expectEqual(@as(usize, 0), partialThinkCloseSuffixLen("ordinary reasoning"));
+}
+
+test "Inkling EOS keeps an unclosed thought in reasoning and direct answers in content" {
+    const streamTailIsReasoning = @import("stream_gate.zig").streamTailIsReasoning;
+    const saw_opener = modelThinkOpener(false, "<|content_thinking|>") != null;
+    // prompt_opened=false reproduces the native streaming regression.
+    try testing.expect(streamTailIsReasoning(true, false, saw_opener));
+    const truncated = splitThinkBlock("<|content_thinking|>private analysis", true, false);
+    try testing.expectEqualStrings("private analysis", truncated.reasoning_content.?);
+    try testing.expectEqualStrings("", truncated.content);
+    const direct = splitThinkBlock("<|content_text|>Public answer<|end_message|>", true, false);
+    try testing.expect(direct.reasoning_content == null);
+    try testing.expectEqualStrings("Public answer", direct.content);
 }
 
 test "K2-Horizon: the rendered prompt opens one of three think tags; thinking-off closes the SAME one" {
