@@ -1,141 +1,109 @@
-![MLX-Serve, a local LLM and media server for Apple Silicon](website/assets/mlx-serve-header.jpg)
+# mlx-serve-inkling2-m1
 
-# MLX-Serve
+Apple M1 / M2 optimizations for **Thinking Machines' Inkling 2 Mini (`inkling2_loop`)** on top of [ddalcu/mlx-serve](https://github.com/ddalcu/mlx-serve) (`2fe9be8`, MIT License), plus a virtually lossless Q4-attention / Q6-head requantization tool and streaming SSE reasoning fix.
 
-Run open models on your Mac: chat, coding agents, images, video, music, speech and 3D. One native app and one local server that speaks the OpenAI, Anthropic and Ollama APIs. It runs offline, needs no Python and no account, and it's MIT licensed.
+> **Upstream credit & license:** Based on [ddalcu/mlx-serve](https://github.com/ddalcu/mlx-serve) commit `2fe9be834a601c70ef1a597563026340f0e722fe` by David Dalcu, preserved under the original [MIT License](LICENSE) (see [NOTICE](NOTICE) and [README_UPSTREAM.md](README_UPSTREAM.md) for full upstream documentation). No model weights are distributed in this repository.
 
-[![Release](https://img.shields.io/github/v/release/ddalcu/mlx-serve?style=flat-square&color=0071e3)](https://github.com/ddalcu/mlx-serve/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/ddalcu/mlx-serve/total?style=flat-square&color=30d158)](https://github.com/ddalcu/mlx-serve/releases)
-[![Stars](https://img.shields.io/github/stars/ddalcu/mlx-serve?style=flat-square&color=f7a41d)](https://github.com/ddalcu/mlx-serve/stargazers)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
+---
 
-**[Download for Mac](https://github.com/ddalcu/mlx-serve/releases/latest/download/MLX-Serve.dmg)** · [Homebrew](#install) · [iPhone](https://apps.apple.com/us/app/mlx-chat-local-ai/id6787603518) · [Linux](#linux-and-windows) · [mlxserve.com](https://mlxserve.com/) · [简体中文](README.zh-CN.md)
+## Highlights (Apple M1 Max, 64 GB, `--kv-quant 4`, `--ctx-size 1048576`)
 
-![Chatting with a local model, making a picture and coding with Claude Code, all on one Mac](website/assets/demo.gif)
+Bracketed back-to-back head-to-head benchmark (`OPT_1` → `STOCK` → `OPT_2`) against stock `ddalcu/mlx-serve` (`2fe9be8` + SSE fix) serving the canonical 8-bit-attention / NVFP4-expert Inkling-2-Mini pack:
 
-## Install
+| Workload | Stock `mlx-serve` (`tok/s` / TTFT) | This Repo Mean (`tok/s` / TTFT) | Peak Observed | Speedup |
+|---|---:|---:|---:|---:|
+| **1K raw** (`1,214` prompt tok) | `33.87` / `4.04s` | **`45.34`** / `3.21s` | `46.83 tok/s` | **+33.9%** |
+| **Python code** (`reasoning_effort=low`) | `35.80` / `0.80s` | **`44.96`** / `0.67s` | `48.48 tok/s` | **+25.6%** |
+| **English prose** (`reasoning_effort=low`) | `37.01` / `0.94s` | **`43.61`** / `0.89s` | `47.40 tok/s` | **+17.8%** |
+| **Greek prose** (`reasoning_effort=low`) | `35.77` / `0.78s` | **`42.10`** / `0.64s` | `46.18 tok/s` | **+17.7%** |
+| **`xhigh` (`temp=1.0, top_p=1.0`)** | `34.88` / `0.63s` | **`41.52`** / `0.58s` | `45.02 tok/s` | **+19.1%** |
+| **8K context** (`7,935` prompt tok) | `30.26` / `25.11s` | **`42.38`** / `25.05s` | `43.55 tok/s` | **+40.1%** |
+| **18K needle (`18,035` tok, cold / SSD-warm / post-restart)** | `60.8s` cold / `3.7s` repeat wall | **`52.2s` cold (`41.7 tok/s`) / `0.60s` TTFT (`43.9 tok/s`) / `0.55s` TTFT post-restart (`44.1 tok/s`)** | `44.05 tok/s` | **Flat decode speed 1K→18K** |
 
-**The app.** [Download MLX-Serve](https://github.com/ddalcu/mlx-serve/releases/latest/download/MLX-Serve.dmg), drag it to Applications and open it. It needs macOS 26.2 or later on Apple Silicon, suggests a model that fits your Mac, and updates itself.
+*(A full 1,048,576-token prompt occupancy test was not benchmarked; 1M context is configured and exposed with 4-bit KV caching, and live-verified up to 18,035 tokens with SSD prefix cache persistence across restarts.)*
 
-**Homebrew.**
+---
+
+## What Changed
+
+All engine optimizations live cleanly inside `src/plugins/inkling2/`, plus one streaming reasoning parser fix in `src/host/chat/reasoning/think_tags.zig`:
+
+1. **Native FP16 activations & weights on Apple7/8 (M1/M2, `gen < 15`)** (`plugin.zig`, `layers.zig`, `ups.metal`, `downs.metal`):
+   - M1/M2 GPUs lack hardware BF16 ALUs. Automatically runs Inkling-2-Mini in FP16 while applying NVFP4 per-expert `global_scale` in `float32` before narrowing to FP16 so intermediate expert activations never overflow (`INKLING_FORCE_BF16=1` disables).
+2. **Fused Q4/Q8 KV Attention with Relative Bias, Sinks & Output Gate** (`qkv_ink2.metal`, `qkv_ink2_merge.metal`, `qkv_ink2_verify.metal`, `qkv_ink2_verify_merge.metal`):
+   - Stock `inkling2` ignored quantized KV triples and forced full 48-layer KV dequantization every token (~5 ms penalty by 8K).
+   - Reads packed Q4/Q8 KV cache directly with `simdgroup_float8x8` MMA, fuses per-head relative bias + sink + sigmoid output gate, tunes `nsplit = clamp((t_k + 255) / 256, 1, 16)`, and lets 4-bit `o_proj` run on MLX's ~228 GB/s `qmv_fast` instead of ~77 GB/s `oproj.metal`.
+3. **Barrier-Free MoE `downs.metal` & Zero-Waste NVFP4 `ups.metal`**:
+   - Rewrote `downs.metal` so each SIMD group sweeps all `KSEL * (I / 16)` (`8 × 72 = 576 = 18 × 32`) chunks across `ROWS=4` output columns at `BG=8` (`256` threads/TG) with zero `threadgroup_barrier` and zero idle SIMD lanes (~255 GB/s vs ~93 GB/s in cold-DRAM microbenchmarks).
+   - Added an exact 8-value (`uint`) NVFP4 sweep (`288 / 32 = 9` full iterations, `ROWS=2, BG=8`) to `ups.metal` (~257 GB/s vs ~144 GB/s) and fast `uint` 4-bit/8-bit affine paths in `bank_header.metal`.
+4. **Coalesced FP16 Loop Message Gates & Hoisted Constants** (`gate.metal`, `kernels.zig`, `plugin.zig`):
+   - Converts `gates.{down,forget,message}` from F32 to FP16, transposes `forget`/`message` to `[4, RANK, D]` with threadgroup SRAM staging (`TG=128`), and hoists ~336 per-token constant array allocations onto `layers.Body`.
+5. **Opt-In M1 DSpark MTP (`INKLING_FORCE_DRAFT=1`)** (`draft.zig`, `markov_fold.metal`, `qkv_ink2_verify.metal`, `plugin.zig`):
+   - Adds FP16 + 8-bit quantized drafter layers (`INKLING_DRAFT_BITS=4|6|8|16`), symmetric per-row INT8 `d.fold` (`103 MB → 51.5 MB`, cutting draft latency from `9.8 ms` to `6.15 ms`), fused Q4 KV verify up to `S=8`, and expected-tokens-per-ms draft count selection.
+   - **Why it stays opt-in on M1/M2:** Across Inkling-2-Mini's 48 visits of 128-expert (`top_k=8`) MoE without SME/NAX tiles, verifying `S=4..5` rows (`53–67 ms`) + drafting (`6.2 ms`) needs `~3.0` tokens/round just to break even against our `~20.6 ms` (`45–48.5 tok/s`) pipelined serial path. DSpark reached `51.3 tok/s` on repetitive `1K_raw` copy tasks, but trailed serial on real Python code (`45.6` vs `48.5`), English (`43.1` vs `47.4`), Greek (`41.2` vs `46.2`), `xhigh` (`40.9` vs `45.0`), and 8K (`40.0` vs `42.4`). Keeping M1/M2 serial by default gives the highest real-world speed and saves ~400 MB RAM while leaving `INKLING_FORCE_DRAFT=1` available for copy-heavy workloads.
+6. **Inkling SSE `<|content_thinking|>` Separation Fix** (`src/host/chat/reasoning/think_tags.zig`):
+   - Latches `<|content_thinking|>` on model-opened reasoning blocks and guards split boundaries on `<|end_message|>` so streamed thinking stays strictly inside `reasoning_content` without leaking into visible `content`.
+
+---
+
+## Virtually Lossless Q4-Attention / Q6-Head Pack (`tools/requant_inkling2_q4attn.py`)
+
+Because Inkling-2-Mini runs 48 visits per token, stock 8-bit `self_attn` projections (`~1,374 MB/tok`) and 8-bit `lm_head` (`~492 MB/tok`) dominate non-MoE bandwidth on M1 Max. Requantizing **only** `self_attn.*_proj` to 4-bit affine (`gs=64`) and `embed_tokens`/`lm_head` to 6-bit affine (`gs=64`) — while keeping **all 24 layers' MoE experts 100% bit-for-bit untouched** — cuts model size from `15.6 GB` to `15.0 GB` and unlocks MLX's 4-bit `qmv_fast` / `verifyQmm` lanes with virtually zero quality loss:
+
+- **KLD (`tests/inkling2_kld.py`, 2,726 positions across Zig/Python/Markdown):**
+  - Mean KLD: `0.0269 ± 0.0015` (median `0.0064`)
+  - Top-1 agreement: `93.4%`
+  - Perplexity: `3.912` vs `3.902` (`+0.010` ppl)
 
 ```bash
-brew tap ddalcu/mlx-serve https://github.com/ddalcu/mlx-serve
-brew trust ddalcu/mlx-serve
-brew install --cask mlx-serve   # the app
-brew install mlx-serve          # or only the command-line server
+python3 tools/requant_inkling2_q4attn.py \
+  --src /path/to/inkling2-mlx-canonical \
+  --dst /path/to/inkling2-mlx-q4attn
 ```
 
-**The terminal**, if you know Ollama:
+---
+
+## Building & Running
+
+Requires Zig 0.17.0 and macOS Apple Silicon (see [README_UPSTREAM.md](README_UPSTREAM.md) for submodule/MLX build scripts):
 
 ```bash
-mlx-serve run gemma4          # downloads Gemma 4 E4B, serves it and chats right here
-mlx-serve pull gemma4:26b     # download only, resumable
-mlx-serve serve               # serve everything you downloaded; models load when asked for
+git clone --recursive https://github.com/namp/mlx-serve-inkling2-m1.git
+cd mlx-serve-inkling2-m1
+./scripts/build-mlx.sh
+zig build -Doptimize=ReleaseFast -Dunits=true -j4
 ```
 
-The server listens on `http://localhost:11234`. Point any OpenAI, Anthropic or Ollama client at it, or open that address in a browser for the built-in web console.
+Serve with 1M context, Q4 KV caching, and 2 GB SSD prefix cache:
 
-### iPhone
+```bash
+./zig-out/bin/mlx-serve \
+  --model /path/to/inkling2-mlx-q4attn \
+  --serve --host 127.0.0.1 --port 8085 \
+  --ctx-size 1048576 --max-tokens 65536 \
+  --os-reserve-gib 16 --max-concurrent 1 \
+  --kv-quant 4 --no-vision \
+  --prefix-cache-entries 4 --no-prefix-cache-ram --prefix-cache-disk 2GB \
+  --temp 1.0 --top-p 1.0 --top-k 0
+```
 
-[MLX-Serve](https://apps.apple.com/us/app/mlx-chat-local-ai/id6787603518) puts the same engine on your iPhone: chat with Gemma 4, clone your voice, and make pictures and music, all on the phone and offline. It needs an A17 Pro-class iPhone or newer with iOS 26.
+### Runtime Environment Knobs
 
-### Linux and Windows
-
-Every release has Linux downloads for NVIDIA GPUs: x64 for RTX 20 to 50 cards, arm64 for DGX Spark, GH200 and Jetson Thor. On Windows with an NVIDIA card, one script builds it. Details are in [docs/building.md](docs/building.md#linux-and-windows-nvidia).
-
-## What it does
-
-- **Coding agents on a local model.** `mlx-serve launch claude` starts Claude Code against your Mac, set up with the model's real context window. Codex, OpenCode, pi, Grok and others work the same way. [Integrations](docs/integrations.md)
-- **Pictures, video, music, speech and 3D.** FLUX.2, Qwen-Image, MiniMax-H3-Image, Krea, MOSS-Image, LTX-Video, MiniMax-H3, ACE-Step, YuE2, Qwen3-TTS with voice cloning, and Hunyuan3D, in the app or over HTTP. [The app](docs/app.md)
-- **Transcripts and meeting notes.** Speech to text in 30 languages, with word timings and who said what. The menu bar records a call and writes the notes. [API](docs/api.md#other-endpoints)
-- **Models bigger than your Mac.** GLM-5.3-Flash and DeepSeek-V4.1-Flash run on a 128 GB Mac by reading their experts from the SSD. Two Macs on a Thunderbolt 5 cable can run one model together, and Macs on your network can use each other's models. [CLI](docs/cli.md) · [FAQ](docs/faq.md#can-my-macs-share-models-over-the-network)
-- **An assistant that lives on your Mac.** Chat with your documents, talk to it hands-free, give agents a sandboxed shell and MCP tools, or schedule tasks in plain English. [The app](docs/app.md)
-- **The APIs your tools already use.** OpenAI chat, completions and Responses, Anthropic Messages and Ollama, all on one port, with streaming, tool calls, JSON schemas, vision and reasoning. [API](docs/api.md)
-
-## What can my Mac run?
-
-The app suggests a first model for your Mac's memory:
-
-| Memory | Suggested model |
+| Env Var | Effect |
 |---|---|
-| 16 GB | Gemma 4 E4B |
-| 18–24 GB | Gemma 4 12B |
-| 32 GB | Qwen 3.8 27B |
-| 36 GB | Qwen 3.8 27B 6-bit |
-| 48–64 GB | Qwen 3.8 27B 8-bit |
-| 96 GB and up | Qwen3.8-Flash-Next (125B, about 6B active per token) |
-| 128 GB | Also GLM-5.3-Flash and DeepSeek-V4.1-Flash, their experts streamed from the SSD |
-| 256 GB | Also GLM-5.3-Flash in memory (NVIDIA's FP4 pack) |
+| `INKLING_FORCE_BF16=1` | Disable M1/M2 native FP16 mode (fall back to BF16) |
+| `INKLING_NO_FUSED_QKV=1` | Disable fused Q4/Q8 KV decode attention (`qkv_ink2`) |
+| `INKLING_NO_FUSED_QKV_VERIFY=1` | Disable fused Q4/Q8 KV verify attention (`qkv_ink2_verify`) |
+| `INKLING_FORCE_DRAFT=1` | Opt in to M1/M2 DSpark MTP (useful for copy-heavy/repetitive workloads) |
+| `INKLING_NO_DRAFT=1` | Force serial decode even on Apple9+ |
+| `INKLING_DRAFT_BITS=4\|6\|8\|16` | Drafter transformer layer quantization width on M1/M2 (default `8`) |
+| `INKLING_DRAFT_MAX=1..7` | Cap drafted tokens per round on M1/M2 (default `7`) |
+| `INKLING_NO_FOLD_Q8=1` | Keep Markov `d.fold` in FP16 instead of per-row symmetric INT8 |
 
-Thousands more run too: any MLX model with a supported architecture, and any GGUF. The [tier list](https://mlxserve.com/llm-tier-list/) ranks the popular ones, and [docs/models.md](docs/models.md) lists every architecture.
-
-## Speed
-
-Decode speed in v26.11.3 on an M5 Ultra with 256 GB, on a code prompt, with speculative decoding on:
-
-| Model | Tokens per second |
-|---|---:|
-| Qwen3.6 35B-A3B, 4-bit | 439 |
-| Qwen3.8 27B, 4-bit | 244 |
-| Gemma 4 E4B, 4-bit | 197 |
-| Gemma 4 26B-A4B, 4-bit | 184 |
-| Qwen3.8-Flash-Next, 4.7 bits | 168 |
-
-On an M4 Max, the same models decode 10% to 47% faster than they did in v26.8. Every release is measured the same way in [benchmarks.md](benchmarks.md); speculative decoding and tuning are in [docs/performance.md](docs/performance.md).
-
-## Docs
-
-- [Integrations](docs/integrations.md): Claude Code, Codex, OpenCode, pi, Zed and more
-- [HTTP API](docs/api.md): OpenAI, Anthropic, Ollama and the media endpoints
-- [CLI and server flags](docs/cli.md)
-- [The Mac app](docs/app.md), with the media tour
-- [Supported models](docs/models.md)
-- Write a plugin without rebuilding the server: [model](docs/plugin-model.md), [media](docs/plugin-media.md), [quant](docs/plugin-quant.md)
-- [Performance and tuning](docs/performance.md)
-- [Building from source](docs/building.md) and [NVIDIA GPUs](docs/CUDA.md)
-- [FAQ](docs/faq.md) and the [changelog](CHANGELOG.md)
-
-## Build from source
-
-You need Xcode 26.2 or later and [Homebrew](https://brew.sh):
+### Benchmarking
 
 ```bash
-git clone --recurse-submodules https://github.com/ddalcu/mlx-serve && cd mlx-serve
-./app/build.sh
+python3 tools/bench_inkling2.py \
+  --bin ./zig-out/bin/mlx-serve \
+  --model /path/to/inkling2-mlx-q4attn
 ```
-
-The script fetches the pinned Zig, builds MLX and llama.cpp, and signs the app ad hoc. There's no Python anywhere in the build. Server-only builds are in [docs/building.md](docs/building.md).
-
-## Community
-
-Questions, ideas and things you made: the [community chat on X](https://x.com/i/chat/group_join/g2108335256541741397/K38XS6aGRh) and [GitHub issues](https://github.com/ddalcu/mlx-serve/issues). Builds and deep dives go out on [YouTube](https://www.youtube.com/@DavidDalcu) and [X](https://x.com/ddalcu).
-
-## Thank you
-
-Thank you to the sponsors who back mlx-serve: @jcprichard, @skudinov, @davidfekke, @lojza3d, @cpko, @d-b, @alinselea, Johnny Dang and @R0xr1te. If it's useful to you, you can support it on [GitHub Sponsors](https://github.com/sponsors/ddalcu) or [Buy Me a Coffee](https://buymeacoffee.com/ddalcu). Nothing is paywalled: it's MIT now and stays MIT.
-
-Thank you also to everyone who sends code, reports and ideas. The [contributors page](https://github.com/ddalcu/mlx-serve/graphs/contributors) shows the code side, and the [changelog](CHANGELOG.md) thanks people release by release.
-
-## Acknowledgements
-
-mlx-serve builds on [MLX](https://github.com/ml-explore/mlx), [mlx-c](https://github.com/ml-explore/mlx-c), [mlx-lm](https://github.com/ml-explore/mlx-lm), [llama.cpp](https://github.com/ggerganov/llama.cpp), [antirez/ds4](https://github.com/antirez/ds4), [mlx-stream](https://github.com/davidtai/mlx-stream), [Sushi](https://github.com/beamivalice/sushi), [jinja.cpp](https://github.com/wangzhaode/jinja.cpp), [nlohmann/json](https://github.com/nlohmann/json), [stb_image](https://github.com/nothings/stb), [libwebp](https://chromium.googlesource.com/webm/libwebp), [Hugging Face tokenizers](https://github.com/huggingface/tokenizers) and [Zig](https://ziglang.org). It runs the open models their authors published, and the app uses the [Anthropic](https://github.com/anthropics/swift-sdk) and [MCP](https://github.com/modelcontextprotocol/swift-sdk) Swift SDKs.
-
-Licenses and required notices are in [NOTICE](NOTICE). If we missed you, please open a PR.
-
-## Star history
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/star-history-dark.svg">
-  <img alt="GitHub star history for ddalcu/mlx-serve" src="docs/star-history.svg">
-</picture>
-
-<!-- regenerate with: python3 scripts/star-chart.py -->
-
-[![ddalcu%2Fmlx-serve | Trendshift](https://trendshift.io/api/badge/repositories/43025)](https://trendshift.io/repositories/43025)
-
-If mlx-serve is useful to you, a star helps other people find it.
-
-## License
-
-MIT, see [LICENSE](LICENSE). Bundled third-party code keeps its own license: [NOTICE](NOTICE) lists it with the required attributions, and [LICENSE-APACHE-2.0](LICENSE-APACHE-2.0) has the Apache license text.
