@@ -1,0 +1,7 @@
+/* MLX-Serve 简体中文 — Info.plist 文案 */
+
+"CFBundleDisplayName" = "MLX-Serve";
+"NSAppleEventsUsageDescription" = "MLX-Serve 在 Agent 模式下通过 AppleScript 控制 Safari 和其他应用。";
+"NSLocalNetworkUsageDescription" = "只有在设置里开启局域网共享时，MLX-Serve 才会使用你的局域网：通过 Bonjour 广播你选择共享的模型，并发现其他 Mac 共享的模型。任何数据都不会离开你的网络。";
+"NSAudioCaptureUsageDescription" = "只在转写同时录制桌面音频时需要：录下 Mac 播放的声音，比如通话的另一方。音频不会离开你的 Mac。";
+"NSMicrophoneUsageDescription" = "用于语音模式和录制音频提示。应用播放音频时 macOS 也会请求此权限；播放绝不会录音。";

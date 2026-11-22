@@ -1,0 +1,598 @@
+import Foundation
+
+private let bytesPerGiB: Double = 1_073_741_824
+
+/// Data behind the Model Browser's "Recommended" pane: the Gemma 4 and
+/// Qwen checkpoints this app is tuned hardest for (native MTP
+/// speculative decode, PLD, the assistant-drafter catalog all target these),
+/// grouped by family and explained in plain English for someone who has
+/// never picked a local model before. It intentionally does NOT reuse
+/// `gemmaModelOptions`: that catalog is a flat download-tray list keyed for
+/// CLI-style browsing, where this one needs the descriptive copy the pane
+/// renders. Both point at the same underlying HuggingFace repos.
+///
+/// Every `sizeGB` below is the real on-disk weight size — summed from each
+/// repo's safetensors dtype byte counts via the HuggingFace API, the same
+/// convention `GemmaModelOption.sizeEstimate` uses (raw weights, not the
+/// +20% RAM-with-overhead figure `HFModel.ramEstimate` shows elsewhere) —
+/// not guessed from the model name.
+///
+/// # Capability scores (`intelligence` / `speed` / `contextTokens`)
+///
+/// The three bars the Model Browser draws. All three describe the ORIGINAL
+/// published weights, not the 4-bit/2-bit build this pick downloads — a quant
+/// moves quality a little and speed a lot, and pretending otherwise would make
+/// every bar a claim we can't source.
+///
+/// **Intelligence** is the Artificial Analysis Intelligence Index
+/// (<https://artificialanalysis.ai/models/open-source>), read on **2026-07-30**,
+/// rescaled `round(index / 60 × 100)` so the bar is "fraction of the best model
+/// available anywhere" (the index's frontier sat at 61 that day). Where a model
+/// is published in both reasoning and non-reasoning modes the REASONING number
+/// is used — this app runs them with thinking available. Models the site has no
+/// entry for carry our own estimate and `intelligenceIsEstimated = true`; there
+/// is no "unrated" state, because a missing bar reads as "bad" rather than
+/// "unknown".
+///
+/// **Speed** is always our OWN relative estimate, never the site's: their
+/// figure is measured on cloud GPUs, and that ordering does not survive the
+/// move to Apple Silicon, where decode is bandwidth-bound and ACTIVE
+/// parameters dominate. Same M4 Max, 26.7.12 bench (benchmarks.md; the
+/// per-cell CSV lives in git history at docs/perf-csvs/all-26.7.12.csv):
+/// `gemma4-26b-a4b` 118 tok/s against `gemma4-31b` 25 tok/s — a 4.7× gap a
+/// cloud comparison shows as nearly level. The score is `round(100 × tok/s / 200)`
+/// over PLAIN autoregressive decode, capped at 100, calibrated against that
+/// CSV where a row exists and estimated from active params + weight bytes
+/// elsewhere. A pick whose checkpoint ships its own draft head that this app
+/// runs by default (`speedIsWithMtp`) scores the bench's `mtp` cell instead:
+/// that IS the rate the user gets, and scoring it serial would rank the
+/// fastest model here behind Gemma E2B. Opt-in speculation (DSpark, PLD, the
+/// assistant drafter) stays excluded. `activeParamsB` exists so the plain
+/// scores can be CHECKED rather than trusted — see the ordering invariant in
+/// `RecommendedModelsTests`; MTP-scored picks are swept separately there.
+///
+/// **Context** is the checkpoint's own `max_position_embeddings`, read from
+/// each repo's `config.json`. It is deliberately NOT the RAM-clamped effective
+/// window: the bars compare models to each other, and the clamp is a property
+/// of the user's Mac.
+
+/// Which curated section a pick belongs to. Gemma/Qwen are vendor families;
+/// `largest` is a RAM tier — the biggest models this app runs (Qwen 3.8
+/// Flash-Next and DeepSeek-V4.1-Flash on the native MLX arch),
+/// grouped by "needs a very large Mac" rather than vendor.
+enum RecommendedModelFamily: String {
+    case gemma = "Gemma"
+    case qwen = "Qwen"
+    case liquid = "Liquid"
+    case largest = "Largest models"
+}
+
+/// One curated, plain-English download recommendation.
+struct RecommendedModelPick: Identifiable, Hashable {
+    let id: String
+    let name: String
+    /// Short (~3 word) framing shown right under the name.
+    let tagline: String
+    /// The full explanation, written for someone with zero AI experience —
+    /// what it's good at and what the trade-off is versus its neighbors.
+    /// Rendered as the description under the model in the list row.
+    let blurb: String
+    let repoId: String
+    /// Approximate on-disk weight size in GB.
+    let sizeGB: Double
+    let family: RecommendedModelFamily
+    /// 0–100. The Artificial Analysis Intelligence Index, rescaled — see the
+    /// file header for the source, the as-of date and the rescale.
+    let intelligence: Int
+    /// True when the site had no entry for this model and `intelligence` is our
+    /// own estimate. Never a reason to hide the bar; the pane says so instead.
+    let intelligenceIsEstimated: Bool
+    /// 0–100. Our own Apple-Silicon decode estimate — never the site's
+    /// cloud-GPU speed. See the file header.
+    let speed: Int
+    /// True when `speed` is the bench's MTP cell rather than plain decode —
+    /// the checkpoint ships a draft head this app runs by default.
+    var speedIsWithMtp: Bool = false
+    /// The checkpoint's own context window (`max_position_embeddings`), NOT the
+    /// RAM-clamped effective one.
+    let contextTokens: Int
+    /// Active parameters per token, in billions — dense models count their
+    /// whole size, an MoE counts only what it wakes (Flash-Next is
+    /// 125B-**A6B**, so 6). Read from each repo's config/model card, and
+    /// the basis the hand-edited `speed` scores are checked against: on Apple
+    /// Silicon decode is bandwidth-bound, so a model with more active
+    /// parameters must never be scored FASTER than one with fewer.
+    let activeParamsB: Double
+    /// Overrides the generic weights×1.2 RAM estimate for picks where that
+    /// formula misleads (e.g. a build whose runtime footprint or context needs
+    /// push the honest recommendation gate above what the on-disk size implies).
+    /// Used by DeepSeek-V4-Flash, where ×1.2 overshoots the real footprint by
+    /// enough to hide the model from the Mac it was converted for.
+    var ramOverrideGB: Double? = nil
+    /// For a GGUF/ds4 pick: the specific `.gguf` file this recommendation
+    /// downloads (the repo ships many; the curated pick names one known-good
+    /// quant). nil for a safetensors pick, whose whole repo is fetched. When
+    /// set, the pane downloads via the GGUF path (and auto-pulls the ds4 MTP
+    /// draft head) instead of the safetensors-tree path.
+    var ggufFilename: String? = nil
+
+    var sizeLabel: String { String(format: "~%.1f GB", sizeGB) }
+
+    /// The quant this pick downloads, read off the GGUF filename or the repo
+    /// name ("…-4bit", "…-oQ2e", "…-mixed-2-3-8bit", "…-NVFP4-…"). nil when the
+    /// name carries none.
+    var quantLabel: String? {
+        if let f = ggufFilename { return DownloadManager.quantLabel(forFilename: f) }
+        let name = (repoId as NSString).lastPathComponent
+        if let r = name.range(of: "mixed(-[0-9]+)+bit", options: .regularExpression) {
+            let bits = name[r].dropFirst("mixed-".count).dropLast("bit".count).split(separator: "-")
+            return "mixed \(bits.joined(separator: "/"))-bit"
+        }
+        if let r = name.range(of: "(iQ-MLX|Sushi)(-Pruned[0-9]+)?-[0-9.]+bpw", options: .regularExpression) {
+            let tag = name[r].dropLast("bpw".count)
+            let dash = tag.lastIndex(of: "-")!
+            return "\(tag[..<dash].replacingOccurrences(of: "-Pruned", with: " Pruned")) \(tag[tag.index(after: dash)...]) bpw"
+        }
+        if let r = name.range(of: "(?<![A-Za-z0-9])[0-9]+bit", options: .regularExpression) {
+            return name[r].dropLast("bit".count) + "-bit"
+        }
+        if let r = name.range(of: "(?<![A-Za-z0-9])(oQ[0-9]+e?|NVFP[0-9]+|MXFP[0-9]+|Q[0-9]_[A-Z0-9_]+)(?![A-Za-z0-9])",
+                              options: .regularExpression) {
+            return String(name[r])
+        }
+        return nil
+    }
+
+    // MARK: - Capability bars
+    //
+    // 0…1 track fills. No number is ever rendered next to them: the scores are
+    // a hand-maintained comparison between these picks, and printing "62" would
+    // claim a precision they don't have.
+
+    var intelligenceBar: Double { Double(intelligence) / 100 }
+    var speedBar: Double { Double(speed) / 100 }
+
+    /// Context on a LOG scale between 32K (empty) and 1M (full). Linear would
+    /// leave every pick but DeepSeek pinned at a quarter of the track, because
+    /// the field's windows are powers of two two doublings apart.
+    var contextBar: Double {
+        let floorTokens = 32_768.0, ceilTokens = 1_048_576.0
+        let t = Double(max(contextTokens, 1))
+        let f = (log2(t) - log2(floorTokens)) / (log2(ceilTokens) - log2(floorTokens))
+        return min(max(f, 0), 1)
+    }
+
+    /// Approximate RAM this checkpoint needs once loaded — weights plus the
+    /// same ~20% KV-cache/runtime-buffer overhead `HFModel.ramEstimate` and
+    /// `GemmaModelOption.sizeEstimate` budget for elsewhere in the app.
+    var approxRAMNeededGB: Double { ramOverrideGB ?? sizeGB * 1.2 }
+
+    /// Whether what this Mac can give a model (the GPU's usable budget, not
+    /// physical RAM) covers what the model needs. This is a SOFT signal for the
+    /// UI (dim the row, explain why) — never a hard download gate. The rest of
+    /// the app never blocks on this either (Discover just colors a fitness dot;
+    /// ImageGenView warns and lets the user proceed anyway), so a pick that
+    /// doesn't meet requirements stays fully downloadable/usable here too.
+    func meetsSystemRequirements(memory: SystemMemoryInfo) -> Bool {
+        memory.fit(neededGB: approxRAMNeededGB).fitsAtAll
+    }
+}
+
+/// The fixed pool of picks the Recommended pane draws from, as static
+/// members on the type itself so the catalogs below can use plain
+/// dot-shorthand (`.gemmaE4B`).
+extension RecommendedModelPick {
+    static let lfm3_1_7b = lfm3(id: "lfm3-1.7b", name: "LFM3 1.7B", tagline: "Tiny and quick",
+        blurb: "Liquid's small text model: answers in a blink, thinks before it answers, and calls tools. A good fit for quick questions on any Mac.",
+        repo: "LiquidAI/LFM3-1.7B-MLX-8bit", sizeGB: 1.9, context: 262_144)
+    static let lfm3Omni2b = lfm3(id: "lfm3-omni-2b", name: "LFM3 Omni 2B", tagline: "Sees, hears and speaks",
+        blurb: "Everything at once: pictures, video and your voice in, text or its own voice out. Native voice mode in a model under 3 GB.",
+        repo: "LiquidAI/LFM3-Omni-2B-MLX-8bit", sizeGB: 2.9, context: 128_000)
+
+    private static func lfm3(id: String, name: String, tagline: String, blurb: String, repo: String,
+                             sizeGB: Double, context: Int) -> RecommendedModelPick {
+        RecommendedModelPick(id: id, name: name, tagline: tagline, blurb: blurb, repoId: repo, sizeGB: sizeGB,
+                             family: .liquid, intelligence: 15, intelligenceIsEstimated: true, speed: 85,
+                             contextTokens: context, activeParamsB: 1.7)
+    }
+}
+
+extension RecommendedModelPick {
+    static let gemmaE4B = RecommendedModelPick(
+        id: "gemma-4-e4b",
+        name: "Gemma 4 E4B",
+        tagline: "The sweet spot",
+        blurb: "A clear step up in quality from E2B — better at longer conversations, writing, and coding — while still replying quickly. A great all-around default if you're not sure what to pick.",
+        repoId: "mlx-community/gemma-4-e4b-it-4bit",
+        sizeGB: 4.8,
+        family: .gemma,
+        intelligence: 20,
+        intelligenceIsEstimated: false,
+        speed: 57,
+        contextTokens: 131_072,
+        activeParamsB: 4.0
+    )
+
+    static let gemma12B = RecommendedModelPick(
+        id: "gemma-4-12b",
+        name: "Gemma 4 12B",
+        tagline: "Sharper reasoning",
+        blurb: "Noticeably better at following detailed, multi-step instructions and reasoning through trickier problems than the smaller Gemma models, without needing a huge amount of memory.",
+        repoId: "mlx-community/gemma-4-12b-it-4bit",
+        sizeGB: 6.3,
+        family: .gemma,
+        intelligence: 37,
+        intelligenceIsEstimated: false,
+        speed: 23,
+        contextTokens: 262_144,
+        activeParamsB: 12.0
+    )
+
+    static let gemma26bA4b = RecommendedModelPick(
+        id: "gemma-4-26b-a4b",
+        name: "Gemma 4 26B-A4B",
+        tagline: "Big, but efficient",
+        blurb: "A much larger model that uses a trick called \u{201c}mixture of experts\u{201d} — for every word it only wakes up a small part of itself, so it answers faster than you'd expect for its size while giving noticeably better answers than the smaller Gemma models.",
+        repoId: "mlx-community/gemma-4-26b-a4b-it-4bit",
+        sizeGB: 14.3,
+        family: .gemma,
+        intelligence: 33,
+        intelligenceIsEstimated: false,
+        speed: 59,
+        contextTokens: 262_144,
+        activeParamsB: 4.0
+    )
+
+    static let gemma31B = RecommendedModelPick(
+        id: "gemma-4-31b",
+        name: "Gemma 4 31B",
+        tagline: "Gemma's biggest all-rounder",
+        blurb: "Gemma's largest single model — every part of it is used on every word, with no shortcuts. Excellent general reasoning, writing, and instruction-following.",
+        repoId: "mlx-community/gemma-4-31b-it-4bit",
+        sizeGB: 17.2,
+        family: .gemma,
+        intelligence: 48,
+        intelligenceIsEstimated: false,
+        speed: 13,
+        contextTokens: 262_144,
+        activeParamsB: 31.0
+    )
+
+    static let gemma26bA4b8bit = RecommendedModelPick(
+        id: "gemma-4-26b-a4b-8bit",
+        name: "Gemma 4 26B-A4B (higher precision)",
+        tagline: "Sharper version of the MoE model",
+        blurb: "The same Gemma mixture-of-experts model as above, stored with twice the numeric precision (8-bit instead of 4-bit). That means slightly more accurate, consistent answers, at roughly double the memory.",
+        repoId: "mlx-community/gemma-4-26b-a4b-it-8bit",
+        sizeGB: 26.0,
+        family: .gemma,
+        intelligence: 33,
+        intelligenceIsEstimated: false,
+        speed: 33,
+        contextTokens: 262_144,
+        activeParamsB: 4.0
+    )
+
+    /// MiMo-V2.6 distilled to 9B on ddalcu's 4-bit pack — the entry-level
+    /// Qwen pick. A dense 9B with a vision tower (the repo is tagged
+    /// image-text-to-text) and a 256K window, small enough for a 16 GB Mac.
+    ///
+    /// `intelligence` is ESTIMATED: the index has no entry for the distill.
+    /// Placed a notch above the retired Qwen 9B's 35 on the maintainer's
+    /// read. `speed` is the 9B-class rate (no benchmarks.md row yet).
+    static let mimo9b = RecommendedModelPick(
+        id: "mimo-9b",
+        name: "MiMo 9B",
+        tagline: "Small, sharp, and quick",
+        blurb: "A smaller model that punches above its size — good at everyday chat, coding help, and following instructions, and it reads images too. The lightest Qwen here, so it fits Macs with less memory while still replying quickly.",
+        repoId: "ddalcu/MiMo-V2.6-Distill-Qwen-9B-MLX-Serve-4bit",
+        sizeGB: 7.1,
+        family: .qwen,
+        intelligence: 38,
+        intelligenceIsEstimated: true,
+        speed: 28,
+        contextTokens: 262_144,
+        activeParamsB: 9.7
+    )
+
+    /// Qwen 3.8 27B, the pick this app leads with on any Mac that can hold it.
+    /// Same geometry as the 3.6 27B it replaces (dense 27B, 64 layers, 256K
+    /// context) with a newer generation's weights, a vision tower and the MTP
+    /// draft head inside the checkpoint rather than in a sidecar.
+    ///
+    /// `intelligence` is ESTIMATED: the model shipped 2026-08-14 and the index
+    /// has no entry for it. Placed one point above the 3.6 27B it supersedes
+    /// — a newer generation of the same size class — and below
+    /// DeepSeek-V4-Flash. `speed` is the bench's MTP cell (68 tok/s on
+    /// an M4 Max, 26.9.2) — the head ships in the checkpoint and runs by
+    /// default, so that is the rate the user sees.
+    static let qwen38_27b = RecommendedModelPick(
+        id: "qwen38-27b",
+        name: "Qwen 3.8 27B",
+        tagline: "One of the strongest models here",
+        blurb: "One of the most capable models this app can run — excellent at coding and at multi-step \u{201c}agent\u{201d} tasks like using tools and following a plan, and it reads images too. It also ships with a built-in speed trick that lets it draft and double-check several words at once, so it feels noticeably faster than a plain model this size.",
+        repoId: "ddalcu/Qwen3.8-27B-MLX-Serve-4bit",
+        sizeGB: 18.2,
+        family: .qwen,
+        intelligence: 63,
+        intelligenceIsEstimated: true,
+        speed: 34,
+        speedIsWithMtp: true,
+        contextTokens: 262_144,
+        activeParamsB: 27.0
+    )
+
+    /// The same Qwen 3.8 27B at 6 and 8 bits: starter picks for 36 GB and
+    /// 48-64 GB Macs, not browser rows. `speed` is the 4-bit cell scaled by
+    /// weight bytes (decode is bandwidth-bound), not measured.
+    static let qwen38_27b6bit = qwen38_27bVariant(bits: 6, sizeGB: 27.0, speed: 23)
+    static let qwen38_27b8bit = qwen38_27bVariant(bits: 8, sizeGB: 35.0, speed: 18)
+
+    private static func qwen38_27bVariant(bits: Int, sizeGB: Double, speed: Int) -> RecommendedModelPick {
+        RecommendedModelPick(
+            id: "qwen38-27b-\(bits)bit",
+            name: "Qwen 3.8 27B \(bits)-bit",
+            tagline: "The strongest 27B, at higher precision",
+            blurb: "The same Qwen 3.8 27B, stored at \(bits) bits per weight instead of 4, so its answers stay closer to the original model's. Excellent at coding and multi-step agent work, reads images, and drafts several words at once for speed.",
+            repoId: "ddalcu/Qwen3.8-27B-MLX-Serve-\(bits)bit",
+            sizeGB: sizeGB,
+            family: .qwen,
+            intelligence: qwen38_27b.intelligence,
+            intelligenceIsEstimated: true,
+            speed: speed,
+            speedIsWithMtp: true,
+            contextTokens: qwen38_27b.contextTokens,
+            activeParamsB: qwen38_27b.activeParamsB
+        )
+    }
+
+    /// prism-ml's Bonsai 2: Qwen3.8-27B requantized to ternary 2-bit behind
+    /// Hadamard rotations (`prism_hadamard_qwen35`), 8.6 GB, so the 27B fits
+    /// a 16 GB Mac. The repo ships no MTP head; the server grafts the 27B
+    /// pack's head at load (`mtp_graft.zig`), so it runs by default.
+    ///
+    /// `intelligence` is ESTIMATED (no index entry), placed below the 4-bit
+    /// 27B: a 2-bit squeeze of the same model never beats it. `speed` is the
+    /// 71 tok/s measured with the grafted head at depth 2 on an M4 Max
+    /// (26.9.5 dev, code prompts), not a bench.sh cell.
+    static let bonsai2_27b = RecommendedModelPick(
+        id: "bonsai2-27b",
+        name: "Bonsai 2 27B",
+        tagline: "The 27B, sized for 16 GB",
+        blurb: "Qwen 3.8 27B squeezed down to about 2 bits per weight by prism-ml, so one of the strongest models here fits a Mac with 16 GB of memory. It gives up some accuracy against the full-size 27B and replies slower on a small Mac, but it is far smarter than anything else that fits in 16 GB. It reads images too, and uses the same built-in speed trick as the 27B.",
+        repoId: "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit",
+        sizeGB: 8.6,
+        family: .qwen,
+        intelligence: 55,
+        intelligenceIsEstimated: true,
+        speed: 36,
+        speedIsWithMtp: true,
+        contextTokens: 262_144,
+        activeParamsB: 27.0
+    )
+
+    /// DeepSeek-V4.1-Flash for a 128 GB Mac: our pack keeps 192 of each layer's 384 experts at 2 bits (the
+    /// 256 GB pick's model, so its intelligence and context). The RAM gate is the 91 GB measured active on a
+    /// 128 GB M4 Max plus room for macOS: a 96 GB Mac has none. `speed` is that M4 Max's 31 tok/s with DSpark
+    /// (on by default), measured with the Engram table read from another Mac's disk.
+    static let deepseekV41Pruned = RecommendedModelPick(
+        id: "deepseek-v41-flash-pruned192",
+        name: "DeepSeek-V4.1-Flash Pruned",
+        tagline: "DeepSeek V4.1 for 128 GB",
+        blurb: "DeepSeek's newest frontier model, slimmed to fit a Mac with 128 GB of memory: each layer keeps the 192 of its 384 experts our agent and coding traffic uses most, at 2 bits per weight. Code, reasoning and tool calls hold up best; chat is weaker than the full model and other languages than English are much weaker. It holds around a million words of context and reads images. About 92 GB stays in memory plus a 203 GB lookup table read from disk as it runs, so plan for the 296 GB download on a fast internal SSD and close other apps first.",
+        repoId: "ddalcu/DeepSeek-V4.1-Flash-1017-MLX-Serve-iQ-MLX-Pruned192-2.25bpw",
+        sizeGB: 296.2,
+        family: .largest,
+        intelligence: deepseekV41Flash.intelligence,
+        intelligenceIsEstimated: true,
+        speed: 16,
+        speedIsWithMtp: true,
+        contextTokens: 1_048_576,
+        activeParamsB: 16.0,
+        ramOverrideGB: 100.0
+    )
+
+    /// DeepSeek-V4.1-Flash in our iQ-MLX 3.0 bpw pack on the native
+    /// `deepseek_v41` arch: 224 GB of weights resident plus the 203 GB Engram
+    /// table, read from disk as it runs (427 GB download). The RAM gate is the
+    /// load's measured ~213 GB wired peak: a 256 GB Mac, not a 192 GB one.
+    ///
+    /// `intelligence` is ESTIMATED (no index entry): the top of the scale, on
+    /// the maintainer's call. `activeParamsB` is read off config.json (6 of
+    /// 384 experts + 1 shared, ~16B). `speed` is scored with its draft stages:
+    /// DSpark ships in the pack and runs by default, and the maintainer puts it
+    /// level with Flash-Next; no M4 Max holds it to measure.
+    static let deepseekV41Flash = RecommendedModelPick(
+        id: "deepseek-v41-flash",
+        name: "DeepSeek-V4.1-Flash",
+        tagline: "Our smartest model, for 256 GB",
+        blurb: "DeepSeek's newest frontier model, running natively on Apple Silicon through MLX, for top-tier reasoning, coding and agent work. It wakes only a fraction of itself per word (mixture of experts), holds around a million words of context, and reads images. This is our own iQ-MLX conversion at 3 bits per weight: about 224 GB that stays in memory plus a 203 GB lookup table read from disk as it runs, so it wants a Mac with 256 GB of memory and the 427 GB download on a fast SSD (raise the GPU wired limit and close other apps to fit a useful context).",
+        repoId: "ddalcu/DeepSeek-V4.1-Flash-1017-MLX-Serve-iQ-MLX-3.0bpw",
+        sizeGB: 427.3,
+        family: .largest,
+        intelligence: 100,
+        intelligenceIsEstimated: true,
+        speed: qwen38FlashNext.speed,
+        speedIsWithMtp: true,
+        contextTokens: 1_048_576,
+        activeParamsB: 16.0,
+        ramOverrideGB: 215.0
+    )
+
+    /// Our own MLX-Serve pack of the 3.6 35B-A3B with the MTP head in the
+    /// checkpoint. `speed` is the bench's MTP cell (259 tok/s on an M4 Max,
+    /// 26.9.2) — the fastest model in this list by a wide margin.
+    static let qwen36_35bA3b = RecommendedModelPick(
+        id: "qwen36-35b-a3b",
+        name: "Qwen 3.6 35B-A3B",
+        tagline: "The fastest model here",
+        blurb: "Qwen's mixture-of-experts model — 35 billion parameters in total, but like the Gemma mixture-of-experts model above, it only activates a few billion per word. It ships with a built-in speed trick that drafts and double-checks several words at once, which makes it the fastest model on this list by a wide margin. Excellent for demanding coding and reasoning work.",
+        repoId: "ddalcu/Qwen3.6-35B-A3B-MLX-Serve-4bit",
+        sizeGB: 19.5,
+        family: .qwen,
+        intelligence: 53,
+        intelligenceIsEstimated: false,
+        speed: 100,
+        speedIsWithMtp: true,
+        contextTokens: 262_144,
+        activeParamsB: 3.0
+    )
+
+    /// Qwen 3.8 Flash-Next (125B-A6B) in our iQ-MLX 4.7 bpw pack (the mixed
+    /// 4/8-bit layout, experts quantized with an importance matrix):
+    /// the qwen3_5 trunk inside hyper-connections, an n-gram embedding table
+    /// (32 GB, mmapped at serve time, never resident) and the MTP layer in the
+    /// checkpoint. ~100 GB on disk, but only the ~70 GB of weights is
+    /// resident, so the RAM gate is an explicit 78 GB: a 96 GB Mac (tight
+    /// against Metal's default working set there), not the ×1.2 128.
+    ///
+    /// `intelligence` is ESTIMATED (no index entry), placed level with
+    /// DeepSeek-V4-Flash. `speed` is the bench's MTP cell (93 tok/s on an M4
+    /// Max, 26.9.2).
+    static let qwen38FlashNext = RecommendedModelPick(
+        id: "qwen38-flash-next",
+        name: "Qwen Flash-Next iQ 4.7bpw",
+        tagline: "Frontier-class, still quick",
+        blurb: "Qwen's largest model here — 125 billion parameters, of which it wakes only about 6 billion per word (mixture of experts), so it answers at a pace closer to a mid-size model than to one this big. Reasoning, coding and agent work at the same level as DeepSeek-V4-Flash, it reads images, and it ships with a built-in speed trick that drafts and double-checks several words at once. This is our own calibrated build at 4.7 bits per weight, about 100 GB on disk, of which a 32 GB lookup table stays on disk while it runs, so it fits a Mac with 96 GB of memory.",
+        repoId: "ddalcu/Qwen3.8-Flash-Next-MLX-Serve-iQ-MLX-4.7bpw",
+        sizeGB: 100.0,
+        family: .largest,
+        intelligence: 67,
+        intelligenceIsEstimated: true,
+        speed: 47,
+        speedIsWithMtp: true,
+        contextTokens: 262_144,
+        activeParamsB: 6.0,
+        ramOverrideGB: 78.0
+    )
+
+    /// Qwen 3.8 Flash-Next in the Sushi project's 2bpw pack (beamster): routed experts
+    /// in EXL3, served through lib/sushi. Scores are Flash-Next's own (the bars
+    /// describe the original weights), context is the checkpoint's YaRN 1M, and
+    /// the RAM gate is Sushi's README figure for a full 128k context (GiB). Its
+    /// tier is a stock 64 GB Mac: on 48 GB it needs a raised `iogpu.wired_limit_mb`,
+    /// which the app cannot set, and the 3bpw pack does not fit a stock 64 GB Mac.
+    static let sushi2bpw = RecommendedModelPick(
+        id: "sushi-2bpw",
+        name: "Qwen Flash-Next Sushi 2bpw",
+        tagline: "EXL3 Variant for 64 GB Macs",
+        blurb: "The same 125 billion parameter Qwen 3.8 Flash-Next, packed by the Sushi project to about 2 bits per weight so it fits a Mac with 64 GB of memory. Fewer bits means a smaller download and less memory, at a small cost in answer quality. Part of the download is a lookup table that stays on disk while it runs.",
+        repoId: "beamster/Qwen3.8-Flash-Next-Sushi-2bpw",
+        sizeGB: 69.6,
+        family: .largest,
+        intelligence: qwen38FlashNext.intelligence,
+        intelligenceIsEstimated: true,
+        speed: qwen38FlashNext.speed,
+        speedIsWithMtp: true,
+        contextTokens: 1_048_576,
+        activeParamsB: 6.0,
+        ramOverrideGB: 41.7
+    )
+
+}
+
+extension RecommendedModelPick {
+    /// Gemma 4 picks, ascending by size: the welcome screen's General picks
+    /// and the small-Mac starter tiers. Not a section of the Recommended pane.
+    static let gemmaCatalog: [RecommendedModelPick] = [
+        .gemmaE4B, .gemma12B, .gemma26bA4b, .gemma31B, .gemma26bA4b8bit,
+    ]
+
+    /// Qwen picks, ascending by size — the Recommended pane's other family
+    /// section. The 6/8-bit and iQ variants of these checkpoints live in
+    /// Discover search instead, and the 3.6 27B MTP pack stays out on the
+    /// maintainer's call (the 3.8 is better for the same RAM).
+    static let qwenCatalog: [RecommendedModelPick] = [
+        .mimo9b, .bonsai2_27b, .qwen38_27b, .qwen36_35bA3b,
+    ]
+
+    /// The largest models this app runs, ascending by on-disk size (the app's
+    /// smallest-first convention) — Qwen 3.8 Flash-Next (~100 GB), DeepSeek-V4.1-Flash
+    /// pruned for 128 GB (~296 GB download) then V4.1-Flash (~430 GB). Grouped by
+    /// "needs a very large Mac" rather than by vendor.
+    static let largestCatalog: [RecommendedModelPick] = [
+        .sushi2bpw, .qwen38FlashNext, .deepseekV41Pruned, .deepseekV41Flash,
+    ]
+
+    /// Liquid LFM3, the Recommended pane's first section: the small text model and the Omni that sees, hears and
+    /// speaks (native voice, the composer's purple toggle). One trunk (1.7B active) under both; speed is estimated
+    /// from its weight bytes (no M4 Max cell yet), intelligence is ours (no Artificial Analysis entry).
+    static let liquidCatalog: [RecommendedModelPick] = [lfm3_1_7b, lfm3Omni2b]
+
+    /// Every curated pick: the pane's sections plus the Gemma picks the welcome screen and the starter offer —
+    /// the union the score invariants sweep and the one list a new section can't slip past.
+    static let allCatalogs: [RecommendedModelPick] =
+        gemmaCatalog + qwenCatalog + liquidCatalog + largestCatalog
+
+    // MARK: - The starter recommendation
+
+    /// The ONE model to offer someone who has downloaded nothing yet, chosen
+    /// from this Mac's memory. Total by construction — every input
+    /// returns a pick — and the single source of truth for all three surfaces
+    /// that make this recommendation: the Model Browser's "Best for your Mac"
+    /// card, the welcome window's starter card, and the chat gate. Two copies
+    /// of this decision is how two of them start recommending different models.
+    ///
+    /// Each tier is the largest pick that still leaves the machine room to do
+    /// anything else (`approxRAMNeededGB` = weights × 1.2, the app's ~20%
+    /// runtime overhead), never merely the largest that fits:
+    ///
+    /// | Physical RAM (band cap) | Pick | Disk | RAM needed |
+    /// |---|---|---|---|
+    /// | ≤ 16 GB  | Gemma 4 E4B         |  4.8 GB |  5.8 GB |
+    /// | 16–32 GB | Gemma 4 12B         |  6.3 GB |  7.6 GB |
+    /// | 32–36 GB | Qwen 3.8 27B 4-bit  | 18.2 GB | 21.8 GB |
+    /// | 36–48 GB | Qwen 3.8 27B 6-bit  | 27.0 GB | 32.4 GB |
+    /// | 48–96 GB | Qwen 3.8 27B 8-bit  | 35.0 GB | 42.0 GB |
+    /// | 96 GB+   | Qwen 3.8 Flash-Next |  100 GB |   78 GB |
+    ///
+    /// 16 GB is upper-inclusive (a 16 GB Mac gets E4B); the bands above are
+    /// lower-inclusive, since 32, 36, 48 and 96 GB are the Macs each pick is
+    /// chosen for.
+    ///
+    /// The band only caps the pick: it steps down to the largest pick at or
+    /// below it that fits what the GPU can give a model (`usableBytes`, not
+    /// physical RAM): a 36 GB Mac gives models about 28 GB, and the 6-bit 27B
+    /// needs 32.4.
+    static func starterPick(memory: SystemMemoryInfo) -> RecommendedModelPick {
+        let gib = memory.totalGB
+        let band = gib <= 16 ? 0 : gib < 32 ? 1 : gib < 36 ? 2 : gib < 48 ? 3 : gib < 96 ? 4 : 5
+        return starterLadder[...band].last { $0.meetsSystemRequirements(memory: memory) } ?? .gemmaE4B
+    }
+
+    /// The starter picks, smallest first, one per RAM band of `starterPick`.
+    static let starterLadder: [RecommendedModelPick] = [
+        .gemmaE4B, .gemma12B, .qwen38_27b, .qwen38_27b6bit, .qwen38_27b8bit, .qwen38FlashNext,
+    ]
+}
+
+extension Array where Element == RecommendedModelPick {
+    /// Split a family catalog into what this Mac's RAM covers and what it
+    /// doesn't, preserving each side's relative (ascending-size) order. The
+    /// Recommended pane shows the first inline and tucks the second behind a
+    /// "Requires more RAM" disclosure — nothing is ever dropped, just
+    /// deferred until the user asks to see it.
+    func partitionedByRequirements(memory: SystemMemoryInfo) -> (fits: [RecommendedModelPick], requiresMoreRAM: [RecommendedModelPick]) {
+        var fits: [RecommendedModelPick] = []
+        var requiresMoreRAM: [RecommendedModelPick] = []
+        for pick in self {
+            if pick.meetsSystemRequirements(memory: memory) {
+                fits.append(pick)
+            } else {
+                requiresMoreRAM.append(pick)
+            }
+        }
+        return (fits, requiresMoreRAM)
+    }
+}
+
+/// The hover card over the two capability bars: which bar is which, and the
+/// score behind it — the bars alone cannot say either.
+enum CapabilityTip {
+    static func lines(for pick: RecommendedModelPick) -> [String] {
+        [
+            "Intelligence: \(pick.intelligence)" + (pick.intelligenceIsEstimated ? " (our estimate)" : ""),
+            "Speed: \(pick.speed)" + (pick.speedIsWithMtp ? " (with its built-in draft head)" : ""),
+        ]
+    }
+}

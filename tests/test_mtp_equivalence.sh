@@ -1,0 +1,342 @@
+#!/bin/bash
+# test_mtp_equivalence.sh — native MTP head: auto-load, per-request opt-out, ENGAGEMENT (`[spec-stats] mode=mtp`
+# attempts > 0 per request on chat stream + non-stream and /v1/messages), an ACCEPTANCE floor (best avg_per_round >=
+# 0.5: a head built without the +1 norm fold engages yet accepts ~0), and temp-0 equivalence of the first
+# $PREFIX_CHARS against --no-mtp, TIE-AWARE (a mismatch replays serially with logprobs and passes only when the first
+# divergent token is a near-tie, top-2 gap <= 0.15 nats). Boots --prefix-cache-entries 0 --no-drafter.
+#
+#   MTP_TEST_MODEL=<dir> ./tests/test_mtp_equivalence.sh [port]   # default ddalcu/Qwen3.8-27B-MLX-Serve-4bit
+#   MTP_EXPECT_AUTO_PROFILE=<tag> MTP_EXPECT_AUTO_DEPTH=<n>  pin a calibrated surface's boot arm and realized depth
+#   MTP_FORCE_ENABLE=1  inject enable_mtp:true (runs on qwen4_exp packs: in-checkpoint head, `[qwen4] MTP head loaded`)
+#
+# Heads: any mtp.sidecar_rel_paths file or a checkpoint carrying an mtp_marker_key; standalone sidecars rebuild with
+# tests/build_mtp_sidecar.py.
+
+set -u
+source "$(dirname "$0")/lib/server.sh"
+source "$(dirname "$0")/_lib_models.sh"
+MODEL="${MTP_TEST_MODEL:-$(find_fitting_model ddalcu/Qwen3.8-27B-MLX-Serve-4bit ddalcu/Qwen3.8-27B-MLX-Serve-iQ-MLX-3.8bpw)}"
+PORT="${1:-11313}"
+BIN="./zig-out/bin/mlx-serve"
+# ~24 tokens of prefix. Mirrors the PLD/KV-quant first-N thresholds: INT4
+# float-reduction near-ties legitimately flip argmax past ~25-30 tokens
+# (observed live at char ~116 on warm prefix-cache requests).
+PREFIX_CHARS="${PREFIX_CHARS:-100}"
+MAX_TOKENS=120
+PROMPT="Write a short story about a robot learning to paint."
+EXPECT_AUTO_PROFILE="${MTP_EXPECT_AUTO_PROFILE:-}"
+EXPECT_AUTO_DEPTH="${MTP_EXPECT_AUTO_DEPTH:-}"
+if { [ -n "$EXPECT_AUTO_PROFILE" ] && [ -z "$EXPECT_AUTO_DEPTH" ]; } ||
+    { [ -z "$EXPECT_AUTO_PROFILE" ] && [ -n "$EXPECT_AUTO_DEPTH" ]; }; then
+    echo "ERROR: MTP_EXPECT_AUTO_PROFILE and MTP_EXPECT_AUTO_DEPTH must be set together"
+    exit 2
+fi
+# Injected into every request body; empty by default (server defaults apply).
+OPTIN=""
+if [ "${MTP_FORCE_ENABLE:-0}" = "1" ]; then
+    OPTIN='"enable_mtp":true,'
+fi
+
+checkpoint_has_mtp_head() {
+    [ -f "$MODEL/mtp/weights.safetensors" ] ||
+        [ -f "$MODEL/mtp.safetensors" ] ||
+        [ -f "$MODEL/model-mtp.safetensors" ] ||
+        [ -f "$MODEL/optiq/mtp.safetensors" ] ||
+        [ -f "$MODEL/mtp_head.safetensors" ] ||
+        python3 - "$MODEL" <<'PY'
+import json
+import pathlib
+import sys
+
+model = pathlib.Path(sys.argv[1])
+markers = {
+    "mtp.fc.weight",
+    "language_model.mtp.fc.weight",
+    "mtp.eh_proj.weight",
+    "language_model.mtp.eh_proj.weight",
+    "mtp.fc_hidden.weight",
+    "language_model.mtp.fc_hidden.weight",
+}
+
+try:
+    weight_map = json.loads((model / "model.safetensors.index.json").read_text()).get("weight_map", {})
+    if markers.intersection(weight_map):
+        raise SystemExit(0)
+except (OSError, ValueError, AttributeError):
+    pass
+
+try:
+    with (model / "model.safetensors").open("rb") as f:
+        header_len = int.from_bytes(f.read(8), "little")
+        if header_len > 64 * 1024 * 1024:
+            raise ValueError("oversized safetensors header")
+        header = json.loads(f.read(header_len))
+    raise SystemExit(0 if markers.intersection(header) else 1)
+except (OSError, ValueError, AttributeError):
+    raise SystemExit(1)
+PY
+}
+
+if [ ! -d "$MODEL" ] || ! checkpoint_has_mtp_head; then
+    if [ -n "$EXPECT_AUTO_PROFILE" ]; then
+        echo "FAIL: required MTP checkpoint not detected at $MODEL"
+        exit 1
+    fi
+    echo "SKIP: model with MTP head not found at $MODEL"
+    exit 0
+fi
+
+PASS=0
+FAIL=0
+LOG=/tmp/mtp_equiv_server.log
+
+start_server() { # $1 = extra flags
+    srv_preclean "$PORT"
+    sleep 1
+    # --prefix-cache-entries 0: byte-stable greedy on a HYBRID needs the
+    # prefix cache off (CLAUDE.md) — a warm restore re-runs the recurrence in
+    # a different block size and legitimately flips near-tie argmaxes inside
+    # the byte-compared prefix (the char-~116 drift noted above was this).
+    # --no-drafter: a pack shipping its own drafter/ would otherwise outrank
+    # the MTP head and this script would measure DFlash.
+    # shellcheck disable=SC2086
+    "$BIN" --model "$MODEL" --serve --port "$PORT" --no-pld --no-drafter --prefix-cache-entries 0 --log-level info $1 >"$LOG" 2>&1 &
+    SERVER_PID=$!
+    srv_wait_health "http://127.0.0.1:$PORT" 120 1 || true
+    # /health answers as soon as the socket binds — the model is still
+    # loading behind it. Wait for the load's own ready line, timeout scaled
+    # to the checkpoint size.
+    local model_mb ready_secs
+    model_mb=$(du -sm "$MODEL" 2>/dev/null | awk '{print $1}')
+    ready_secs=$(( 300 + ${model_mb:-0} / 100 ))
+    for _ in $(seq 1 $((ready_secs / 3)) ); do
+        grep -q "Model ready (loaded on inference thread)" "$LOG" && return 0
+        kill -0 "$SERVER_PID" 2>/dev/null || break
+        sleep 3
+    done
+    echo "FAIL: server did not become ready"; cat "$LOG" | tail -20; exit 1
+}
+
+stop_server() {
+    kill "$SERVER_PID" 2>/dev/null
+    wait "$SERVER_PID" 2>/dev/null
+}
+
+chat_nonstream() {
+    curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' -d "{
+        $OPTIN\"model\":\"default\",\"stream\":false,\"temperature\":0,\"max_tokens\":$MAX_TOKENS,
+        \"messages\":[{\"role\":\"user\",\"content\":\"$PROMPT\"}]}" |
+        python3 -c "import json,sys; print(json.load(sys.stdin)['choices'][0]['message']['content'], end='')"
+}
+
+chat_stream() {
+    curl -sN "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' -d "{
+        $OPTIN\"model\":\"default\",\"stream\":true,\"temperature\":0,\"max_tokens\":$MAX_TOKENS,
+        \"messages\":[{\"role\":\"user\",\"content\":\"$PROMPT\"}]}" |
+        python3 -c "
+import json, sys
+out = []
+for line in sys.stdin:
+    line = line.strip()
+    if not line.startswith('data: ') or line == 'data: [DONE]': continue
+    try: d = json.loads(line[6:])
+    except Exception: continue
+    for c in d.get('choices', []):
+        out.append(c.get('delta', {}).get('content') or '')
+print(''.join(out), end='')"
+}
+
+messages_nonstream() {
+    curl -s "http://127.0.0.1:$PORT/v1/messages" -H 'Content-Type: application/json' -d "{
+        $OPTIN\"model\":\"default\",\"stream\":false,\"max_tokens\":$MAX_TOKENS,\"temperature\":0,
+        \"messages\":[{\"role\":\"user\",\"content\":\"$PROMPT\"}]}" |
+        python3 -c "import json,sys; print(''.join(b.get('text','') for b in json.load(sys.stdin)['content']), end='')"
+}
+
+# On a byte mismatch, decide TIE vs BUG: replay the prompt serially
+# (enable_mtp:false, adds no mode=mtp lines) on the SAME server with logprobs
+# and read the serial top-2 gap at the first divergent character. Verify
+# forwards (qmm) and serial decode (qmv) reduce in different orders, so a
+# near-tied argmax legitimately lands on either candidate — and WHICH
+# positions get verified at which width depends on draft content, so any
+# draft-side change can move the flip. A spec plumbing bug (committing a
+# token verify never approved) diverges at a CONFIDENT position and still
+# fails here. Observed live: an EXACT 0.0000 top-2 tie at token 13 of this
+# very prompt on Qwen3.8-27B.
+tie_gap_at_divergence() { # $1 expected-file, $2 actual-file → prints gap or "none"
+    python3 - "$1" "$2" "$PORT" "$MAX_TOKENS" "$PROMPT" <<'PYEOF'
+import json, sys, urllib.request
+expf, actf, port, max_tokens, prompt = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5]
+exp = open(expf).read()
+act = open(actf).read()
+n = min(len(exp), len(act))
+i = next((k for k in range(n) if exp[k] != act[k]), n)
+body = {"model": "default", "stream": False, "temperature": 0, "max_tokens": max_tokens,
+        "enable_mtp": False, "logprobs": True, "top_logprobs": 2,
+        "messages": [{"role": "user", "content": prompt}]}
+req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions",
+                             data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+resp = json.load(urllib.request.urlopen(req, timeout=600))
+entries = (resp["choices"][0].get("logprobs") or {}).get("content") or []
+pos = 0
+for e in entries:
+    tok = e.get("token") or ""
+    if pos + len(tok) > i:
+        tops = e.get("top_logprobs") or []
+        if len(tops) >= 2:
+            print(f"{abs(tops[0]['logprob'] - tops[1]['logprob']):.4f}")
+        else:
+            print("none")
+        sys.exit(0)
+    pos += len(tok)
+print("none")
+PYEOF
+}
+
+check() { # $1 name, $2 expected-prefix-file, $3 actual-file, $4 expected new mtp engagements (log delta)
+    local name="$1" expf="$2" actf="$3" want_engage="$4"
+    local exp act
+    exp=$(head -c "$PREFIX_CHARS" "$expf")
+    act=$(head -c "$PREFIX_CHARS" "$actf")
+    if [ -z "$act" ]; then
+        echo "FAIL [$name]: empty output"; FAIL=$((FAIL+1)); return
+    fi
+    if [ "$want_engage" = "yes" ]; then
+        local stats
+        stats=$(grep -c "\[spec-stats\] mode=mtp" "$LOG")
+        if [ "$stats" -lt "$ENGAGE_BASE" ] || [ "$stats" -eq "$ENGAGE_BASE" ]; then
+            echo "FAIL [$name]: no new '[spec-stats] mode=mtp' log line (engagement hole!)"
+            FAIL=$((FAIL+1)); return
+        fi
+        ENGAGE_BASE=$stats
+    fi
+    if [ "$exp" != "$act" ]; then
+        local gap
+        gap=$(tie_gap_at_divergence "$expf" "$actf")
+        if python3 -c "import sys; g='$gap'; sys.exit(0 if g not in ('', 'none') and float(g) <= 0.15 else 1)"; then
+            echo "PASS [$name] (spec/serial argmax flip at a near-tie, top-2 gap=$gap)"
+            PASS=$((PASS+1)); return
+        fi
+        echo "FAIL [$name]: first $PREFIX_CHARS chars differ from no-mtp baseline (top-2 gap at divergence: ${gap:-unreadable} — NOT a near-tie)"
+        echo "  expected: $(echo "$exp" | head -c 80)..."
+        echo "  actual:   $(echo "$act" | head -c 80)..."
+        FAIL=$((FAIL+1)); return
+    fi
+    echo "PASS [$name]"
+    PASS=$((PASS+1))
+}
+
+echo "── baseline server (--no-mtp) ──"
+start_server "--no-mtp"
+chat_nonstream > /tmp/mtp_base_chat.txt
+messages_nonstream > /tmp/mtp_base_msg.txt
+if grep -q "mode=mtp" "$LOG"; then
+    echo "FAIL: --no-mtp server ran MTP rounds"; FAIL=$((FAIL+1))
+else
+    echo "PASS [no-mtp baseline clean]"; PASS=$((PASS+1))
+fi
+stop_server
+
+echo "── MTP server (default-on) ──"
+start_server ""
+# The qwen4_exp head is the checkpoint's own layer and logs its own line.
+if ! grep -q "MTP head ready\|\[qwen4\] MTP head loaded" "$LOG"; then
+    echo "FAIL: server did not auto-load the MTP sidecar"; tail -5 "$LOG"; FAIL=$((FAIL+1))
+else
+    echo "PASS [mtp auto-load]"; PASS=$((PASS+1))
+fi
+if [ -n "$EXPECT_AUTO_PROFILE" ]; then
+    EXPECT_READY="MTP head ready (depth=$EXPECT_AUTO_DEPTH, profile=$EXPECT_AUTO_PROFILE)."
+    if grep -Fq "$EXPECT_READY" "$LOG"; then
+        echo "PASS [auto profile fingerprint] ($EXPECT_AUTO_PROFILE, depth=$EXPECT_AUTO_DEPTH)"; PASS=$((PASS+1))
+    else
+        echo "FAIL [auto profile fingerprint]: expected '$EXPECT_READY'"
+        grep "MTP head ready" "$LOG" | tail -1
+        FAIL=$((FAIL+1))
+    fi
+fi
+ENGAGE_BASE=0
+chat_nonstream > /tmp/mtp_on_chat.txt
+check "chat non-stream" /tmp/mtp_base_chat.txt /tmp/mtp_on_chat.txt yes
+chat_stream > /tmp/mtp_on_chat_stream.txt
+check "chat stream" /tmp/mtp_base_chat.txt /tmp/mtp_on_chat_stream.txt yes
+messages_nonstream > /tmp/mtp_on_msg.txt
+check "messages non-stream" /tmp/mtp_base_msg.txt /tmp/mtp_on_msg.txt yes
+# Acceptance floor: a broken head engages but accepts ~0 tokens per round.
+# avg_per_round is depth-independent (per_draft_pct divides by depth and
+# legitimately dilutes on chained creative drafts at the depth-3 default).
+BEST_ACCEPT=$(grep -o 'avg_per_round=[0-9.]*' "$LOG" | cut -d= -f2 | sort -n | tail -1)
+if python3 -c "import sys; sys.exit(0 if float('${BEST_ACCEPT:-0}') >= 0.5 else 1)"; then
+    echo "PASS [acceptance floor] (best avg_per_round=${BEST_ACCEPT})"; PASS=$((PASS+1))
+else
+    echo "FAIL [acceptance floor]: best avg_per_round=${BEST_ACCEPT:-none} < 0.5 — head is drafting garbage"
+    FAIL=$((FAIL+1))
+fi
+# Fused-kernel engagement (anti-silent-no-op, kv-quant class): every qwen
+# 3.5/3.6 checkpoint is hd 256 with GDN layers, so both fusions must fire on
+# the verify widths this server just ran. Output equality alone is blind to a
+# decline gate quietly routing everything back to the composed chain.
+# Nemotron-H (Mamba2 + hd-128 attention) has its own kernels; its engagement
+# line is the fused Mamba2 step.
+ARCH=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1] + '/config.json')).get('model_type', ''))" "$MODEL" 2>/dev/null)
+if [ "$ARCH" = "nemotron_h" ]; then
+    ENGAGE_LINES=("\[mamba2\] fused step engaged")
+else
+    ENGAGE_LINES=("\[attn\] fused QK-norm\+RoPE \(hd-256\) engaged" "\[gdn\] (packed prework|verify recur|verify fold) engaged")
+fi
+for ENGAGE_LINE in "${ENGAGE_LINES[@]}"; do
+    if grep -qE "$ENGAGE_LINE" "$LOG"; then
+        echo "PASS [engaged: $ENGAGE_LINE]"; PASS=$((PASS+1))
+    else
+        echo "FAIL [not engaged: $ENGAGE_LINE] — fused path silently declined"; FAIL=$((FAIL+1))
+    fi
+done
+# Per-request opt-out must fall back to regular decode.
+ENGAGE_PRE=$(grep -c "\[spec-stats\] mode=mtp" "$LOG")
+curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' -d "{
+    \"model\":\"default\",\"stream\":false,\"temperature\":0,\"max_tokens\":24,\"enable_mtp\":false,
+    \"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" >/dev/null
+ENGAGE_POST=$(grep -c "\[spec-stats\] mode=mtp" "$LOG")
+if [ "$ENGAGE_PRE" -eq "$ENGAGE_POST" ]; then
+    echo "PASS [enable_mtp:false opt-out]"; PASS=$((PASS+1))
+else
+    echo "FAIL [enable_mtp:false opt-out]: MTP ran despite per-request disable"; FAIL=$((FAIL+1))
+fi
+
+# EV-controller engagement (dispatch-hole lesson: output equality can't see a
+# silent fallback). An ECHO workload is the max-acceptance case: the adaptive
+# controller must climb past the warmup depth (mean drafted depth > 2).
+ECHO_PROMPT="Repeat the following code block back EXACTLY as written, no commentary: def gcd(a, b):\\n    while b:\\n        a, b = b, a % b\\n    return a\\n\\ndef fib(n, memo={}):\\n    if n in memo: return memo[n]\\n    if n < 2: return n\\n    memo[n] = fib(n-1, memo) + fib(n-2, memo)\\n    return memo[n]\\n\\ndef reverse_string(s):\\n    out = ''\\n    for ch in s:\\n        out = ch + out\\n    return out"
+curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' -d "{
+    $OPTIN\"model\":\"default\",\"stream\":false,\"temperature\":0,\"max_tokens\":160,
+    \"messages\":[{\"role\":\"user\",\"content\":\"$ECHO_PROMPT\"}]}" >/dev/null
+ECHO_STATS=$(grep 'spec-stats\] mode=mtp' "$LOG" | tail -1)
+# Prompt lookup (default on) serves most echo rounds; its rounds and drafts count too.
+ECHO_LOOKUP=$(echo "$ECHO_STATS" | grep -o 'lookup=[0-9]*/[0-9]*' | cut -d= -f2)
+ECHO_ROUNDS=$(( $(echo "$ECHO_STATS" | grep -o 'attempts=[0-9]*' | cut -d= -f2) + ${ECHO_LOOKUP%%/*} ))
+ECHO_DRAFTED=$(( $(echo "$ECHO_STATS" | grep -o ' drafted=[0-9]*' | cut -d= -f2) + ${ECHO_LOOKUP##*/} ))
+if [ "$ARCH" = "nemotron_h" ]; then
+    # A MoE trunk pays per verify row (more experts routed), so the controller
+    # correctly keeps this head at depth 1-2; the auto cap is 2 (ModelConfig.mtpDepth).
+    echo "SKIP [EV controller climb] (nemotron_h: depth capped at 2; drafted=$ECHO_DRAFTED over $ECHO_ROUNDS rounds)"
+elif [ "${ECHO_ROUNDS:-0}" -gt 0 ] && [ "${ECHO_DRAFTED:-0}" -gt $((2 * ECHO_ROUNDS)) ]; then
+    echo "PASS [EV controller climbs on echo] (drafted=$ECHO_DRAFTED over $ECHO_ROUNDS rounds)"; PASS=$((PASS+1))
+else
+    echo "FAIL [EV controller climb]: drafted=${ECHO_DRAFTED:-none} over ${ECHO_ROUNDS:-none} rounds on a max-acceptance echo — depth never rose"
+    FAIL=$((FAIL+1))
+fi
+if [ -n "$EXPECT_AUTO_DEPTH" ]; then
+    AUTO_STATS=$(grep -o '\[spec-stats\] mode=mtp.*' "$LOG" | tail -1)
+    AUTO_DEPTH=$(echo "$AUTO_STATS" | grep -o ' depth=[0-9]*' | grep -o '[0-9]*')
+    if [ "${AUTO_DEPTH:-0}" = "$EXPECT_AUTO_DEPTH" ]; then
+        echo "PASS [auto depth realized on echo] (depth=$AUTO_DEPTH)"; PASS=$((PASS+1))
+    else
+        echo "FAIL [auto depth realized on echo]: depth=${AUTO_DEPTH:-none}, expected $EXPECT_AUTO_DEPTH"
+        FAIL=$((FAIL+1))
+    fi
+fi
+stop_server
+
+echo
+echo "RESULT: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ] || exit 1

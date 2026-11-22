@@ -1,0 +1,1325 @@
+import Foundation
+
+/// The voice backend for hands-free mode.
+enum VoiceEngine: String, Codable, CaseIterable, Sendable {
+    /// macOS `AVSpeechSynthesizer`. No download, no GPU, but robotic.
+    case system
+    /// Qwen3-TTS with the global clone clip (`voiceClonePath`).
+    case clone
+    /// Kokoro-82M with a built-in or blended voice.
+    case kokoro
+    /// LFM3-Audio / Omni's own voices (19 languages, female and male).
+    case lfm3
+
+    /// What Settings and an agent's voice menu offer. `.system` stays for saved agents and as the fallback that keeps
+    /// a failed synthesis from going silent; a saved global `.system` reads as Kokoro.
+    static let selectable: [VoiceEngine] = [.clone, .kokoro, .lfm3]
+
+    var label: String {
+        switch self {
+        case .system: return "System voice"
+        case .clone: return "My cloned voice"
+        case .kokoro: return "Kokoro (fast, built-in voices)"
+        case .lfm3: return "LFM3 (19 languages)"
+        }
+    }
+}
+
+struct ServerOptions: Codable, Equatable {
+    // MARK: Server-launch flags (require restart)
+    var host: String = "0.0.0.0"
+    var port: UInt16 = 11234
+    var ctxSize: Int = 0                // 0 = Auto (memory-bounded safe ceiling, capped at model max)
+    var noVision: Bool = false
+    var logLevel: LogLevel = .info
+    /// Write the server log to `~/.mlx-serve/logs/mlx-serve-<port>.log` (32 MB
+    /// rotation, per port) — THE post-mortem file; the in-app log viewer's
+    /// buffer dies with the app. Default ON, mirroring the server (the file
+    /// sink is on for all serving paths); `toCLIArgs` emits `--log-file off`
+    /// ONLY when disabled, so a default launch stays flag-free.
+    var logToFile: Bool = true
+    var requestTimeout: Int = 300       // seconds; 0 = unlimited
+
+    // Observability (server-launch flag). When true, launches with `--metrics`,
+    // exposing the Prometheus `/metrics` scrape endpoint AND a live throughput/
+    // latency/GPU/memory panel on the server's index page (GET /). ON by
+    // default here — deliberately NOT mirroring the server's own default:
+    // the tray's throughput rows read `/metrics.json`, and the cost is a few
+    // relaxed atomics per request, never per token.
+    var enableMetrics: Bool = true
+    /// Optional API key (`--api-key`). When non-empty, remote (non-loopback)
+    /// requests to the OpenAI/Anthropic/Ollama APIs AND the index page + metrics
+    /// panel require it (Authorization: Bearer / x-api-key / HTTP Basic / query
+    /// param). Loopback is trusted, so this app (127.0.0.1) never needs to send
+    /// it — the key protects the server when bound to the network (0.0.0.0).
+    var apiKey: String = ""
+    /// Tool-call argument auto-correct (`--no-tool-autocorrect` disables). When
+    /// true (default, mirrors the server's `g_tool_autocorrect`), parsed
+    /// tool-call arguments are coerced to the types the tool schema declares
+    /// (e.g. Python `False` → JSON `false`, an `edits` array shipped as a string
+    /// → a real array), fixing the class of "expected boolean, provided string"
+    /// rejections weak models cause. Off = args pass through verbatim (still valid
+    /// JSON; only the schema-type coercion is skipped). `toCLIArgs` emits the flag
+    /// ONLY when false, so a default launch stays flag-free.
+    var toolAutocorrect: Bool = true
+
+    // MARK: LAN sharing (server-launch flags)
+    /// Share models with other Macs on this network (`--lan-share`). OFF by
+    /// default. When on, this Mac advertises itself over Bonjour and LAN
+    /// clients can run inference on the shared models — model management,
+    /// metrics and the status page stay host-local. Privacy: prompts sent to
+    /// a shared model are processed on (and visible to) this Mac.
+    var lanShareEnabled: Bool = false
+    /// Share every local model (default), or only `lanSharedModels`.
+    var lanShareAll: Bool = true
+    /// Model names shared when `lanShareAll` is off (LocalModel.name — the
+    /// server matches registry ids basename-tolerantly).
+    var lanSharedModels: [String] = []
+    /// Use models other Macs share (`--lan-discover`): they appear in every
+    /// model picker as `model @ peer` and requests are proxied to that Mac —
+    /// which sees those prompts. OFF by default.
+    var lanDiscoverEnabled: Bool = false
+    /// Name other Macs see for this one (`--lan-name`). Empty = hostname.
+    var lanName: String = ""
+
+    // MARK: Thunderbolt cluster (RDMA)
+    /// Host: this server runs `clusterModelPath` across this Mac and a worker
+    /// (`--dist`). Worker: the app runs `mlx-serve worker` for another Mac's host.
+    var clusterRole: ClusterRole = .off
+    var clusterMode: ClusterMode = .pipeline
+    /// The model the two Macs serve together; the worker finds its own copy by folder name.
+    var clusterModelPath: String = ""
+    /// The RDMA port facing the other Mac (`rdma_enX`). Empty = the one that is up.
+    var clusterDevice: String = ""
+    /// The host's address the worker dials. Empty = the host's Thunderbolt address.
+    var clusterCoordinator: String = ""
+
+    // Speculative decoding (server-launch flags)
+    var enablePLD: Bool = true          // --pld is default-on now (CLI flips with --no-pld)
+    var pldDraftLen: Int = 5
+    var pldKeyLen: Int = 3
+
+    /// Native multi-token prediction (Qwen 3.5/3.6 checkpoints that ship a
+    /// trained `mtp/` sidecar head). Default ON, mirroring the server — the head
+    /// auto-loads when present and models without one are unaffected, so
+    /// `toCLIArgs` emits `--no-mtp` ONLY when the user turns it off.
+    var enableMTP: Bool = true
+    /// Maximum tokens the MTP head drafts per round. `0` = auto: omit the
+    /// flag so the server tunes depth from measured acceptance. An explicit
+    /// value emits `--mtp-max-depth`; the planner may choose a lower depth.
+    var mtpDepth: Int = 0
+    /// Decode attention requant, TRI-STATE: nil = the server's own default
+    /// (laguna-class dense attention requants ON, DeepSeek-V4's comp_in
+    /// requant stays dense — its characterization found answer movement, so
+    /// the server gates it on the EXPLICIT flag form), true = emit
+    /// `--decode-attn-quant` (opts dsv4 in, +7-8% decode there), false =
+    /// emit `--no-decode-attn-quant` (bit-exact dense everywhere). A plain
+    /// Bool cannot tell "not decided" from "switched on" (the drafterOptOut
+    /// class), and legacy blobs stored the old always-written Bool — the
+    /// decode migration below treats a stored TRUE as undecided, never as an
+    /// explicit opt-in.
+    var decodeAttnQuantChoice: Bool? = nil
+    /// `--dspark`. DeepSeek-V4's DSpark draft stages are OPT-IN server-side:
+    /// enabling them materializes ~11 GB of stage weights at load (the memory
+    /// fit-gate still applies and disables with a log when the box can't hold
+    /// trunk + stages + headroom). Off, matching the server default.
+    var enableDSpark: Bool = false
+    /// `--ane-prefill`. Neural Engine prefill offload: part of every long
+    /// prompt's prefill (dense MLP rows + GatedDeltaNet input projections on
+    /// Qwen 3.5-family models) runs on the ANE in parallel with the GPU.
+    /// Measured +16-20% prefill at 16-32k on an M4 Max; decode untouched.
+    /// The server refuses by name on unsupported models and on Macs under
+    /// 96 GB RAM (the int8 ANE weight copy is ~20 GB wired on a 27B), so the
+    /// flag is always safe to pass — but it stays opt-in and OFF, matching
+    /// the server default, because the copy is real memory and the win is
+    /// per-machine (M5-family GPUs carry NAX cores that raise the GPU's own
+    /// prefill baseline, shrinking the ANE's edge — see AnePrefillAdvice).
+    var anePrefill: Bool = false
+    /// `--ane-image` / `--ane-video` / `--ane-audio`: a share of each media
+    /// DiT block's MLP runs on the Neural Engine beside the GPU (Krea,
+    /// MiniMax-H3, ACE-Step). Off to mirror the server default; the server
+    /// solves the share per Mac and declines by name where the int8 copy
+    /// does not fit.
+    var aneImage: Bool = false
+    var aneVideo: Bool = false
+    var aneAudio: Bool = false
+    /// `--w8a8` / `--no-w8a8`: image, video, music and 3D transformers run as rotated int8 x int8 on
+    /// M5-class GPUs (lossy, faster). The server turns it on by itself only with NAX (M5 family) and
+    /// 64 GiB of RAM, so this default is the same function and BOTH choices are emitted.
+    var w8a8: Bool = ServerOptions.defaultW8a8(
+        physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory, isM5Family: AnePrefillAdvice.liveIsM5Family)
+    static func defaultW8a8(physicalMemoryBytes: UInt64, isM5Family: Bool) -> Bool {
+        isM5Family && physicalMemoryBytes >= 64 * 1_073_741_824
+    }
+    /// `--ane-slots`: requests each Neural Engine model runs at once. Slots share the weights and
+    /// the engines, so they split one stream's speed; each adds its own KV and state.
+    var aneSlots: Int = 1
+
+    // Performance (server-launch flags)
+    /// Continuous batching: max in-flight chat requests batched through one
+    /// forward pass. 1 = serial (default). Hybrid SSM / MoE models clamp to 1
+    /// regardless. Pure-attention dense models pick up ~1.6× at 4-way.
+    var maxConcurrent: Int = 1
+    /// KV-cache quantization scheme. `off` = dense bf16. `int4` / `int8` apply
+    /// affine quant.
+    var kvQuant: KVQuant = .off
+    /// Keep completed prefix snapshots in RAM for low-latency reuse. Turning this off keeps
+    /// the live request KV but retains reusable prefixes only on the SSD tier when enabled.
+    var hotPrefixCacheEnabled: Bool = true
+    /// Hot prefix cache entry count. Used only while RAM retention is enabled. The launcher
+    /// RAM-clamps the emitted value via `ramCappedPrefixCacheEntries`.
+    var prefixCacheEntries: Int = 8
+    /// Hot prefix cache memory budget. `2GB`, `512MB`, etc. `0` or `off`
+    /// disables the byte cap (count cap still applies). Empty = server default
+    /// (2GB, or one session at the working context on qwen4_exp when larger).
+    var prefixCacheMem: String = ""
+    /// `--ple-gpu`: Qwen3.8-Flash-Next keeps its ~30 GB n-gram table resident for the GPU
+    /// gather. OFF matches the server: rows are read from the mmapped file on demand.
+    var pleGpu: Bool = false
+    /// SSD tier for the prefix cache. OFF by default because it can persist
+    /// gigabytes of KV under ~/.mlx-serve/kv-cache. When on, seen prefixes
+    /// survive restarts + RAM evictions (turns a cold 30-50 s long-context
+    /// TTFT into a bounded SSD read). Always emitted (`--prefix-cache-disk
+    /// <size>` on, `off` off) so the process matches the UI regardless of the
+    /// server default. See "SSD prefix cache" in CLAUDE.md.
+    var enablePrefixCacheDisk: Bool = false
+    /// Disk budget when `enablePrefixCacheDisk` is on. `10GB`, `2GB`, etc.
+    var prefixCacheDisk: String = "10GB"
+    /// Registry residency cap (`--max-resident-mem`), in GiB. 0 = Auto, the
+    /// server's own default (the GPU working-set limit). This is the
+    /// gate that decides whether a cold load is admitted AT ALL, and it runs
+    /// BEFORE the memory pre-flight — so `skipMemPreflight` cannot overturn
+    /// it, and without this field a model the auto cap refuses was unloadable
+    /// from the app at any setting. A NUMBER off a slider rather than typed
+    /// text: `main.zig` exits on a `--max-resident-mem` it cannot parse, and a
+    /// value that cannot be malformed needs no validator to drop it.
+    var maxResidentMemGB: Int = 0
+    /// Registry residency cap (`--max-resident-models`): the count of `.ready`
+    /// models the server keeps loaded at once. A hot model switch (the
+    /// composer's picker) never explicitly unloads the model it's replacing —
+    /// it relies entirely on this server-side LRU gate, which evicts the
+    /// least-recently-used resident model before admitting a new load once the
+    /// count would exceed this cap (or refuses the load if nothing is
+    /// evictable). Mirrors the server's own default of 3, so switching models
+    /// a few times in a row can leave that many resident at once before the
+    /// oldest gets evicted. Set to 1 to keep exactly one model loaded at a
+    /// time — every switch unloads the previous model first.
+    var maxResidentModels: Int = 3
+    /// Idle-eviction window (`--idle-evict-secs`), in seconds. 0 = off, the
+    /// server's own default. The registry unloads a model that has served
+    /// nothing for this long; the next request pays a cold load. Seconds off a
+    /// snap ladder, not typed text — `main.zig` reads an unparseable value as
+    /// off, so a typo would silently disable it.
+    var idleEvictSecs: Int = 0
+    /// When true, launch with `--skip-mem-preflight` so the MLX loader skips the
+    /// free-RAM pre-flight that would otherwise refuse a model whose weights +
+    /// warmup headroom look too big for current free memory. The check is
+    /// deliberately conservative (macOS reclaims file cache as MLX allocates),
+    /// so a load it refuses often still fits — but a genuine over-commit can
+    /// hard-crash the server, so this is opt-in.
+    var skipMemPreflight: Bool = false
+    /// `--os-reserve-gib` in GiB; nil = the server's automatic reserve, 0 = none.
+    var osReserveGiB: Int? = nil
+
+    // MARK: Engines
+    /// `--mlx-gguf`. EXPERIMENTAL: lib/mlx-serve-gguf claims the `.gguf` files
+    /// it can serve on MLX itself; the rest still go to ds4 / llama.cpp. Off,
+    /// mirroring main.zig `mlx_gguf_enabled = false`.
+    var mlxGguf: Bool = false
+
+    /// KV-cache quantization for the embedded llama.cpp engine. MLX's
+    /// `--kv-quant` does NOT apply to the llama path (different kernels);
+    /// this is the GGUF-equivalent knob. `off` keeps F16 (libllama
+    /// default); `q8` ≈ 2× compression near-lossless; `q4` ≈ 4× with
+    /// some quality cost. Auto-enables flash-attn server-side when
+    /// non-default.
+    var llamaKvQuant: LlamaKVQuant = .off
+    /// Sequences per llama.cpp model: requests decoded together in one batch,
+    /// each keeping its own prompt KV warm (and holding a full context of KV
+    /// from load). Default 4 MUST match `scheduler.zig` `LlamaSettings.seqs` —
+    /// `toCLIArgs` omits the flag at this value, so a mismatch would silently
+    /// run the server's default instead.
+    var llamaCacheEntries: Int = 4
+    /// Draft tokens per MTP round for a GGUF with an MTP head (its own, or an
+    /// `mtp-*.gguf` beside it); 0 = off. Default 2 mirrors `LlamaSettings.mtp_drafts`.
+    var llamaMtpDrafts: Int = 2
+    /// llama.cpp prefill batch in tokens; 0 = libllama's default (512).
+    var llamaUbatch: Int = 0
+
+    // MARK: ds4-only (DeepSeek-V4-Flash engine)
+    /// When true, launch with `--ssd-streaming` so the embedded ds4 engine
+    /// streams expert weights from SSD instead of holding the whole model
+    /// resident (skips full residency + Metal warmup). Lets DeepSeek-V4-Flash
+    /// run on a Mac whose RAM can't hold the full model. ds4-only — the MLX and
+    /// llama.cpp engines ignore the flag. Default off mirrors main.zig
+    /// `ds4_ssd_streaming = false`.
+    var ssdStreaming: Bool = false
+
+    // MARK: All engines
+    /// Per-LoadedModel LRU cache of chat-template render + tokenize
+    /// results. Applies to MLX, llama.cpp, and ds4 — same handler
+    /// boundary on every path. 0 disables.
+    var tokenizeCacheEntries: Int = 4
+
+    // MARK: Per-request defaults (apply immediately, no restart)
+    // 16384, not 4096: a thinking trace + agentic/code answer routinely blew
+    // past 4 K and tripped finish_reason "length" mid-reply. The server clamps
+    // this to the live context window, so a generous default can't overflow —
+    // it just stops cutting normal answers short. Users can still tune it in
+    // Settings (existing stored values are preserved on upgrade).
+    var defaultMaxTokens: Int = 16384
+    var defaultTemperature: Double = 0.8
+    var defaultTopP: Double = 0.95
+    var defaultTopK: Int = 0            // 0 = disabled
+    var defaultRepeatPenalty: Double = 1.0
+    var defaultPresencePenalty: Double = 0.0
+    var defaultReasoningBudget: Int = -1    // -1 = unlimited
+    var defaultEnableThinking: Bool = false
+
+    // Per-request overrides for spec-decode (default = follow server default)
+    var perRequestEnablePLD: TriState = .auto
+    var perRequestEnableDrafter: TriState = .auto
+
+    // MARK: Messaging bridge (app-level — NOT a server-launch flag, NOT per-request)
+    /// Telegram bot bridge: message your local model from your phone. The bridge
+    /// runs *inside* the app (long-polls Telegram over outbound HTTPS), so it is
+    /// deliberately excluded from `serverLaunchEquals` — toggling it must never
+    /// prompt a server restart.
+    var telegram: TelegramConfig = TelegramConfig()
+
+    // MARK: Agent sandbox (app-level — NOT a server-launch flag, NOT per-request)
+    /// Run the agent's shell/tool commands inside an isolated Linux sandbox
+    /// instead of directly on host macOS. The sandbox is a lightweight Linux
+    /// guest booted on Apple's Virtualization.framework (see `VzGuest`); only
+    /// the working directory is shared in, so a destructive command can't reach
+    /// the rest of the Mac. It's consumed by the app-side tool executor, so —
+    /// like `telegram` — it's deliberately excluded from `serverLaunchEquals`:
+    /// toggling it must never prompt a server restart.
+    var sandbox: SandboxConfig = SandboxConfig()
+
+    // MARK: Tool opt-in (app-level — NOT a server-launch flag, NOT per-request)
+    /// ON = tools are strictly opt-in: the composer never interrupts a send to
+    /// offer Tools or MCP, so the model only gets tools in a chat where the
+    /// wrench (or the tab's agent) turned them on. OFF (default, the shipped
+    /// behavior) keeps the pre-send nudge that spots an agentic-looking message
+    /// and asks first. Read by `ComposerIntent.nudge`, which is the ONE place
+    /// the decision is made — app-side only, so like `sandbox` it is excluded
+    /// from `serverLaunchEquals` and `toCLIArgs`: flipping it never prompts a
+    /// server restart.
+    var toolsOnlyWhenAsked: Bool = false
+
+    /// ON = ⌘Q closes the app's windows and keeps the app and the server
+    /// running in the menu bar (`QuitCommand`). App-level, like `sandbox`.
+    var quitKeepsRunning: Bool = false
+
+    // MARK: Voice clone (app-level — NOT a server-launch flag, NOT per-request)
+    /// Absolute path to the normalized voice-clone reference clip (24 kHz mono
+    /// WAV) that hands-free voice mode speaks with, via Qwen3-TTS zero-shot
+    /// cloning (`/v1/audio/speech` + `ref_audio`). Empty = no clone — voice
+    /// mode uses the macOS system voice. Recorded/picked in Settings ▸ Voice.
+    /// Consumed app-side by `ClonedVoiceSynthesizer`, so — like `telegram` and
+    /// `sandbox` — it's deliberately excluded from `serverLaunchEquals` and
+    /// `toCLIArgs`: changing it must never prompt a server restart.
+    var voiceClonePath: String = ""
+    /// Whether voice mode actually speaks with the clone. Selecting a system
+    /// voice in the voice picker flips this off WITHOUT deleting the clip, so
+    /// switching back to "My voice" stays one click. Defaults true — a clip
+    /// set before this toggle existed keeps cloning (legacy behavior).
+    var voiceCloneEnabled: Bool = true
+    /// Human-readable name for the clip shown in the voice picker (the picked
+    /// file's name, or "Recorded clip") — the stored clip itself is always
+    /// normalized to `voice-clone.wav`, which is useless as a display name.
+    var voiceCloneLabel: String = ""
+
+    /// Which engine hands-free voice mode speaks with. App-side only, like the
+    /// other voice fields — never a server-launch flag, so changing it must not
+    /// prompt a restart.
+    ///
+    /// `.clone` and `.kokoro` are BOTH `/v1/audio/speech`, but on different
+    /// backends with disjoint controls: the clone path sends `ref_audio` and
+    /// has no voice list, Kokoro sends `voice` and cannot clone. Sending the
+    /// wrong one is a named 400 server-side, so the engine choice decides which
+    /// field is sent rather than both being attempted.
+    var voiceEngine: VoiceEngine = .kokoro
+    /// Which Kokoro voice to speak with. A comma-separated list BLENDS voices
+    /// (`"af_bella,af_sky"`) — the reference's own convention, passed through
+    /// verbatim.
+    var kokoroVoice: String = "af_heart"
+    /// Which LFM3 voice to speak with (`<language>-<female|male>`, listed on its `/v1/models` row).
+    var lfm3Voice: String = "american-english-female"
+    /// Wake phrase for hands-free voice mode ("hey loki" by default). Stored
+    /// as the user typed it in Settings ▸ Voice; consumers normalize through
+    /// `WakeWord.normalizePhrase` (blank → default). App-side like the other
+    /// voice fields — never a server-launch flag.
+    var wakePhrase: String = WakeWord.defaultPhrase
+
+    // MARK: Transcribe (app-level, like the voice fields: never a launch flag)
+    /// The chat model that writes a tray transcript's notes: a model path, ""
+    /// for the chat model in use, or `notesOff`.
+    var transcriptNotesModel: String = ""
+    static let notesOff = "off"
+    /// What turns speech into words: the Qwen3-ASR pack with its aligner and diarizer, or Nemotron 3.5 Transcribe
+    /// alone (it times and tells speakers apart itself, and writes the notes).
+    var transcribeEngine: TranscribeEngine = .combo
+    enum TranscribeEngine: String, Codable, CaseIterable, Identifiable {
+        case combo, nemotron
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .combo:    return "Qwen3-ASR + aligner + diarizer"
+            case .nemotron: return "Nemotron 3.5 Transcribe"
+            }
+        }
+        /// The `config.json` model_types of the packs that transcribe (NVIDIA's name and mlx-audio's).
+        var asrModelTypes: [String] {
+            switch self {
+            case .combo:    return ["qwen3_asr"]
+            case .nemotron: return ["nemo_speechlm", "nemotron_transcribe"]
+            }
+        }
+    }
+    /// Minutes of silence after which a tray recording stops itself; 0 never.
+    var transcriptAutoStopMinutes: Int = 10
+    /// Start a tray recording when an app turns the camera on.
+    var transcriptAutoStartCamera: Bool = false
+
+    enum LogLevel: String, Codable, CaseIterable, Identifiable {
+        case error, warn, info, debug
+        var id: String { rawValue }
+        /// Human-readable label for the Settings picker. The raw value is what
+        /// the server's `--log-level` flag accepts — keep these in sync.
+        var label: String {
+            switch self {
+            case .error: return "Error (quietest)"
+            case .warn:  return "Warn"
+            case .info:  return "Info (default)"
+            case .debug: return "Debug (verbose)"
+            }
+        }
+    }
+
+    enum KVQuant: String, Codable, CaseIterable, Identifiable {
+        case off
+        case int4 = "4"
+        case int8 = "8"
+        var id: String { rawValue }
+        /// CLI flag value (`--kv-quant <x>`); same string the server parses.
+        var cliValue: String { rawValue }
+        var label: String {
+            switch self {
+            case .off:    return "Off (dense bf16)"
+            case .int4:   return "4-bit (≈4× smaller KV)"
+            case .int8:   return "8-bit (≈2× smaller KV)"
+            }
+        }
+    }
+
+    /// KV-cache quantization for the embedded llama.cpp engine.
+    /// Distinct from `KVQuant` because llama.cpp's quant scheme is
+    /// ggml's `Q8_0` / `Q4_0`, not the MLX affine kernels. The server
+    /// flag is `--llama-kv-quant` rather than `--kv-quant`.
+    enum LlamaKVQuant: String, Codable, CaseIterable, Identifiable {
+        case off
+        case q8
+        case q4
+        var id: String { rawValue }
+        var cliValue: String { rawValue }
+        var label: String {
+            switch self {
+            case .off: return "Off (F16, libllama default)"
+            case .q8:  return "Q8_0 (≈2× smaller, near-lossless)"
+            case .q4:  return "Q4_0 (≈4× smaller, some quality cost)"
+            }
+        }
+    }
+
+    enum TriState: String, Codable, CaseIterable, Identifiable {
+        case auto, on, off
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .auto: return "Auto (server default)"
+            case .on:   return "Force on"
+            case .off:  return "Force off"
+            }
+        }
+        /// `nil` means leave the request body alone — the server's startup
+        /// flag governs. `true`/`false` overrides per-request.
+        var asOptionalBool: Bool? {
+            switch self {
+            case .auto: return nil
+            case .on:   return true
+            case .off:  return false
+            }
+        }
+    }
+
+    /// Telegram bot bridge settings. The user creates the bot via @BotFather
+    /// (`/newbot`) and pastes the token here. The bridge long-polls Telegram
+    /// (outbound HTTPS only — no public URL or port-forward, so it works behind
+    /// home NAT). `allowedChatIds` locks the bot to specific chats; empty means
+    /// "adopt the first chat that messages" (trust-on-first-use), so setup is
+    /// just: paste token, message the bot once.
+    struct TelegramConfig: Codable, Equatable {
+        var enabled: Bool = false
+        var botToken: String = ""
+        /// false = plain chat (default, safe). true = the full agent loop with
+        /// tools (shell / file / web) executing on this Mac, driven from the
+        /// phone. Opt-in; the Settings UI warns about the implications.
+        var agentMode: Bool = false
+        /// Expose the user's enabled MCP servers to the bot (and to the tasks it
+        /// creates). Opt-in; works alongside or independently of `agentMode`.
+        var useMCP: Bool = false
+        var enableThinking: Bool = false
+        /// The agent (persona) the bot answers as; nil = none, i.e. the app's own
+        /// settings and the three flags above verbatim.
+        var agentId: UUID?
+        /// Telegram chat IDs allowed to use the bot. Empty = adopt the first
+        /// chat that messages (TOFU); the bridge appends the adopted id here.
+        var allowedChatIds: [Int64] = []
+
+        /// True when the config is actually runnable (enabled + a non-blank token).
+        var isRunnable: Bool {
+            enabled && !botToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+
+        /// The bot token with surrounding whitespace stripped — what the bridge
+        /// actually sends to the Telegram API (users paste with trailing newlines).
+        var trimmedToken: String {
+            botToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        /// Access decision for an incoming chat id. Pure — drives the bridge's
+        /// gate and is unit-tested without any network.
+        func access(forChatId chatId: Int64) -> TelegramAccess {
+            if allowedChatIds.contains(chatId) { return .allowed }
+            if allowedChatIds.isEmpty { return .adopt }
+            return .rejected
+        }
+    }
+
+    /// Outcome of the bot's per-message access check. See `TelegramConfig.access`.
+    enum TelegramAccess: Equatable {
+        /// Chat is on the allow-list — answer it.
+        case allowed
+        /// No allow-list yet — adopt this chat (add to `allowedChatIds`) then answer.
+        case adopt
+        /// An allow-list exists and this chat isn't on it — refuse.
+        case rejected
+    }
+
+    /// Agent execution sandbox. When `enabled`, the agent's shell commands run
+    /// inside a throwaway Linux guest (booted on Apple's Virtualization
+    /// framework) with only the working directory shared in — so a destructive
+    /// command can't touch the rest of the Mac. It costs extra RAM while active
+    /// because a live VM is held for the session. Off by default.
+    struct SandboxConfig: Codable, Equatable {
+        /// false = tools run directly on host macOS (default, no extra RAM).
+        /// true = shell commands run inside the isolated Linux sandbox.
+        var enabled: Bool = false
+        /// The OCI image the sandbox boots from — pinned to our purpose-built
+        /// arm64 agentic shell (Debian glibc + Node.js + Python3/pip + git/curl
+        /// + apt + dropbear for the terminal's ssh transport, ~129 MB; source:
+        /// containers/agent-shell-mlxserve). Deliberately NOT user-configurable:
+        /// the ssh terminal and in-guest MCP servers depend on what this exact
+        /// image ships, and a stored custom/legacy ref left upgraders stuck on
+        /// the pre-ssh image (stale-image dialog forever — see the regression
+        /// test). Test overrides go through `AgentSandbox.configure(baseImage:)`.
+        static let baseImage = "ddalcu/agent-shell-mlxserve"
+        /// Outbound network for the guest (NAT) + live guest→host port mapping:
+        /// a server the agent starts on guest port N becomes reachable at
+        /// `localhost:N` on this Mac. Off → the guest has NO network device at
+        /// all (fully isolated). Applies on the next guest boot.
+        var network: Bool = true
+    }
+
+    // MARK: Restart-detection helpers
+
+    /// Compares only fields that affect the launched mlx-serve process, ignoring
+    /// per-request defaults.
+    /// The cluster fields the server's flags read: a host's only (a worker is its own process).
+    private var hostCluster: [String]? {
+        guard clusterRole == .host else { return nil }
+        return [clusterMode.rawValue, clusterModelPath, clusterDevice, clusterCoordinator]
+    }
+
+    func serverLaunchEquals(_ other: ServerOptions) -> Bool {
+        host == other.host &&
+        port == other.port &&
+        ctxSize == other.ctxSize &&
+        noVision == other.noVision &&
+        logLevel == other.logLevel &&
+        logToFile == other.logToFile &&
+        requestTimeout == other.requestTimeout &&
+        enableMetrics == other.enableMetrics &&
+        apiKey == other.apiKey &&
+        toolAutocorrect == other.toolAutocorrect &&
+        lanShareEnabled == other.lanShareEnabled &&
+        lanShareAll == other.lanShareAll &&
+        lanSharedModels == other.lanSharedModels &&
+        lanDiscoverEnabled == other.lanDiscoverEnabled &&
+        lanName == other.lanName &&
+        hostCluster == other.hostCluster &&
+        enablePLD == other.enablePLD &&
+        pldDraftLen == other.pldDraftLen &&
+        pldKeyLen == other.pldKeyLen &&
+        enableMTP == other.enableMTP &&
+        mtpDepth == other.mtpDepth &&
+        enableDSpark == other.enableDSpark &&
+        anePrefill == other.anePrefill &&
+        aneImage == other.aneImage &&
+        aneVideo == other.aneVideo &&
+        aneAudio == other.aneAudio &&
+        w8a8 == other.w8a8 &&
+        aneSlots == other.aneSlots &&
+        maxConcurrent == other.maxConcurrent &&
+        kvQuant == other.kvQuant &&
+        hotPrefixCacheEnabled == other.hotPrefixCacheEnabled &&
+        prefixCacheEntries == other.prefixCacheEntries &&
+        prefixCacheMem == other.prefixCacheMem &&
+        pleGpu == other.pleGpu &&
+        enablePrefixCacheDisk == other.enablePrefixCacheDisk &&
+        prefixCacheDisk == other.prefixCacheDisk &&
+        maxResidentMemGB == other.maxResidentMemGB &&
+        maxResidentModels == other.maxResidentModels &&
+        idleEvictSecs == other.idleEvictSecs &&
+        skipMemPreflight == other.skipMemPreflight &&
+        osReserveGiB == other.osReserveGiB &&
+        llamaKvQuant == other.llamaKvQuant &&
+        llamaCacheEntries == other.llamaCacheEntries &&
+        llamaMtpDrafts == other.llamaMtpDrafts &&
+        llamaUbatch == other.llamaUbatch &&
+        ssdStreaming == other.ssdStreaming &&
+        mlxGguf == other.mlxGguf &&
+        tokenizeCacheEntries == other.tokenizeCacheEntries
+    }
+
+    // MARK: CLI args builder
+
+    /// Translate to the `mlx-serve` CLI flags. The leading `--model <path>` is
+    /// passed by ServerManager (since the model path comes from AppState).
+    ///
+    /// Plan 05 Phase G — `modelDirOverride` lets the caller inject
+    /// `--model-dir <path>` so the registry sees siblings (enables
+    /// hot-switch). ServerManager passes the parent directory of the
+    /// selected model.
+    /// RAM-derived ceiling for the hot prefix cache entry count. On a hybrid
+    /// SSM model each entry pins large per-position KV + conv/SSM state, so a
+    /// generous count (the server's own default is 32) fills a small Mac and,
+    /// as resident memory climbs, the auto-context ceiling shrinks until
+    /// prompts no longer fit ("Prompt exceeds maximum context length"). Capping
+    /// the entry count is the reliable lever — the byte cap under-counts the
+    /// true retained allocation. Disabling RAM retention uses `hotPrefixCacheEnabled`.
+    ///   ≤18 GB (16 GB Macs): 1   ≤36 GB (24/32 GB): 8   else: uncapped.
+    /// Snap points for the model memory cap slider, in GiB. 0 is Auto and is
+    /// always first. The ladder stops at the machine's RAM — a cap above it
+    /// can never be reached, so offering it is theatre. 224 lets a 256 GB Mac
+    /// hold one 200 GB model and refuse a second one beside it.
+    static func residentMemPresets(physicalMemoryBytes: UInt64) -> [Int] {
+        let ram = Int(physicalMemoryBytes / 1_073_741_824)
+        return [0] + [4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 224, 256, 384, 512]
+            .filter { $0 <= max(ram, 8) }
+    }
+
+    /// Mirrors `server.osReserveBytes`: an eighth of RAM in GiB, never under 2 or over 8.
+    static func autoOsReserveGiB(physicalMemoryBytes: UInt64) -> Double {
+        min(max(Double(physicalMemoryBytes) / 8 / 1_073_741_824, 2), 8)
+    }
+
+    /// Snap points for the idle-eviction slider, in seconds. Off first; every
+    /// step is a whole number of minutes or hours so the label never rounds.
+    static let idleEvictPresets: [Int] = [0, 300, 600, 900, 1800, 3600, 7200, 14400]
+
+    /// The slider's readout — seconds are the flag's unit, not the reader's.
+    static func idleEvictLabel(_ secs: Int) -> String {
+        if secs <= 0 { return "Off" }
+        if secs < 3600 { return "\(secs / 60) min" }
+        return "\(secs / 3600) hr"
+    }
+
+    static func ramCappedPrefixCacheEntries(_ requested: Int, physicalMemoryBytes: UInt64) -> Int {
+        let requested = max(requested, 1)
+        let gib = physicalMemoryBytes / 1_073_741_824
+        let ceiling: Int
+        if gib <= 18 { ceiling = 1 }
+        else if gib <= 36 { ceiling = 8 }
+        else { return requested }
+        return min(requested, ceiling)
+    }
+
+    /// `--model-dir` per folder, in order: the one place the flag is spelled.
+    static func modelDirArgs(_ dirs: [String]) -> [String] {
+        dirs.filter { !$0.isEmpty }.flatMap { ["--model-dir", $0] }
+    }
+
+    func toCLIArgs(modelDirOverride: String? = nil,
+                   physicalMemoryBytes: UInt64 = ProcessInfo.processInfo.physicalMemory) -> [String] {
+        toCLIArgs(modelDirs: modelDirOverride.map { [$0] } ?? [],
+                  physicalMemoryBytes: physicalMemoryBytes)
+    }
+
+    /// `--model-dir` is REPEATABLE server-side, and a library can live in more
+    /// than one folder (the download destination, the folder it used to be, an
+    /// LM Studio tree). With one flag the others were listed by the app's own
+    /// picker and absent from `/v1/models`, so switching to one cost a full
+    /// server restart instead of a hot swap. Order matters: the server takes
+    /// the FIRST folder's copy of a repeated model id.
+    func toCLIArgs(modelDirs: [String],
+                   physicalMemoryBytes: UInt64 = ProcessInfo.processInfo.physicalMemory) -> [String] {
+        // The host field is free text in Settings — a cleared field must not
+        // launch `--host ""` (the server would fail to bind).
+        let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        var args: [String] = [
+            "--serve",
+            "--port", "\(port)",
+            "--host", trimmedHost.isEmpty ? "0.0.0.0" : trimmedHost,
+            "--log-level", logLevel.rawValue,
+        ]
+        // File logging is ON by default server-side — emit only the opt-out.
+        if !logToFile {
+            args += ["--log-file", "off"]
+        }
+        args += Self.modelDirArgs(modelDirs)
+        if ctxSize > 0 {
+            args += ["--ctx-size", "\(ctxSize)"]
+        }
+        if noVision {
+            args += ["--no-vision"]
+        }
+        if requestTimeout != 300 {
+            args += ["--timeout", "\(requestTimeout)"]
+        }
+        if enableMetrics {
+            args += ["--metrics"]
+        }
+        let trimmedApiKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedApiKey.isEmpty {
+            args += ["--api-key", trimmedApiKey]
+        }
+        // Emit ONLY when disabled — the server default is on, so a default launch
+        // stays flag-free (guarded by testDefaultLaunchOmitsAllMatchDefaultFlags).
+        if !toolAutocorrect {
+            args += ["--no-tool-autocorrect"]
+        }
+        // LAN sharing: everything defaults off, so a default launch stays
+        // flag-free. Share-on with nothing selected shares nothing — omit.
+        if lanShareEnabled {
+            let list = lanSharedModels.filter { !$0.isEmpty }
+            if lanShareAll {
+                args += ["--lan-share", "all"]
+            } else if !list.isEmpty {
+                args += ["--lan-share", list.joined(separator: ",")]
+            }
+        }
+        if lanDiscoverEnabled {
+            args += ["--lan-discover"]
+        }
+        args += ClusterSetup.hostArgs(self)
+        let trimmedLanName = lanName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if (lanShareEnabled || lanDiscoverEnabled) && !trimmedLanName.isEmpty {
+            args += ["--lan-name", trimmedLanName]
+        }
+        // Spec-decode: explicit flags either way so the server's CLI defaults
+        // can't drift out from under the UI.
+        args += [enablePLD ? "--pld" : "--no-pld"]
+        args += ["--pld-draft-len", "\(pldDraftLen)"]
+        args += ["--pld-key-len", "\(pldKeyLen)"]
+        // MTP: the server auto-loads a checkpoint's head (dense or MoE) and
+        // defaults depth to auto.
+        if !enableMTP {
+            args += ["--no-mtp"]
+        }
+        if mtpDepth > 0 {
+            args += ["--mtp-max-depth", "\(mtpDepth)"]
+        }
+        // DSpark (DeepSeek-V4 draft stages): server default is OFF (opt-in —
+        // the stages cost ~11 GB resident), so only ON emits.
+        if enableDSpark {
+            args += ["--dspark"]
+        }
+        // ANE prefill offload: server default is OFF (opt-in — the int8 ANE
+        // copy is ~11 GB on a 27B under the channel split), so only ON emits.
+        if anePrefill {
+            args += ["--ane-prefill"]
+        }
+        // Media offloads: server default OFF, so only ON emits.
+        if aneImage { args += ["--ane-image"] }
+        if aneVideo { args += ["--ane-video"] }
+        if aneAudio { args += ["--ane-audio"] }
+        args += [w8a8 ? "--w8a8" : "--no-w8a8"]
+        if aneSlots > 1 { args += ["--ane-slots", "\(aneSlots)"] }
+        // Decode attention requant: tri-state — undecided emits NOTHING (the
+        // server default keeps laguna on and dsv4's comp_in dense); an
+        // explicit choice emits its flag, and the positive form is what opts
+        // dsv4's characterization-gated comp_in requant in.
+        if let choice = decodeAttnQuantChoice {
+            args += [choice ? "--decode-attn-quant" : "--no-decode-attn-quant"]
+        }
+        // Performance: only emit non-default flags so the CLI tail stays
+        // readable in log lines and `ps`. Server defaults are 1 / off / auto.
+        if maxConcurrent > 1 {
+            args += ["--max-concurrent", "\(maxConcurrent)"]
+        }
+        if kvQuant != .off {
+            args += ["--kv-quant", kvQuant.cliValue]
+        }
+        // ALWAYS emit — the server's prefix-cache default is 32, NOT 1, so
+        // omitting this silently launched a 32-entry cache that filled small
+        // Macs. Emit the RAM-clamped value so the entry count stays bounded.
+        let cappedEntries = Self.ramCappedPrefixCacheEntries(prefixCacheEntries, physicalMemoryBytes: physicalMemoryBytes)
+        args += ["--prefix-cache-entries", "\(cappedEntries)"]
+        if !hotPrefixCacheEnabled { args += ["--no-prefix-cache-ram"] }
+        // Empty leaves the size to the server; any value, the old "2GB" default included, is sent.
+        let trimmedPrefixMem = prefixCacheMem.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedPrefixMem.isEmpty {
+            args += ["--prefix-cache-mem", trimmedPrefixMem]
+        }
+        if pleGpu { args += ["--ple-gpu"] }
+        // ALWAYS emit — the SSD tier can persist gigabytes of KV, so the app is
+        // authoritative: `off` when the toggle is off (regardless of any server
+        // default), the chosen size when on. Mirrors the prefix-cache-entries
+        // always-emit discipline.
+        let trimmedPrefixDisk = prefixCacheDisk.trimmingCharacters(in: .whitespacesAndNewlines)
+        if enablePrefixCacheDisk && !trimmedPrefixDisk.isEmpty {
+            args += ["--prefix-cache-disk", trimmedPrefixDisk]
+        } else {
+            args += ["--prefix-cache-disk", "off"]
+        }
+        // The registry residency cap. Emitted only when the user set a value
+        // the server can parse: `main.zig` EXITS on a bad one, and bricking
+        // the launch over a typo in a text field is worse than falling back
+        // to the auto cap it would have used anyway.
+        if maxResidentMemGB > 0 {
+            args += ["--max-resident-mem", "\(maxResidentMemGB)GB"]
+        }
+        if maxResidentModels != 3 {
+            args += ["--max-resident-models", "\(maxResidentModels)"]
+        }
+        // Omitted at 0: that IS the server default.
+        if idleEvictSecs > 0 {
+            args += ["--idle-evict-secs", "\(idleEvictSecs)"]
+        }
+        // GGUF-only performance knobs. Emitted unconditionally when not
+        // the default — the server silently ignores them on the MLX path
+        // (it never opens an llama session). Keeping them in argv for
+        // every launch means the user gets consistent behavior whether
+        // they're switching MLX↔GGUF via the menu picker or restarting.
+        if llamaKvQuant != .off {
+            args += ["--llama-kv-quant", llamaKvQuant.cliValue]
+        }
+        if llamaCacheEntries != 4 {  // 4 = server default (LlamaSettings.seqs)
+            args += ["--llama-cache-entries", "\(llamaCacheEntries)"]
+        }
+        if llamaMtpDrafts != 2 {  // 2 = server default (LlamaSettings.mtp_drafts)
+            args += ["--llama-mtp-drafts", "\(llamaMtpDrafts)"]
+        }
+        if llamaUbatch != 0 {
+            args += ["--llama-ubatch", "\(llamaUbatch)"]
+        }
+        // All-engines knob — applies to MLX, llama, and ds4 alike.
+        if tokenizeCacheEntries != 4 {
+            args += ["--tokenize-cache-entries", "\(tokenizeCacheEntries)"]
+        }
+        // Generation defaults are read per request from generation-settings.json.
+        // Opt-in escape hatch — omitted by default so the load pre-flight runs.
+        if skipMemPreflight {
+            args += ["--skip-mem-preflight"]
+        }
+        if let gib = osReserveGiB {
+            args += ["--os-reserve-gib", "\(gib)"]
+        }
+        // ds4-only opt-in: stream DeepSeek-V4-Flash experts from SSD. The MLX
+        // and llama.cpp engines ignore the flag, so it's safe to leave in argv
+        // across engine switches; omitted by default to keep full residency.
+        if ssdStreaming {
+            args += ["--ssd-streaming"]
+        }
+        if mlxGguf {
+            args += ["--mlx-gguf"]
+        }
+        return args
+    }
+
+    private static let prefixCacheMemMigratedKey = "prefixCacheMemAutoMigrated"
+
+    /// Blobs saved while "2GB" was the default store it as if chosen, and the UI never
+    /// offered 2GB apart from the default, so it is cleared to Auto once.
+    mutating func migrateLegacyPrefixCacheMem(_ defaults: UserDefaults = .standard) {
+        guard !defaults.bool(forKey: Self.prefixCacheMemMigratedKey) else { return }
+        defaults.set(true, forKey: Self.prefixCacheMemMigratedKey)
+        if prefixCacheMem.trimmingCharacters(in: .whitespacesAndNewlines) == "2GB" {
+            prefixCacheMem = ""
+        }
+    }
+
+    // MARK: Settings-field validation helpers
+
+    /// Parse the Settings port text field. Accepts exactly what a TCP listen
+    /// can bind: an all-digit string in 1...65535 (after trimming). Returns
+    /// nil for anything else — including 0, which the kernel would map to a
+    /// random ephemeral port the rest of the app isn't watching.
+    static func parsePort(_ raw: String) -> UInt16? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              trimmed.allSatisfy(\.isNumber),
+              let value = UInt16(trimmed),
+              value > 0 else { return nil }
+        return value
+    }
+
+    // MARK: Persistence (UserDefaults JSON)
+
+    private static let storageKey = "serverOptions"
+
+    static func load() -> ServerOptions {
+        guard let data = UserDefaults.standard.data(forKey: storageKey),
+              let opts = try? JSONDecoder().decode(ServerOptions.self, from: data) else {
+            return ServerOptions()
+        }
+        return opts
+    }
+
+    func save() {
+        guard let data = try? JSONEncoder().encode(self) else { return }
+        UserDefaults.standard.set(data, forKey: Self.storageKey)
+    }
+
+    /// The retired global drafter (`drafterPath` / `drafterOptOut`) as the stored
+    /// blob still has it, for `DrafterMigration`. nil once a save has dropped it.
+    static func legacyDrafter(_ defaults: UserDefaults = .standard) -> (path: String, optedOut: Bool)? {
+        guard let data = defaults.data(forKey: storageKey),
+              let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              raw["drafterPath"] != nil || raw["drafterOptOut"] != nil else { return nil }
+        return (raw["drafterPath"] as? String ?? "", raw["drafterOptOut"] as? Bool ?? false)
+    }
+}
+
+// MARK: - Migration-safe decoding
+
+extension ServerOptions {
+    /// Forward/backward-compatible decode: every key is optional, falling back
+    /// to the `ServerOptions()` default when absent.
+    ///
+    /// The COMPILER-SYNTHESIZED `init(from:)` throws `keyNotFound` the moment a
+    /// stored blob is missing ANY key — which is exactly what happens to an
+    /// existing user's saved options every time a new field ships. Because
+    /// `load()` wraps the decode in `try?` and falls back to `ServerOptions()`,
+    /// that throw silently RESETS the user's entire tuning to defaults on
+    /// upgrade. Decoding key-by-key with `decodeIfPresent` (defaults supplied by
+    /// delegating to the no-arg init first) keeps old blobs valid and makes
+    /// every future field addition migration-safe automatically. Declared in an
+    /// extension so the memberwise / no-arg initializers stay synthesized.
+    /// `encode(to:)` and `CodingKeys` remain compiler-synthesized, so round-trip
+    /// + Equatable are unchanged (see `testRoundTripCodable`).
+    /// The retired always-written Bool `decodeAttnQuant` — read-only, for the
+    /// tri-state migration above (it cannot live in the synthesized
+    /// CodingKeys: a case with no matching property breaks synthesized
+    /// encode).
+    private enum LegacyDecodeAttnQuantKey: String, CodingKey {
+        case decodeAttnQuant
+    }
+    private enum LegacyOsMemoryReserveKey: String, CodingKey {
+        case osMemoryReserve
+    }
+
+    init(from decoder: Decoder) throws {
+        self.init()   // every property seeded with its default
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if let v = try c.decodeIfPresent(String.self, forKey: .host) { host = v }
+        if let v = try c.decodeIfPresent(UInt16.self, forKey: .port) { port = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .ctxSize) { ctxSize = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .noVision) { noVision = v }
+        if let v = try c.decodeIfPresent(LogLevel.self, forKey: .logLevel) { logLevel = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .logToFile) { logToFile = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .requestTimeout) { requestTimeout = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .enableMetrics) { enableMetrics = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .apiKey) { apiKey = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .toolAutocorrect) { toolAutocorrect = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .enablePLD) { enablePLD = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .pldDraftLen) { pldDraftLen = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .pldKeyLen) { pldKeyLen = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .lanShareEnabled) { lanShareEnabled = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .lanShareAll) { lanShareAll = v }
+        if let v = try c.decodeIfPresent([String].self, forKey: .lanSharedModels) { lanSharedModels = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .lanDiscoverEnabled) { lanDiscoverEnabled = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .lanName) { lanName = v }
+        if let v = try c.decodeIfPresent(ClusterRole.self, forKey: .clusterRole) { clusterRole = v }
+        if let v = try c.decodeIfPresent(ClusterMode.self, forKey: .clusterMode) { clusterMode = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .clusterModelPath) { clusterModelPath = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .clusterDevice) { clusterDevice = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .clusterCoordinator) { clusterCoordinator = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .enableMTP) { enableMTP = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .decodeAttnQuantChoice) {
+            decodeAttnQuantChoice = v
+        } else {
+            // Legacy blobs always carried `decodeAttnQuant` (the old Bool was
+            // written by synthesized encode for every user who saved settings
+            // once), so a stored TRUE is indistinguishable from "never
+            // touched" and stays nil — it must not become an explicit opt-in
+            // to dsv4's lossy comp_in requant. FALSE was a real choice.
+            if try decoder.container(keyedBy: LegacyDecodeAttnQuantKey.self)
+                .decodeIfPresent(Bool.self, forKey: .decodeAttnQuant) == false
+            {
+                decodeAttnQuantChoice = false
+            }
+        }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .mtpDepth) { mtpDepth = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .enableDSpark) { enableDSpark = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .anePrefill) { anePrefill = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .aneImage) { aneImage = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .aneVideo) { aneVideo = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .aneAudio) { aneAudio = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .w8a8) { w8a8 = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .aneSlots) { aneSlots = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .maxConcurrent) { maxConcurrent = v }
+        if let v = try c.decodeIfPresent(KVQuant.self, forKey: .kvQuant) { kvQuant = v }
+        let storedPrefixEntries = try c.decodeIfPresent(Int.self, forKey: .prefixCacheEntries)
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .hotPrefixCacheEnabled) {
+            hotPrefixCacheEnabled = v
+        } else if storedPrefixEntries == 0 {
+            hotPrefixCacheEnabled = false
+        }
+        if let v = storedPrefixEntries { prefixCacheEntries = max(v, 1) }
+        if let v = try c.decodeIfPresent(String.self, forKey: .prefixCacheMem) { prefixCacheMem = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .pleGpu) { pleGpu = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .enablePrefixCacheDisk) { enablePrefixCacheDisk = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .prefixCacheDisk) { prefixCacheDisk = v }
+        if !c.contains(.hotPrefixCacheEnabled) && storedPrefixEntries == 0 { enablePrefixCacheDisk = false }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .maxResidentMemGB) { maxResidentMemGB = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .maxResidentModels) { maxResidentModels = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .idleEvictSecs) { idleEvictSecs = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .skipMemPreflight) { skipMemPreflight = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .osReserveGiB) {
+            osReserveGiB = v
+        } else if try decoder.container(keyedBy: LegacyOsMemoryReserveKey.self)
+            .decodeIfPresent(Bool.self, forKey: .osMemoryReserve) == false
+        {
+            osReserveGiB = 0
+        }
+        if let v = try c.decodeIfPresent(LlamaKVQuant.self, forKey: .llamaKvQuant) { llamaKvQuant = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .llamaCacheEntries) { llamaCacheEntries = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .llamaMtpDrafts) { llamaMtpDrafts = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .llamaUbatch) { llamaUbatch = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .ssdStreaming) { ssdStreaming = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .mlxGguf) { mlxGguf = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .tokenizeCacheEntries) { tokenizeCacheEntries = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .defaultMaxTokens) { defaultMaxTokens = v }
+        if let v = try c.decodeIfPresent(Double.self, forKey: .defaultTemperature) { defaultTemperature = v }
+        if let v = try c.decodeIfPresent(Double.self, forKey: .defaultTopP) { defaultTopP = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .defaultTopK) { defaultTopK = v }
+        if let v = try c.decodeIfPresent(Double.self, forKey: .defaultRepeatPenalty) { defaultRepeatPenalty = v }
+        if let v = try c.decodeIfPresent(Double.self, forKey: .defaultPresencePenalty) { defaultPresencePenalty = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .defaultReasoningBudget) { defaultReasoningBudget = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .defaultEnableThinking) { defaultEnableThinking = v }
+        if let v = try c.decodeIfPresent(TriState.self, forKey: .perRequestEnablePLD) { perRequestEnablePLD = v }
+        if let v = try c.decodeIfPresent(TriState.self, forKey: .perRequestEnableDrafter) { perRequestEnableDrafter = v }
+        if let v = try c.decodeIfPresent(TelegramConfig.self, forKey: .telegram) { telegram = v }
+        if let v = try c.decodeIfPresent(SandboxConfig.self, forKey: .sandbox) { sandbox = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .toolsOnlyWhenAsked) { toolsOnlyWhenAsked = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .quitKeepsRunning) { quitKeepsRunning = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .voiceClonePath) { voiceClonePath = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .voiceCloneEnabled) { voiceCloneEnabled = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .voiceCloneLabel) { voiceCloneLabel = v }
+        if let v = try c.decodeIfPresent(VoiceEngine.self, forKey: .voiceEngine) { voiceEngine = v == .system ? .kokoro : v }
+        else if let legacy = try c.decodeIfPresent(Bool.self, forKey: .voiceCloneEnabled) {
+            // Configs written before the engine picker existed only carried the
+            // clone toggle. Changing a persisted DEFAULT does nothing for
+            // existing users, so migrate the old field explicitly rather than
+            // stranding them on `.system` with a clip they already recorded.
+            voiceEngine = (legacy && !voiceClonePath.isEmpty) ? .clone : .kokoro
+        }
+        if let v = try c.decodeIfPresent(String.self, forKey: .kokoroVoice) { kokoroVoice = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .lfm3Voice) { lfm3Voice = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .wakePhrase) { wakePhrase = v }
+        if let v = try c.decodeIfPresent(TranscribeEngine.self, forKey: .transcribeEngine) { transcribeEngine = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .transcriptNotesModel) { transcriptNotesModel = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .transcriptAutoStopMinutes) { transcriptAutoStopMinutes = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .transcriptAutoStartCamera) { transcriptAutoStartCamera = v }
+    }
+}
+
+extension ServerOptions.TelegramConfig {
+    /// Tolerant decode (same rationale as `ServerOptions.init(from:)`): a stored
+    /// telegram blob written before a field existed must decode with that field
+    /// defaulted, not throw — a throw here propagates up through ServerOptions
+    /// and `load()` silently resets the user's entire config (token included).
+    init(from decoder: Decoder) throws {
+        self.init()
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .enabled) { enabled = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .botToken) { botToken = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .agentMode) { agentMode = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .useMCP) { useMCP = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .enableThinking) { enableThinking = v }
+        agentId = try c.decodeIfPresent(UUID.self, forKey: .agentId)
+        if let v = try c.decodeIfPresent([Int64].self, forKey: .allowedChatIds) { allowedChatIds = v }
+    }
+}
+
+extension ServerOptions.SandboxConfig {
+    /// Tolerant decode (same rationale as `ServerOptions.init(from:)`): a stored
+    /// blob written before a field existed must decode with that field defaulted,
+    /// not throw — a throw here propagates up and silently resets the whole config.
+    init(from decoder: Decoder) throws {
+        self.init()
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .enabled) { enabled = v }
+        // baseImage is hardcoded now (see the static above) — a stored value,
+        // legacy default or custom, is deliberately ignored.
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .network) { network = v }
+    }
+}
+
+// MARK: - Reset to defaults
+
+extension ServerOptions {
+    /// The value the Settings screen's "Reset to Defaults" button installs.
+    ///
+    /// Everything returns to `ServerOptions()` except the Telegram bot token,
+    /// which is a credential the user obtained from @BotFather and cannot
+    /// re-derive from anything on this machine — wiping it turns a stray reset
+    /// into a trip back to Telegram. Every other field (including the rest of
+    /// the Telegram block: the enable toggle, agent mode, and the adopted chat
+    /// ids, which re-adopt on the next message) is re-derivable and is
+    /// deliberately restored. Pure so `SettingsResetTests` can pin the scope of
+    /// the carve-out against future fields.
+    static func resetToDefaults(preserving current: ServerOptions) -> ServerOptions {
+        var fresh = ServerOptions()
+        fresh.telegram.botToken = current.telegram.botToken
+        return fresh
+    }
+}
+
+// MARK: - UI introspection metadata
+
+/// Describes a single tunable for the Settings UI: a label, an explainer,
+/// and (where relevant) a flag indicating whether changes need a server restart.
+struct ServerOptionField {
+    let title: String
+    let explainer: String
+    let needsRestart: Bool
+    /// What turning the setting on costs in memory and disk, shown under the
+    /// explainer and emphasized while the setting is on.
+    var cost: String? = nil
+}
+
+extension ServerOptions {
+    /// Human-readable metadata for the server-launch fields, in the order the
+    /// Settings UI should render them.
+    static let serverFlagFields: [String: ServerOptionField] = [
+        "host": .init(
+            title: "Host",
+            explainer: "0.0.0.0 lets other devices on your network connect; 127.0.0.1 keeps the server on this Mac.",
+            needsRestart: true),
+        "port": .init(
+            title: "Port",
+            explainer: "The port the server listens on; change it only if another app uses it.",
+            needsRestart: true),
+        "ctxSize": .init(
+            title: "Context size",
+            explainer: ContextSizeDisplay.helpText,
+            needsRestart: true),
+        "noVision": .init(
+            title: "Disable vision",
+            explainer: "Skip loading image support to save about 3 GB of memory.",
+            needsRestart: true),
+        "logLevel": .init(
+            title: "Log level",
+            explainer: "How much detail goes into the server log; use debug when troubleshooting.",
+            needsRestart: true),
+        "logToFile": .init(
+            title: "Log to file",
+            explainer: "Save the server log to ~/.mlx-serve/logs so you can check it after a crash.",
+            needsRestart: true),
+        "requestTimeout": .init(
+            title: "Request timeout (s)",
+            explainer: "How long one request may run, in seconds; 0 means no limit.",
+            needsRestart: true),
+        "enableMetrics": .init(
+            title: "Metrics panel",
+            explainer: "Show live speed and memory charts on the server's web page.",
+            needsRestart: true),
+        "apiKey": .init(
+            title: "API key",
+            explainer: "A key other devices must send to use this server; this Mac never needs it.",
+            needsRestart: true),
+        "lanShareEnabled": .init(
+            title: "Share my models on this network",
+            explainer: "Let other Macs on your network use the models you share.",
+            needsRestart: true),
+        "lanShareAll": .init(
+            title: "Share all models",
+            explainer: "Share every model, or turn off to choose which ones.",
+            needsRestart: true),
+        "lanName": .init(
+            title: "Shown to others as",
+            explainer: "The name other Macs see; leave blank to use this Mac's name.",
+            needsRestart: true),
+        "clusterRole": .init(
+            title: "This Mac in a Thunderbolt cluster",
+            explainer: "Host runs one model across this Mac and another over Thunderbolt; worker lends this Mac to another Mac's host.",
+            needsRestart: true),
+        "clusterMode": .init(
+            title: "Split",
+            explainer: "By layers: each Mac runs its own layers in turn, fast with little traffic. By experts: both Macs work on every layer at once.",
+            needsRestart: true),
+        "clusterModelPath": .init(
+            title: "Model",
+            explainer: "The model both Macs serve together; the other Mac needs the same model in its library.",
+            needsRestart: true),
+        "clusterDevice": .init(
+            title: "Thunderbolt port",
+            explainer: "The port the cable to the other Mac is in.",
+            needsRestart: true),
+        "clusterCoordinator": .init(
+            title: "Host address",
+            explainer: "Where the worker finds the host; leave blank to use the Thunderbolt link.",
+            needsRestart: true),
+        "lanDiscoverEnabled": .init(
+            title: "Use models shared by other Macs",
+            explainer: "Show models other Macs share, which run on their Mac.",
+            needsRestart: true),
+        "toolAutocorrect": .init(
+            title: "Tool-call auto-correct",
+            explainer: "Fix tool-call arguments that don't match the types the tool expects.",
+            needsRestart: true),
+        "enableMTP": .init(
+            title: "Multi-Token Prediction (recommended)",
+            explainer: "Makes supported Qwen models reply faster with the same output.",
+            needsRestart: true),
+        "mtpDepth": .init(
+            title: "Tokens guessed ahead",
+            explainer: "How far ahead MTP guesses; Automatic adjusts it as it goes.",
+            needsRestart: true),
+        "enableDSpark": .init(
+            title: "DSpark draft stages (DeepSeek‑V4)",
+            explainer: "Faster DeepSeek-V4 replies for about 11 GB of extra memory.",
+            needsRestart: true),
+        "anePrefill": .init(
+            title: "Neural Engine prefill boost",
+            explainer: "Read long prompts faster with the Neural Engine (little gain on M5 Macs); the server declines if this Mac can't fit it.",
+            needsRestart: true,
+            cost: "Memory: about 1 GB more for a small model, up to 11 GB for a 27B. Disk: roughly as much again for its compiled copy."),
+        "aneImage": .init(
+            title: "Neural Engine image boost",
+            explainer: "Generate images faster with the Neural Engine; off by default, and the server declines if this Mac can't fit it.",
+            needsRestart: true,
+            cost: "Memory: 5–7 GB more while Krea is loaded, plus up to 4 GB during the one-time build. Disk: 3.5–6.6 GB once; every image size shares it."),
+        "aneVideo": .init(
+            title: "Neural Engine video boost",
+            explainer: "Generate videos faster with the Neural Engine; off by default, and the server declines if this Mac can't fit it.",
+            needsRestart: true,
+            cost: "Memory: 7–10 GB more while MiniMax-H3 is loaded, plus up to 3.6 GB while it builds, on every request. Disk: 5–9 GB once; every resolution and frame count shares it."),
+        "aneAudio": .init(
+            title: "Neural Engine music boost",
+            explainer: "Generate music faster with the Neural Engine; off by default, and the server declines if this Mac can't fit it.",
+            needsRestart: true,
+            cost: "Memory: 1.5–2 GB more while ACE-Step is loaded, plus up to 2.5 GB during the one-time build. Disk: 1–2 GB once; every song length shares it."),
+        "w8a8": .init(
+            title: "Neural Accelerator int8 (M5)",
+            explainer: "Faster images and video on M5 Macs, slightly lossy; off uses less memory with 4-bit models.",
+            needsRestart: true),
+        "aneSlots": .init(
+            title: "Neural Engine requests at once",
+            explainer: "How many requests a model on the Neural Engine answers together; they share its speed, and each adds its own memory.",
+            needsRestart: true),
+        "enablePLD": .init(
+            title: "Enable PLD (recommended)",
+            explainer: "Speeds up replies that repeat text from the conversation, like code edits.",
+            needsRestart: true),
+        "pldDraftLen": .init(
+            title: "PLD draft length",
+            explainer: "How many tokens to copy ahead with each guess.",
+            needsRestart: true),
+        "pldKeyLen": .init(
+            title: "PLD key length",
+            explainer: "How many matching tokens it takes to start a guess.",
+            needsRestart: true),
+        "maxConcurrent": .init(
+            title: "Concurrent requests",
+            explainer: "How many requests the server works on at once.",
+            needsRestart: true),
+        "decodeAttnQuant": .init(
+            title: "Fast decode for bf16-attention models (recommended)",
+            explainer: "Faster replies on models with unquantized attention, with slightly different wording.",
+            needsRestart: true),
+        "kvQuant": .init(
+            title: "KV cache quantization",
+            explainer: "Uses less memory for long chats but replies about 10% slower, so leave it off if you have plenty of memory.",
+            needsRestart: true),
+        "hotPrefixCacheEnabled": .init(
+            title: "Hot prefix cache",
+            explainer: "Keep recent conversations in memory so follow-ups start faster.",
+            needsRestart: true),
+        "prefixCacheEntries": .init(
+            title: "Prefix cache entries",
+            explainer: "How many conversations to keep in memory.",
+            needsRestart: true),
+        "prefixCacheMem": .init(
+            title: "Prefix cache memory cap",
+            explainer: "The most memory the conversation cache may use; leave blank to choose automatically.",
+            needsRestart: true),
+        "pleGpu": .init(
+            title: "Keep n-gram table in memory (Qwen3.8-Flash-Next)",
+            explainer: "Faster long-context Qwen3.8 Flash Next replies for about 30 GB of extra memory.",
+            needsRestart: true,
+            cost: "Memory: about 30 GB more while Qwen3.8-Flash-Next is loaded."),
+        "enablePrefixCacheDisk": .init(
+            title: "SSD prefix cache",
+            explainer: "Save conversations to disk so they pick up quickly after a restart.",
+            needsRestart: true),
+        "prefixCacheDisk": .init(
+            title: "SSD cache size",
+            explainer: "The most disk space the SSD cache may use.",
+            needsRestart: true),
+        "maxResidentMemGB": .init(
+            title: "Model memory cap",
+            explainer: "The most memory loaded models may use before one is unloaded.",
+            needsRestart: true),
+        "maxResidentModels": .init(
+            title: "Max models loaded at once",
+            explainer: "How many models stay loaded before the oldest is unloaded.",
+            needsRestart: true),
+        "idleEvictSecs": .init(
+            title: "Unload idle models",
+            explainer: "Unload a model after it sits unused this long; your next message reloads it.",
+            needsRestart: true),
+        "osReserveGiB": .init(
+            title: "Keep a memory reserve for macOS",
+            explainer: "Memory kept free for macOS and your other apps.",
+            needsRestart: true),
+        "skipMemPreflight": .init(
+            title: "Skip memory pre-flight check",
+            explainer: "Load models even when memory looks too low, which can crash the server.",
+            needsRestart: true),
+        "mlxGguf": .init(
+            title: "Serve GGUF files on MLX (experimental)",
+            explainer: "Run supported .gguf files on the MLX engine instead of llama.cpp (experimental).",
+            needsRestart: true),
+        "llamaKvQuant": .init(
+            title: "KV cache quantization",
+            explainer: "Uses less memory for llama.cpp models but replies slower, so leave it off if you have plenty of memory.",
+            needsRestart: true),
+        "llamaCacheEntries": .init(
+            title: "Parallel sequences",
+            explainer: "How many requests llama.cpp answers at once, each with its own memory.",
+            needsRestart: true),
+        "llamaMtpDrafts": .init(
+            title: "MTP draft tokens",
+            explainer: "How many tokens to guess ahead for GGUF models with an MTP head; 0 turns it off.",
+            needsRestart: true),
+        "llamaUbatch": .init(
+            title: "Prefill batch size",
+            explainer: "How much of a prompt llama.cpp reads at a time; larger is faster but uses more memory.",
+            needsRestart: true),
+        "ssdStreaming": .init(
+            title: "SSD weight streaming",
+            explainer: "Read a DeepSeek-V4 GGUF from disk so it runs, a bit slower, on Macs with less memory. MLX packs always load fully into memory.",
+            needsRestart: true),
+        "tokenizeCacheEntries": .init(
+            title: "Tokenize cache entries",
+            explainer: "Remember recent prompts so repeats start faster; 0 turns it off.",
+            needsRestart: true),
+    ]
+
+}

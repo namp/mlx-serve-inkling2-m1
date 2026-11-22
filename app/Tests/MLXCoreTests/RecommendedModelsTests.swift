@@ -1,0 +1,532 @@
+import XCTest
+@testable import MLXCore
+
+/// Pins the "Recommended" pane's data: three sections (Gemma 4, Qwen,
+/// Largest), each ascending by size, plus the RAM-requirements math that
+/// drives the pane's dim-but-never-hide treatment. The pane exists to answer
+/// "which model should I download" for someone with zero AI experience, so
+/// every entry's copy and sizing claims are load-bearing — get either wrong
+/// and the recommendation itself is wrong, not just a cosmetic bug.
+final class RecommendedModelsTests: XCTestCase {
+
+    private let GiB: UInt64 = 1_073_741_824
+
+    /// Every recommended pick across all three sections — the union the
+    /// invariant tests below sweep, so a new section can't slip past them.
+    private var allRecommended: [RecommendedModelPick] {
+        RecommendedModelPick.allCatalogs
+    }
+
+    /// `allCatalogs` is what the invariant sweeps run over, so it has to BE the
+    /// sections — a section left out of it is a section with no guards.
+    func testAllCatalogsIsTheUnionOfTheSections() {
+        let union = RecommendedModelPick.gemmaCatalog
+            + RecommendedModelPick.qwenCatalog
+            + RecommendedModelPick.liquidCatalog
+            + RecommendedModelPick.largestCatalog
+        XCTAssertEqual(RecommendedModelPick.allCatalogs, union)
+    }
+
+    // MARK: - Catalog shape
+
+    /// The pane draws one section per family (Gemma 4, Qwen, Liquid LFM3, Largest).
+    func testEveryFamilyIsPresent() {
+        let families = Set(allRecommended.map(\.family))
+        XCTAssertEqual(families, [.gemma, .qwen, .liquid, .largest])
+    }
+
+    /// A family catalog can't be empty — a section with zero rows would be a
+    /// dead header in the UI.
+    func testNoFamilyCatalogIsEmpty() {
+        XCTAssertFalse(RecommendedModelPick.gemmaCatalog.isEmpty)
+        XCTAssertFalse(RecommendedModelPick.qwenCatalog.isEmpty)
+        XCTAssertFalse(RecommendedModelPick.largestCatalog.isEmpty)
+    }
+
+    /// Every entry in `gemmaCatalog` is actually Gemma, and every entry in
+    /// `qwenCatalog` is actually Qwen — the section header promises this.
+    func testEveryEntryMatchesItsCatalogsFamily() {
+        for p in RecommendedModelPick.gemmaCatalog {
+            XCTAssertEqual(p.family, .gemma, p.id)
+        }
+        for p in RecommendedModelPick.qwenCatalog {
+            XCTAssertEqual(p.family, .qwen, p.id)
+        }
+        for p in RecommendedModelPick.largestCatalog {
+            XCTAssertEqual(p.family, .largest, p.id)
+        }
+    }
+
+    /// Each family list renders smallest-to-largest, so a beginner scans it
+    /// as "gets more capable as you go".
+    func testEachFamilyCatalogIsSortedAscendingBySize() {
+        let gemmaSizes = RecommendedModelPick.gemmaCatalog.map(\.sizeGB)
+        XCTAssertEqual(gemmaSizes, gemmaSizes.sorted())
+        let qwenSizes = RecommendedModelPick.qwenCatalog.map(\.sizeGB)
+        XCTAssertEqual(qwenSizes, qwenSizes.sorted())
+        let largestSizes = RecommendedModelPick.largestCatalog.map(\.sizeGB)
+        XCTAssertEqual(largestSizes, largestSizes.sorted())
+    }
+
+    /// No id collisions within or across the catalogs — ids key the
+    /// SwiftUI `ForEach`/download-state lookups.
+    func testNoDuplicateIdsAcrossAllCatalogs() {
+        let ids = allRecommended.map(\.id)
+        XCTAssertEqual(ids.count, Set(ids).count)
+    }
+
+    /// Every repo id must look like a real, resolvable HuggingFace path
+    /// (`org/repo`, no whitespace) — a typo here silently 404s the download.
+    func testRepoIdsAreWellFormed() {
+        for p in allRecommended {
+            XCTAssertTrue(p.repoId.contains("/"), p.repoId)
+            XCTAssertFalse(p.repoId.contains(" "), p.repoId)
+            XCTAssertEqual(p.repoId.split(separator: "/").count, 2, p.repoId)
+        }
+    }
+
+    /// Every entry needs real, non-empty plain-English copy — an empty blurb
+    /// or tagline would silently render a blank description.
+    func testEveryPickHasNonEmptyBeginnerCopy() {
+        for p in allRecommended {
+            XCTAssertFalse(p.name.isEmpty, p.id)
+            XCTAssertFalse(p.tagline.isEmpty, p.id)
+            XCTAssertGreaterThan(p.blurb.count, 40, "\(p.id) blurb reads as a stub")
+        }
+    }
+
+    // MARK: - Capability scores (the three bars)
+
+    /// Every score is on the 0–100 scale the bars divide by, and every pick
+    /// names a real context window. A stray 0 or 120 renders an empty or
+    /// overflowing track with nothing else to catch it.
+    func testEveryPickHasScoresInRange() {
+        for p in allRecommended {
+            XCTAssertTrue((0...100).contains(p.intelligence), "\(p.id) intelligence \(p.intelligence)")
+            XCTAssertTrue((0...100).contains(p.speed), "\(p.id) speed \(p.speed)")
+            XCTAssertGreaterThan(p.contextTokens, 0, p.id)
+            XCTAssertGreaterThan(p.activeParamsB, 0, p.id)
+        }
+    }
+
+    /// **The invariant that makes hand-tuning the speed scores safe.** Decode
+    /// on Apple Silicon is bandwidth-bound, so a model that wakes MORE
+    /// parameters per token can never be faster than one that wakes fewer. A
+    /// tie in active params is unconstrained — that's where quantization
+    /// (26B-A4B at 4-bit vs 8-bit) and expert-bank size legitimately differ.
+    /// A pick scored at its draft-head rate is a different quantity and is
+    /// swept separately below.
+    func testABiggerModelIsNeverScoredFasterThanASmallerOne() {
+        let byActiveDescending = allRecommended.filter { !$0.speedIsWithMtp }
+            .sorted { $0.activeParamsB > $1.activeParamsB }
+        for (i, big) in byActiveDescending.enumerated() {
+            for small in byActiveDescending[(i + 1)...] where small.activeParamsB < big.activeParamsB {
+                XCTAssertLessThanOrEqual(
+                    big.speed, small.speed,
+                    "\(big.id) wakes \(big.activeParamsB)B and is scored FASTER (\(big.speed)) than \(small.id) at \(small.activeParamsB)B (\(small.speed))"
+                )
+            }
+        }
+    }
+
+    /// The MTP-scored picks are the ones whose checkpoint (or bundled
+    /// sidecar) ships a draft head this app runs by default, scored from the
+    /// bench's `mtp` cells: the 35B-A3B is the fastest thing here and
+    /// Flash-Next sits above the 27B.
+    func testMtpScoredPicksAreTheOnesShippingADraftHead() {
+        let mtp = Set(allRecommended.filter(\.speedIsWithMtp).map(\.id))
+        XCTAssertEqual(mtp, ["qwen38-27b", "bonsai2-27b", "qwen36-35b-a3b", "qwen38-flash-next",
+                             "sushi-2bpw", "deepseek-v41-flash", "deepseek-v41-flash-pruned192"])
+        XCTAssertEqual(RecommendedModelPick.qwen36_35bA3b.speed, allRecommended.map(\.speed).max())
+        XCTAssertGreaterThan(RecommendedModelPick.qwen38FlashNext.speed, RecommendedModelPick.qwen38_27b.speed)
+        XCTAssertLessThan(RecommendedModelPick.qwen38FlashNext.speed, RecommendedModelPick.qwen36_35bA3b.speed)
+    }
+
+    /// The same weights quantized twice are the same model: an 8-bit build is
+    /// slower and bigger, never smarter.
+    func testAHigherPrecisionBuildInheritsItsSiblingsIntelligence() {
+        XCTAssertEqual(RecommendedModelPick.gemma26bA4b8bit.intelligence,
+                       RecommendedModelPick.gemma26bA4b.intelligence)
+        XCTAssertLessThan(RecommendedModelPick.gemma26bA4b8bit.speed,
+                          RecommendedModelPick.gemma26bA4b.speed)
+    }
+
+    /// The Gemma section starts at E4B (E2B is too small to recommend) and
+    /// carries one 8-bit build, the MoE; the dense 31B at 8-bit is gone.
+    func testGemmaSectionDropsE2BAndThe31B8bit() {
+        let ids = RecommendedModelPick.gemmaCatalog.map(\.id)
+        XCTAssertEqual(ids.first, "gemma-4-e4b")
+        XCTAssertFalse(ids.contains("gemma-4-e2b"))
+        XCTAssertFalse(ids.contains("gemma-4-31b-8bit"))
+        XCTAssertTrue(ids.contains("gemma-4-31b"))
+    }
+
+    /// The hover card over the bars names each bar and prints its score —
+    /// the bars alone cannot say which is which.
+    func testCapabilityTipNamesBothBarsWithTheirScores() {
+        let fn = CapabilityTip.lines(for: .qwen38FlashNext)
+        XCTAssertEqual(fn, ["Intelligence: 67 (our estimate)", "Speed: 47 (with its built-in draft head)"])
+        let e4b = CapabilityTip.lines(for: .gemmaE4B)
+        XCTAssertEqual(e4b, ["Intelligence: 20", "Speed: 57"])
+    }
+
+    /// Only the picks the site has no entry for are flagged estimated —
+    /// leaving a real score flagged (or an invented one unflagged) is the whole
+    /// point of carrying the flag.
+    func testOnlyTheModelsAbsentFromTheIndexAreFlaggedEstimated() {
+        let estimated = Set(allRecommended.filter(\.intelligenceIsEstimated).map(\.id))
+        XCTAssertEqual(estimated, ["qwen38-27b", "bonsai2-27b", "qwen38-flash-next", "mimo-9b",
+                                   "sushi-2bpw", "lfm3-1.7b", "lfm3-omni-2b", "deepseek-v41-flash",
+                                   "deepseek-v41-flash-pruned192"])
+    }
+
+    /// The bar fractions the pane draws stay inside the track, and context —
+    /// which is compared on a log scale — orders the way the raw windows do.
+    func testBarFractionsStayInsideTheTrack() {
+        for p in allRecommended {
+            XCTAssertTrue((0...1).contains(p.intelligenceBar), p.id)
+            XCTAssertTrue((0...1).contains(p.speedBar), p.id)
+            XCTAssertTrue((0...1).contains(p.contextBar), p.id)
+        }
+        // 128K < 256K < 1M, and the 1M pick fills the track.
+        XCTAssertLessThan(RecommendedModelPick.gemmaE4B.contextBar,
+                          RecommendedModelPick.gemma12B.contextBar)
+        XCTAssertLessThan(RecommendedModelPick.gemma12B.contextBar,
+                          RecommendedModelPick.deepseekV41Flash.contextBar)
+        XCTAssertEqual(RecommendedModelPick.deepseekV41Flash.contextBar, 1.0, accuracy: 0.001)
+    }
+
+    /// The context bar shows the MODEL's window, not the RAM-clamped effective
+    /// one — pinned against each checkpoint's own `max_position_embeddings`.
+    func testContextWindowsMatchTheCheckpoints() {
+        XCTAssertEqual(RecommendedModelPick.gemmaE4B.contextTokens, 131_072)
+        XCTAssertEqual(RecommendedModelPick.gemma31B.contextTokens, 262_144)
+        XCTAssertEqual(RecommendedModelPick.mimo9b.contextTokens, 262_144)
+        XCTAssertEqual(RecommendedModelPick.qwen38_27b.contextTokens, 262_144)
+        XCTAssertEqual(RecommendedModelPick.qwen38FlashNext.contextTokens, 262_144)
+        XCTAssertEqual(RecommendedModelPick.deepseekV41Pruned.contextTokens, 1_048_576)
+    }
+
+    /// `activeParamsB` is a fact per checkpoint, not a restatement of the
+    /// headline size: an MoE counts only what it wakes.
+    func testActiveParamsAreTheWokenParametersNotTheTotal() {
+        XCTAssertEqual(RecommendedModelPick.qwen36_35bA3b.activeParamsB, 3.0)  // 35B total
+        XCTAssertEqual(RecommendedModelPick.qwen38FlashNext.activeParamsB, 6.0) // 125B total
+        XCTAssertEqual(RecommendedModelPick.deepseekV41Pruned.activeParamsB, 16.0) // 6 of 192 kept experts + shared
+        XCTAssertEqual(RecommendedModelPick.mimo9b.activeParamsB, 9.7) // dense
+        XCTAssertEqual(RecommendedModelPick.gemma31B.activeParamsB, 31.0)      // dense
+    }
+
+    // MARK: - Starter recommendation (RAM tiers)
+
+    /// A Mac of `gib` GB that gives models `usable` GB, by default 3/4 of RAM (the app's own fallback).
+    private func mac(_ gib: Double, usable: Double? = nil) -> SystemMemoryInfo {
+        SystemMemoryInfo(totalBytes: UInt64(gib * Double(GiB)), usableBytes: UInt64((usable ?? gib * 3 / 4) * Double(GiB)))
+    }
+
+    /// Each band, sampled in the middle: the band's pick, or the largest below it the GPU can hold.
+    func testStarterPickPerRamTier() {
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(8)).id, "gemma-4-e4b")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(24)).id, "gemma-4-12b")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(32)).id, "qwen38-27b")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(36)).id, "qwen38-27b")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(64)).id, "qwen38-27b-8bit")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(128)).id, "qwen38-flash-next")
+    }
+
+    /// Bands at 32, 36, 48 and 96 GB are LOWER-inclusive: those are real Mac
+    /// sizes. 16 GB stays upper-inclusive. A band caps the pick; what the GPU
+    /// can give decides it.
+    func testStarterPickBoundariesAreExact() {
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(16)).id, "gemma-4-e4b")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(17)).id, "gemma-4-12b")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(31)).id, "gemma-4-12b")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(32)).id, "qwen38-27b")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(35)).id, "qwen38-27b")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(47)).id, "qwen38-27b-6bit")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(95)).id, "qwen38-27b-8bit")
+    }
+
+    /// A band's own pick needs a GPU that can hold it. A 36 GB Mac gives models
+    /// about 28 GB (measured on an M3 Pro), so the 6-bit 27B (32.4 GB) steps
+    /// down; a 96 GB Mac at 3/4 (72 GB) cannot hold Flash-Next (78 GB), at the
+    /// large-Mac working set (~84%) or a raised `iogpu.wired_limit_mb` it can.
+    func testABandsPickNeedsAGpuThatCanHoldIt() {
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(36, usable: 28)).id, "qwen38-27b")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(36, usable: 33)).id, "qwen38-27b-6bit")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(48)).id, "qwen38-27b-6bit")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(96)).id, "qwen38-27b-8bit")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(96, usable: 96 * 0.84)).id, "qwen38-flash-next")
+    }
+
+    /// Every tier's pick fits what the GPU of the SMALLEST Mac in its band can
+    /// give a model, not its physical RAM — a recommendation the machine can't
+    /// load is worse than no recommendation.
+    func testEveryStarterTierFitsTheBottomOfItsBand() {
+        let bottoms = [mac(8), mac(16), mac(17), mac(32), mac(36), mac(36, usable: 28), mac(48), mac(96)]
+        for memory in bottoms {
+            let pick = RecommendedModelPick.starterPick(memory: memory)
+            XCTAssertTrue(pick.meetsSystemRequirements(memory: memory),
+                          "\(pick.id) needs \(pick.approxRAMNeededGB) GB but was recommended where models get \(memory.usableGB) GB")
+        }
+    }
+
+    /// The 6/8-bit 27B packs are the same checkpoint as the 4-bit pick.
+    func testQwen27BQuantVariantsShareTheCheckpoint() {
+        for (pick, label) in [(RecommendedModelPick.qwen38_27b6bit, "6-bit"), (.qwen38_27b8bit, "8-bit")] {
+            XCTAssertEqual(pick.quantLabel, label)
+            XCTAssertEqual(pick.family, .qwen)
+            XCTAssertEqual(pick.intelligence, RecommendedModelPick.qwen38_27b.intelligence)
+            XCTAssertEqual(pick.activeParamsB, RecommendedModelPick.qwen38_27b.activeParamsB)
+            XCTAssertLessThanOrEqual(pick.speed, RecommendedModelPick.qwen38_27b.speed, "more bits per weight is never faster")
+        }
+    }
+
+    /// Total: no input can fail to produce a recommendation, including the
+    /// degenerate ones a `physicalMemory` read could theoretically hand back.
+    func testStarterPickIsTotal() {
+        for bytes: UInt64 in [0, 1, 2 * GiB, 96 * GiB, 512 * GiB, UInt64.max] {
+            for usable: UInt64 in [0, bytes / 4 * 3] {
+                let memory = SystemMemoryInfo(totalBytes: bytes, usableBytes: usable)
+                XCTAssertFalse(RecommendedModelPick.starterPick(memory: memory).repoId.isEmpty)
+            }
+        }
+    }
+
+    /// Every starter tier is a plain safetensors pick. The shared card handles
+    /// a GGUF pick (`ggufFilename` → the quant download path) because it must
+    /// not assume otherwise, but nothing routes there today.
+    func testNoStarterTierIsAGgufPick() {
+        for gib: Double in [8, 16, 32, 36, 48, 128] {
+            XCTAssertNil(RecommendedModelPick.starterPick(memory: mac(gib)).ggufFilename)
+        }
+    }
+
+    // MARK: - Meets-system-requirements (reduced opacity, never hidden)
+
+    /// A model well within what this Mac gives models meets requirements.
+    func testMeetsSystemRequirementsWhenPlentyOfHeadroom() {
+        XCTAssertTrue(RecommendedModelPick.gemmaE4B.meetsSystemRequirements(memory: mac(16)))
+    }
+
+    /// A model bigger than what this Mac gives models does not meet requirements —
+    /// this is the signal that sorts it behind the "Requires more RAM"
+    /// disclosure, never a reason to drop it from the list.
+    func testDoesNotMeetSystemRequirementsWhenTooBig() {
+        XCTAssertFalse(RecommendedModelPick.gemma31B.meetsSystemRequirements(memory: mac(16)))
+    }
+
+    /// The threshold includes the same ~20% overhead the rest of the app
+    /// budgets for RAM-vs-disk-weight, so a model whose weights alone are
+    /// just under the usable budget still correctly reads as "won't fit".
+    func testRequirementsThresholdIncludesOverhead() {
+        // gemma31B: 17.2 GB weights -> ~20.64 GB needed. 18 GB for models covers
+        // the raw weights but not the overhead.
+        let pick = RecommendedModelPick.gemma31B
+        XCTAssertFalse(pick.meetsSystemRequirements(memory: mac(32, usable: 18)))
+        XCTAssertTrue(pick.meetsSystemRequirements(memory: mac(32, usable: 24)))
+    }
+
+    /// The Sushi pack fits a stock 64 GB Mac's GPU working set (3/4 of RAM) and not a stock 48 GB one.
+    func testSushiPackFitsAStock64GBMacButNot48() {
+        let pick = RecommendedModelPick.sushi2bpw
+        let mac64 = SystemMemoryInfo(totalBytes: 64 * GiB, usableBytes: 48 * GiB)
+        let mac48 = SystemMemoryInfo(totalBytes: 48 * GiB, usableBytes: 36 * GiB)
+        XCTAssertNotEqual(mac64.fit(neededGB: pick.approxRAMNeededGB), .exceeds)
+        XCTAssertEqual(mac48.fit(neededGB: pick.approxRAMNeededGB), .exceeds)
+        XCTAssertTrue(pick.tagline.contains("64 GB") && pick.blurb.contains("64 GB"))
+        XCTAssertEqual(pick.intelligence, RecommendedModelPick.qwen38FlashNext.intelligence)
+    }
+
+    /// Flash-Next is ~100 GB on disk but the 32 GB n-gram table is mmapped,
+    /// never resident, so the honest RAM gate is the ~70 GB of weights plus
+    /// headroom: inline on a 96 GB Mac (tight against Metal's default working
+    /// set there), behind "Requires more RAM" on 64 GB.
+    func testFlashNextFitsOn96GBButNotBelow() {
+        let fn = RecommendedModelPick.qwen38FlashNext
+        XCTAssertTrue(fn.meetsSystemRequirements(memory: mac(96, usable: 96 * 0.84)))
+        XCTAssertFalse(fn.meetsSystemRequirements(memory: mac(64)))
+        XCTAssertTrue(fn.blurb.contains("96 GB"), "blurb must name the 96 GB target")
+        let mac96 = SystemMemoryInfo(totalBytes: 96 * GiB, usableBytes: UInt64(96 * 0.84) * GiB)
+        XCTAssertEqual(mac96.fit(neededGB: fn.approxRAMNeededGB), .tight)
+    }
+
+    /// The pruned DeepSeek serves in ~91 GB on a 128 GB Mac: the row must read TIGHT
+    /// against that Mac's default Metal working set (~107 GB), never
+    /// "exceeds", while a 96 GB Mac still fails the gate.
+    func testDeepseekReadsTightNotExceedsOn128GB() {
+        let ds = RecommendedModelPick.deepseekV41Pruned
+        let mac128 = SystemMemoryInfo(totalBytes: 128 * GiB, usableBytes: UInt64(107.5 * Double(GiB)))
+        XCTAssertEqual(mac128.fit(neededGB: ds.approxRAMNeededGB), .tight)
+        XCTAssertFalse(ds.meetsSystemRequirements(memory: mac(96, usable: 96 * 0.84)))
+    }
+
+    // MARK: - Partitioning (inline vs "Requires more RAM" disclosure)
+
+    /// On a big enough Mac, everything in a family fits — the disclosure
+    /// never appears (nothing goes into `requiresMoreRAM`).
+    func testPartitionPutsEverythingInFitsOnAHighRamMac() {
+        let split = RecommendedModelPick.gemmaCatalog.partitionedByRequirements(memory: mac(128))
+        XCTAssertEqual(split.fits.count, RecommendedModelPick.gemmaCatalog.count)
+        XCTAssertTrue(split.requiresMoreRAM.isEmpty)
+    }
+
+    /// On a small Mac, the biggest Gemma picks land in `requiresMoreRAM`
+    /// while the small ones stay in `fits` — and nothing is dropped: the two
+    /// buckets together must reconstruct the original catalog.
+    func testPartitionSplitsBySizeOnALowRamMac() {
+        let split = RecommendedModelPick.gemmaCatalog.partitionedByRequirements(memory: mac(16))
+        XCTAssertTrue(split.fits.contains(.gemmaE4B))
+        XCTAssertTrue(split.requiresMoreRAM.contains(.gemma31B))
+        XCTAssertEqual(Set(split.fits + split.requiresMoreRAM), Set(RecommendedModelPick.gemmaCatalog))
+    }
+
+    /// Each bucket preserves the catalog's ascending-size order — the
+    /// partition must not reshuffle, only split.
+    func testPartitionPreservesAscendingOrderWithinEachBucket() {
+        let split = RecommendedModelPick.gemmaCatalog.partitionedByRequirements(memory: mac(16))
+        XCTAssertEqual(split.fits.map(\.sizeGB), split.fits.map(\.sizeGB).sorted())
+        XCTAssertEqual(split.requiresMoreRAM.map(\.sizeGB), split.requiresMoreRAM.map(\.sizeGB).sorted())
+    }
+
+    // MARK: - Known-good entries (regression pins)
+
+    /// The Qwen section is one row per size class: the 9B entry, Bonsai for
+    /// 16 GB Macs, the 27B, and the 35B-A3B — in that order. The 3.6 27B MTP
+    /// pack stays out on the maintainer's call (the 3.8 is better for the
+    /// same RAM); the 6/8-bit and iQ variants stay out (Discover search
+    /// carries every quant).
+    func testQwenSectionIsOneRowPerSizeClass() {
+        let repoIds = RecommendedModelPick.qwenCatalog.map(\.repoId)
+        XCTAssertEqual(repoIds, [
+            "ddalcu/MiMo-V2.6-Distill-Qwen-9B-MLX-Serve-4bit",
+            "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit",
+            "ddalcu/Qwen3.8-27B-MLX-Serve-4bit",
+            "ddalcu/Qwen3.6-35B-A3B-MLX-Serve-4bit",
+        ])
+        XCTAssertFalse(repoIds.contains("ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve"))
+    }
+
+    /// The MiMo 9B pack: on-disk size from the repo's blob totals, an
+    /// estimated score (the index has no entry for the distill), the 9B-class
+    /// rate, a 256K window, 4-bit label, comfortable on a 16 GB Mac.
+    func testMiMo9BPackIsPinned() {
+        let p = RecommendedModelPick.mimo9b
+        XCTAssertEqual(p.id, "mimo-9b")
+        XCTAssertEqual(p.repoId, "ddalcu/MiMo-V2.6-Distill-Qwen-9B-MLX-Serve-4bit")
+        XCTAssertEqual(p.family, .qwen)
+        XCTAssertEqual(p.sizeGB, 7.1, accuracy: 0.01)
+        XCTAssertEqual(p.approxRAMNeededGB, 8.5, accuracy: 0.05)
+        XCTAssertEqual(p.intelligence, 38)
+        XCTAssertTrue(p.intelligenceIsEstimated)
+        XCTAssertEqual(p.speed, 28)
+        XCTAssertFalse(p.speedIsWithMtp)
+        XCTAssertEqual(p.contextTokens, 262_144)
+        XCTAssertEqual(p.activeParamsB, 9.7)
+        XCTAssertEqual(p.quantLabel, "4-bit")
+        XCTAssertTrue(p.meetsSystemRequirements(memory: mac(16)))
+        XCTAssertFalse(p.meetsSystemRequirements(memory: mac(8)))
+    }
+
+    /// Bonsai 2 is the Qwen 3.8 27B squeezed to 2 bits so it fits a 16 GB Mac.
+    /// Listed only: the 16 GB starter pick stays Gemma 4 E4B.
+    func testBonsaiIsTheQwen27BThatFitsA16GBMac() {
+        let b = RecommendedModelPick.bonsai2_27b
+        XCTAssertEqual(b.repoId, "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit")
+        XCTAssertTrue(RecommendedModelPick.qwenCatalog.contains(b))
+        XCTAssertTrue(b.meetsSystemRequirements(memory: mac(16)))
+        XCTAssertFalse(RecommendedModelPick.qwen38_27b.meetsSystemRequirements(memory: mac(16)))
+        XCTAssertLessThan(b.intelligence, RecommendedModelPick.qwen38_27b.intelligence, "a 2-bit squeeze is never smarter")
+        XCTAssertEqual(b.contextTokens, 262_144)
+        XCTAssertEqual(b.quantLabel, "2-bit")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(16)).id, "gemma-4-e4b")
+    }
+
+    func testGemma4EverydayPicksArePresent() {
+        let repoIds = Set(RecommendedModelPick.gemmaCatalog.map(\.repoId))
+        XCTAssertTrue(repoIds.contains("mlx-community/gemma-4-e4b-it-4bit"))
+        XCTAssertTrue(repoIds.contains("mlx-community/gemma-4-12b-it-4bit"))
+    }
+
+    /// The "Largest models" section holds the biggest picks, ordered smallest-
+    /// first like every other catalog: the ~100 GB Qwen 3.8 Flash-Next pack,
+    /// then DeepSeek-V4.1 pruned for 128 GB Macs, then its 256 GB pack.
+    func testLargestSectionHoldsFlashNextThenDeepseek() {
+        XCTAssertEqual(RecommendedModelPick.largestCatalog.map(\.id),
+                       ["sushi-2bpw", "qwen38-flash-next", "deepseek-v41-flash-pruned192", "deepseek-v41-flash"])
+        let fn = RecommendedModelPick.qwen38FlashNext
+        XCTAssertEqual(fn.repoId, "ddalcu/Qwen3.8-Flash-Next-MLX-Serve-iQ-MLX-4.7bpw")
+        XCTAssertEqual(fn.quantLabel, "iQ-MLX 4.7 bpw")
+    }
+
+    /// The 35B slot is our own MLX-Serve pack (in-checkpoint MTP head).
+    func testQwenThirtyFiveBPickIsTheMlxServePack() {
+        XCTAssertEqual(RecommendedModelPick.qwen36_35bA3b.repoId, "ddalcu/Qwen3.6-35B-A3B-MLX-Serve-4bit")
+        XCTAssertFalse(RecommendedModelPick.qwenCatalog.contains { $0.repoId == "mlx-community/Qwen3.6-35B-A3B-4bit" })
+    }
+
+    /// DeepSeek-V4.1 for a 128 GB Mac is our pruned pack (192 of 384 experts, 2-bit): the same model as the
+    /// 256 GB pick, so the same intelligence and context; its Engram table stays on disk.
+    func testDeepseekV41PrunedIsOurPackForA128GBMac() {
+        let ds = RecommendedModelPick.deepseekV41Pruned
+        XCTAssertEqual(ds.repoId, "ddalcu/DeepSeek-V4.1-Flash-1017-MLX-Serve-iQ-MLX-Pruned192-2.25bpw")
+        XCTAssertEqual(ds.quantLabel, "iQ-MLX Pruned192 2.25 bpw")
+        XCTAssertEqual(ds.intelligence, RecommendedModelPick.deepseekV41Flash.intelligence)
+        XCTAssertTrue(ds.meetsSystemRequirements(memory: mac(128, usable: 107.5)))
+        XCTAssertFalse(ds.meetsSystemRequirements(memory: mac(96, usable: 96 * 0.84)))
+        XCTAssertFalse(RecommendedModelPick.allCatalogs.contains { $0.repoId.hasPrefix("ddalcu/DeepSeek-V4-Flash") },
+                       "the V4.1 pruned pack replaces the V4-Flash pick")
+    }
+
+    /// DeepSeek-V4.1-Flash is our iQ-MLX 3.0 pack, gated on its ~213 GB wired
+    /// peak: a 256 GB Mac's pick, never a 192 GB one's.
+    func testDeepseekV41FlashIsOurPackForA256GBMac() {
+        let ds = RecommendedModelPick.deepseekV41Flash
+        XCTAssertEqual(ds.repoId, "ddalcu/DeepSeek-V4.1-Flash-1017-MLX-Serve-iQ-MLX-3.0bpw")
+        XCTAssertEqual(ds.quantLabel, "iQ-MLX 3.0 bpw")
+        XCTAssertEqual(ds.contextTokens, 1_048_576)
+        XCTAssertTrue(ds.meetsSystemRequirements(memory: mac(256, usable: 256 * 0.84)))
+        XCTAssertFalse(ds.meetsSystemRequirements(memory: mac(192, usable: 192 * 0.84)))
+    }
+
+    /// The Liquid section is the small text model and the Omni, nothing else.
+    func testLiquidSectionIsTheTextModelAndTheOmni() {
+        XCTAssertEqual(RecommendedModelPick.liquidCatalog.map(\.id), ["lfm3-1.7b", "lfm3-omni-2b"])
+    }
+
+    /// The entry-level Qwen row is the MiMo 9B (7.1 GB) — and the ancient
+    /// 0.8B toy must never come back: too small to be a meaningful
+    /// comparison against the Gemma lineup.
+    func testEntryLevelQwenPickIsMiMoNotAToy() {
+        let repoIds = RecommendedModelPick.qwenCatalog.map(\.repoId)
+        XCTAssertEqual(RecommendedModelPick.qwenCatalog.first?.id, "mimo-9b",
+                       "MiMo 9B (7.1 GB) is the smallest Qwen row")
+        XCTAssertFalse(repoIds.contains { $0.contains("0.8B") })
+    }
+
+    /// The Recommended table names the quant beside the size so nobody finds
+    /// out what they downloaded from the folder name.
+    func testQuantLabelIsDerivedFromRepoIdOrGgufFile() {
+        func label(_ repoId: String, gguf: String? = nil) -> String? {
+            var p = RecommendedModelPick.gemmaCatalog[0]
+            p = RecommendedModelPick(id: p.id, name: p.name, tagline: p.tagline, blurb: p.blurb,
+                                     repoId: repoId, sizeGB: p.sizeGB, family: p.family,
+                                     intelligence: p.intelligence, intelligenceIsEstimated: p.intelligenceIsEstimated,
+                                     speed: p.speed, contextTokens: p.contextTokens, activeParamsB: p.activeParamsB,
+                                     ggufFilename: gguf)
+            return p.quantLabel
+        }
+        XCTAssertEqual(label("mlx-community/gemma-4-12b-it-4bit"), "4-bit")
+        XCTAssertEqual(label("mlx-community/gemma-4-31b-it-8bit"), "8-bit")
+        XCTAssertEqual(label("mlx-community/Hy3-oQ2e"), "oQ2e")
+        XCTAssertEqual(label("ddalcu/DeepSeek-V4-Flash-0731-MLX-Serve-mixed-2-3-8bit"), "mixed 2/3/8-bit")
+        XCTAssertEqual(label("ddalcu/DeepSeek-V4-Flash-0731-iQ-MLX-3.3bpw"), "iQ-MLX 3.3 bpw")
+        XCTAssertEqual(label("beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw"), "Sushi 2.6 bpw")
+        XCTAssertEqual(label("poolside/Laguna-S-2.1-NVFP4-mlx"), "NVFP4")
+        XCTAssertEqual(label("x/y", gguf: "model-Q4_K_M.gguf"), "Q4_K_M")
+        XCTAssertNil(label("x/plain-model"))
+        for pick in RecommendedModelPick.allCatalogs {
+            XCTAssertNotNil(pick.quantLabel, pick.repoId)
+        }
+    }
+}

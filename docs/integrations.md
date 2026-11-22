@@ -1,0 +1,348 @@
+[English](integrations.md) · [简体中文](zh-CN/integrations.md)
+
+# Integrations
+
+mlx-serve speaks the standard APIs (OpenAI, Anthropic, Ollama, OpenAI Responses), so most coding agents and editors connect with a base URL and a model id. This page covers the zero-config launchers first, then manual setup per tool.
+
+## Connection details
+
+| What | Value |
+|---|---|
+| OpenAI-compatible | `http://127.0.0.1:11234/v1` (chat/completions, embeddings, images, audio) |
+| OpenAI Responses | `http://127.0.0.1:11234/v1/responses` (what Codex uses) |
+| Anthropic-compatible | `http://127.0.0.1:11234` (set `ANTHROPIC_BASE_URL`; serves `/v1/messages`) |
+| Ollama-compatible | `http://127.0.0.1:11234/api/*` |
+| API key | Any placeholder (e.g. `mlx-serve`). Loopback connections are exempt even with `--api-key` set; non-local clients need the real key |
+| Model ids | `GET /v1/models`. Each row advertises its context window in `meta.context_length` and as top-level `context_length` / `max_model_len` for discovery-based clients |
+
+Substitute your host/port if you changed them (default port is 11234).
+
+One thing to get right in any manual config: the context window. The server pins the real window at model load (memory-bounded, often well under the model max) and advertises it in `/v1/models`. Hardcoding a bigger number in an agent's config means overflows; hardcoding a smaller one wastes the window. The launchers below read it from the server so you never type it.
+
+## Zero-config: the launchers
+
+Two ways to skip everything below:
+
+- **MLX-Serve app**: the tray's **Code** button detects the CLIs installed on your Mac and launches them preconfigured against the running server (the App Store build shows copy-paste commands instead, since it isn't allowed to launch other apps).
+- **`mlx-serve launch <agent>`**: same thing from the terminal, ollama-style:
+
+```bash
+mlx-serve launch claude              # any of: claude, pi, omp, opencode, opencode2, codex, hermes, aider, fx, grok, zcode
+mlx-serve launch codex --model Qwen3.5-27B-MLX-4bit
+mlx-serve launch codex -- resume     # everything after -- goes to the agent
+```
+
+If no server is running, `launch` starts the MLX-Serve app and waits; without the app installed it tells you to run `mlx-serve serve` first. Flags: `--model`, `--url`, `--port`, `--print` (write the configs and print the launch script instead of running), `--no-start`.
+
+Both launchers write configs into dedicated `~/.mlx-serve/<agent>/` folders and never touch your real agent configs (`~/.claude`, `~/.pi`, `~/.omp`, `~/.codex`, `~/.hermes`, `~/.grok`, `~/.zcode` stay yours). fx is the exception: it reads providers only from `~/.fx/settings.json`, so the launch sets the `providers.mlx-serve` entry there and selects it with `FX_PROVIDER`/`FX_MODEL`, leaving the rest of the file, your default provider included, as it was. Codex is the exception: it launches against your real Codex home so MCP servers, plugins, and auth work; the only file the launch writes for it is `~/.mlx-serve/codex/model-instructions.md`, never into your Codex home — see [Codex](#codex).
+
+### ZCode
+
+[ZCode](https://github.com/zai-org/ZCode) installs from source: build its CLI per its README and put `zcode` on your PATH. `mlx-serve launch zcode` then points it at the server's OpenAI Chat Completions API with every served chat model and its advertised context; `--model` picks one, args after `--` go to `zcode` (`-- -p "fix the tests"` runs one headless prompt). Config lands in `~/.mlx-serve/zcode/provider_config.json`, and ZCode's data dir moves to `~/.mlx-serve/zcode` via `ZCODE_DATA_BASE_DIR`.
+
+## Coding agents (manual setup)
+
+Replace `MODEL_ID` with an id from `GET /v1/models` and `CTX` with that row's `meta.context_length`.
+
+### Claude Code
+
+Env vars only, no config file. mlx-serve serves the Anthropic Messages API natively.
+
+```bash
+export ANTHROPIC_BASE_URL='http://127.0.0.1:11234'
+export ANTHROPIC_API_KEY=
+export ANTHROPIC_AUTH_TOKEN=mlx-serve
+export ANTHROPIC_DEFAULT_OPUS_MODEL=MODEL_ID
+export ANTHROPIC_DEFAULT_SONNET_MODEL=MODEL_ID
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=MODEL_ID
+claude --model MODEL_ID
+```
+
+### pi
+
+pi needs a `models.json` naming the provider; `PI_CODING_AGENT_DIR` relocates the config dir so your real `~/.pi/agent` is untouched.
+
+```bash
+mkdir -p ~/.mlx-serve/pi
+cat > ~/.mlx-serve/pi/models.json <<'EOF'
+{
+  "providers": {
+    "mlx": {
+      "baseUrl": "http://127.0.0.1:11234/v1",
+      "api": "openai-completions",
+      "apiKey": "mlx-serve",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": true,
+        "maxTokensField": "max_tokens"
+      },
+      "models": [
+        {"id": "MODEL_ID", "name": "MODEL_ID (mlx-serve)", "input": ["text"],
+         "contextWindow": CTX, "maxTokens": 8192, "reasoning": true,
+         "thinkingLevelMap": {"off": "none", "xhigh": "xhigh", "max": "max"}}
+      ]
+    }
+  }
+}
+EOF
+export PI_CODING_AGENT_DIR="$HOME/.mlx-serve/pi"
+pi --provider mlx --model MODEL_ID
+```
+
+### oh-my-pi (omp)
+
+Same idea as pi, but the file is `models.yml` (YAML). Note: omp still reads the `PI_CODING_AGENT_DIR` spelling for the config dir.
+
+```bash
+mkdir -p ~/.mlx-serve/omp
+cat > ~/.mlx-serve/omp/models.yml <<'EOF'
+providers:
+  mlx:
+    baseUrl: http://127.0.0.1:11234/v1
+    api: openai-completions
+    apiKey: mlx-serve
+    compat:
+      supportsDeveloperRole: false
+      supportsReasoningEffort: true
+      maxTokensField: max_tokens
+      thinkingFormat: openai
+      reasoningDisableMode: none-effort
+    models:
+      - id: "MODEL_ID"
+        contextWindow: CTX
+        maxTokens: 8192
+        reasoning: true
+        thinking:
+          mode: effort
+          efforts: [minimal, low, medium, high, xhigh]
+        input: [text]
+EOF
+export PI_CODING_AGENT_DIR="$HOME/.mlx-serve/omp"
+omp --model mlx/MODEL_ID
+```
+
+omp also supports live discovery instead of a static list: replace the `models:` block with `discovery: { type: openai-models-list }` and it reads `/v1/models` at startup, taking each model's real context from the rows (mlx-serve advertises it top-level exactly for this). The static list keeps media models out of the picker, which is why the launchers use it.
+
+### OpenCode
+
+`mlx-serve launch opencode` is the recommended path: it runs `opencode --version` and picks the v1 or the v2 integration below automatically (the executable name no longer says the generation — current Homebrew/npm distributions ship OpenCode 2 as `opencode`). For a manual v1 setup:
+
+No file needed. `OPENCODE_CONFIG_CONTENT` merges over your own config, so plugins and settings keep working.
+
+```bash
+export OPENCODE_CONFIG_CONTENT='{"$schema": "https://opencode.ai/config.json", "provider": {"mlx": {"npm": "@ai-sdk/openai-compatible", "name": "MLX Serve (local)", "options": {"baseURL": "http://127.0.0.1:11234/v1"}, "models": {"MODEL_ID": {"name": "MODEL_ID (mlx-serve)", "limit": {"context": CTX, "output": 8192}}}}}}'
+opencode --model mlx/MODEL_ID
+```
+
+### OpenCode 2
+
+OpenCode 2 reuses the same `OPENCODE_CONFIG_CONTENT` provider JSON, and the launcher also writes a dedicated config dir and registers the mlx-serve monitor plugin (sidebar stats + footer turn meter, reading `GET /metrics.json`). `mlx-serve launch opencode` routes a detected major >= 2 here (the profile is v2 for any newer major too); `mlx-serve launch opencode2` remains as a compatibility alias that forces v2 — it resolves `opencode` when that is the v2 binary, else a legacy `opencode2` still on PATH.
+
+**Start the server with `--metrics`** (`mlx-serve serve --metrics`). The CLI server has metrics off by default and answers `/metrics.json` with 503; the plugin then shows `feed --metrics off` and an otherwise empty panel, while the footer turn meter still works from the streamed response. The MLX-Serve app enables metrics by default. A v2 launch probes the endpoint and prints a warning when it is off.
+
+```bash
+export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"
+export OPENCODE_CONFIG_CONTENT='{"$schema": "https://opencode.ai/config.json", "model": "mlx/MODEL_ID", "provider": {"mlx": {"npm": "@ai-sdk/openai-compatible", "name": "MLX Serve (local)", "options": {"baseURL": "http://127.0.0.1:11234/v1"}, "models": {"MODEL_ID": {"name": "MODEL_ID (mlx-serve)", "limit": {"context": CTX, "output": 8192}}}}}}'
+```
+
+`$XDG_CONFIG_HOME/opencode/cli.json` (plugin `package` is relative to that config dir):
+
+```json
+{ "plugins": [ { "package": "./plugins/mlx-serve", "options": { "metricsUrl": "http://127.0.0.1:11234/metrics.json" } } ] }
+```
+
+Loopback omits `metricsToken`; a non-loopback URL adds `"metricsToken": "mlx-serve"` (`Authorization: Bearer`). A v2 launch copies the plugin into `~/.mlx-serve/opencode2/opencode/plugins/mlx-serve/` and never writes `~/.config/opencode/`.
+
+```bash
+# v2 has no root --model flag — the model is pinned in the config above
+opencode --standalone
+```
+
+### Codex
+
+Current Codex speaks only the OpenAI Responses wire API, which mlx-serve serves at `/v1/responses`. mlx-serve writes nothing into your Codex home (`${CODEX_HOME:-$HOME/.codex}`): its settings ride `-c key=value` overrides that codex merges over your own `config.toml`, so your MCP servers, plugins, login and project trusts keep working. No key setup: with no `env_key` configured, codex skips the login screen. Codex launches carry no mlx-serve skill, since codex has no setting for an extra skills folder. The launchers additionally write `~/.mlx-serve/codex/model-instructions.md` — a short base-instructions file written in this repo, teaching local models the tool contract of the current codex (its built-in fallback prompt names tools the binary no longer declares and ends the turn when the model only narrates its next step) — and pass it as `-c model_instructions_file=…`; `MLX_SERVE_CODEX_MODEL_INSTRUCTIONS=off` (or `0`), or the file being missing, keeps codex's own fallback prompt.
+
+No `codex` on PATH but you have the ChatGPT desktop app? It bundles the CLI at `/Applications/ChatGPT.app/Contents/Resources/codex` (the launchers find it there automatically; `mlx-serve launch chatgpt` works too).
+
+Codex will print `Model metadata for <id> not found. Defaulting to fallback metadata` on every turn. That's its internal catalog of OpenAI model ids and it fires for any custom provider's model; it's cosmetic. The part that matters, the context window, comes from the `-c model_context_window=…` override below, which overrides the fallback.
+
+```bash
+codex \
+  -c 'model="MODEL_ID"' \
+  -c 'model_provider="mlx"' \
+  -c model_context_window=CTX \
+  -c 'model_providers.mlx.name="MLX Serve (local)"' \
+  -c 'model_providers.mlx.base_url="http://127.0.0.1:11234/v1"' \
+  -c 'model_providers.mlx.wire_api="responses"'
+```
+
+Beyond these lines `mlx-serve launch codex` also passes `-c model_instructions_file="$HOME/.mlx-serve/codex/model-instructions.md"` for the file it writes there; codex refuses to start when that path is missing, so a hand-run codex without the file should leave the line out.
+
+### Hermes
+
+Hermes reads its whole tree from `HERMES_HOME`. The `.env` matters: `OPENAI_BASE_URL` set is what tells hermes it's configured, otherwise every session opens the setup wizard.
+
+```bash
+mkdir -p ~/.mlx-serve/hermes
+cat > ~/.mlx-serve/hermes/config.yaml <<'EOF'
+model:
+  default: "MODEL_ID"
+  provider: custom
+  base_url: "http://127.0.0.1:11234/v1"
+  api_key: "mlx-serve"
+  api_mode: chat_completions
+custom_providers:
+  - name: mlx-serve
+    base_url: "http://127.0.0.1:11234/v1"
+    api_key: "mlx-serve"
+    model: "MODEL_ID"
+    api_mode: chat_completions
+    models:
+      "MODEL_ID":
+        context_length: CTX
+EOF
+cat > ~/.mlx-serve/hermes/.env <<'EOF'
+OPENAI_BASE_URL=http://127.0.0.1:11234/v1
+OPENAI_API_KEY=mlx-serve
+EOF
+export HERMES_HOME="$HOME/.mlx-serve/hermes"
+hermes
+```
+
+### Aider
+
+Env vars plus a litellm metadata file so aider knows the real context window (without it, unknown `openai/` models get litellm defaults).
+
+```bash
+mkdir -p ~/.mlx-serve/aider
+cat > ~/.mlx-serve/aider/model-metadata.json <<'EOF'
+{
+  "openai/MODEL_ID": {
+    "max_input_tokens": CTX,
+    "max_output_tokens": 8192,
+    "max_tokens": 8192,
+    "input_cost_per_token": 0,
+    "output_cost_per_token": 0,
+    "litellm_provider": "openai",
+    "mode": "chat"
+  }
+}
+EOF
+export OPENAI_API_BASE='http://127.0.0.1:11234/v1'
+export OPENAI_API_KEY=mlx-serve
+aider --model openai/MODEL_ID --model-metadata-file ~/.mlx-serve/aider/model-metadata.json
+```
+
+### Grok
+
+xAI's `grok` CLI (Grok Build) reads its whole config tree from `GROK_HOME`. An env-only setup (`GROK_MODELS_BASE_URL` + `XAI_API_KEY`) does not work against a local server: grok checks the key with xAI and treats a placeholder as signed out. The key goes on each model instead, and the helper models (session titles, image descriptions, suggestions) are pinned to the same model; otherwise they ask for an xAI model id.
+
+```bash
+mkdir -p ~/.mlx-serve/grok
+cat > ~/.mlx-serve/grok/config.toml <<'EOF'
+[models]
+default = "MODEL_ID"
+session_summary = "MODEL_ID"
+image_description = "MODEL_ID"
+prompt_suggestion = "MODEL_ID"
+
+[model."MODEL_ID"]
+model = "MODEL_ID"
+base_url = "http://127.0.0.1:11234/v1"
+name = "MODEL_ID (mlx-serve)"
+api_key = "mlx-serve"
+context_window = CTX
+max_completion_tokens = 8192
+supports_reasoning_effort = true
+reasoning_efforts = ["none", "low", "medium", "high"]
+inference_idle_timeout_secs = 1800
+EOF
+export GROK_HOME="$HOME/.mlx-serve/grok"
+grok
+```
+
+### fx
+
+fx reads custom providers only from `~/.fx/settings.json`. Add this entry to its `providers` object (keep the rest of the file):
+
+```json
+"mlx-serve": {
+  "protocol": "openai-chat-completions",
+  "base_url": "http://127.0.0.1:11234/v1",
+  "auth": { "type": "none" },
+  "model_metadata": {
+    "MODEL_ID": { "context_window": CTX, "max_output_tokens": 8192, "supports_tool_use": true }
+  }
+}
+```
+
+Then select it per run, so your default provider stays as it is:
+
+```bash
+FX_PROVIDER=mlx-serve FX_MODEL=MODEL_ID fx
+```
+
+## Editors and apps
+
+### Zed
+
+Settings > open `settings.json`, add the provider. `max_tokens` is the context window; put the placeholder key in the provider settings UI when Zed asks (Zed refuses keys in settings.json).
+
+```json
+{
+  "language_models": {
+    "openai_compatible": {
+      "mlx-serve": {
+        "api_url": "http://127.0.0.1:11234/v1",
+        "available_models": [
+          {
+            "name": "MODEL_ID",
+            "display_name": "MODEL_ID (mlx-serve)",
+            "max_tokens": CTX,
+            "max_output_tokens": 8192
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+### OpenClaw
+
+Add the provider to `~/.openclaw/openclaw.json` and pick the model:
+
+```json5
+{
+  models: {
+    providers: {
+      mlx: {
+        baseUrl: "http://127.0.0.1:11234/v1",
+        apiKey: "mlx-serve",
+        api: "openai-completions",
+        models: [
+          {
+            id: "MODEL_ID",
+            name: "MODEL_ID (mlx-serve)",
+            reasoning: true,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: CTX,
+            maxTokens: 8192,
+          },
+        ],
+      },
+    },
+  },
+}
+```
+
+Then `openclaw agent --model mlx/MODEL_ID`, or set it as `model.primary` in the agent defaults.
+
+### Anything else OpenAI-compatible
+
+Continue, Cline, Goose and most other tools have an "OpenAI-compatible" provider option. Point it at `http://127.0.0.1:11234/v1`, use any API key, and pick a model id from `/v1/models`. If the tool asks for a context window, use the model's `meta.context_length`.
+
+## Sandboxed agents
+
+The MLX-Serve app can also run pi and hermes inside a Linux VM (Agent Sandbox) with the config injected for you. See [docs/app.md](app.md).

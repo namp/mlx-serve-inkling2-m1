@@ -1,0 +1,298 @@
+import XCTest
+@testable import MLXCore
+
+/// The app keeps its own copy of the server's media-architecture table, and
+/// that copy drifted: `minimax_music3`, `kokoro` and bare `mageflow` were
+/// missing, so a MiniMax Music 3 checkpoint on disk was labelled a red
+/// "Unsupported" on the same screen that offers to download it (#228).
+///
+/// The server classifies media packs from its media plugins alone. Nothing
+/// pinned Swift, which is why the drift went unnoticed — so the guard reads
+/// the types the media plugins declare.
+final class MediaModalityParityTests: XCTestCase {
+
+    private var repoRoot: URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()  // MLXCoreTests
+            .deletingLastPathComponent()  // Tests
+            .deletingLastPathComponent()  // app
+            .deletingLastPathComponent()  // repo root
+    }
+
+    /// Every `model_types` entry of a media plugin (a `src/plugins/*/config.zig` declaring `.kind = .media`):
+    /// the server's source of truth.
+    private func zigMediaModelTypes() throws -> Set<String> {
+        let plugins = repoRoot.appendingPathComponent("src/plugins")
+        var types: Set<String> = []
+        for name in try FileManager.default.contentsOfDirectory(atPath: plugins.path) where !name.hasPrefix("_") {
+            let config = plugins.appendingPathComponent(name).appendingPathComponent("config.zig")
+            guard let text = try? String(contentsOf: config, encoding: .utf8),
+                  text.contains(".kind = .media"),
+                  let start = text.range(of: "pub const model_types = [_][]const u8{"),
+                  let end = text.range(of: "};", range: start.upperBound..<text.endIndex) else { continue }
+            types.formUnion(text[start.upperBound..<end.lowerBound]
+                .split(whereSeparator: { $0 == "," || $0 == "\n" })
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { $0.hasPrefix("\"") }
+                .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "\"")) })
+        }
+        return types
+    }
+
+    func testEveryMediaArchitectureTheServerKnowsIsKnownToTheApp() throws {
+        let zig = try zigMediaModelTypes()
+        XCTAssertGreaterThanOrEqual(zig.count, 11, "parsed too few types — did the media plugins move?")
+        for type in zig {
+            // Prefix entries in Zig ("flux2", "krea", "mage_flow", "hunyuan3d")
+            // are matched by prefix on both sides, so the bare stem must pass.
+            XCTAssertTrue(isMediaModelType(type),
+                          "\(type) is a media architecture on the server but reads as unsupported in the app")
+        }
+    }
+
+    func testTheThreeThatDriftedAreCoveredByName() {
+        // Named individually so a future prefix-vs-exact refactor cannot make
+        // the loop above pass while these regress.
+        XCTAssertTrue(isMediaModelType("minimax_music3"))
+        XCTAssertTrue(isMediaModelType("kokoro"))
+        XCTAssertTrue(isMediaModelType("mageflow"))
+        XCTAssertTrue(isMediaModelType("mage_flow_turbo"))
+    }
+
+    func testMiniMaxH3ImageIsAnImagePackNotAVideoOne() {
+        // The image pack shares H3's DiT and its file names, never its pane.
+        XCTAssertEqual(MediaModality(modelType: "minimax_h3_image"), .image)
+        XCTAssertEqual(MediaModality(modelType: "minimax_h3"), .video)
+        XCTAssertEqual(DownloadManager.requiredMediaMarker(modelType: "minimax_h3_image"), "transformer.safetensors")
+    }
+
+    func testChatArchitecturesStillDoNotReadAsMedia() {
+        for t in ["qwen3", "llama", "gemma3", "bailing_hybrid", "bert", "minimax_text"] {
+            XCTAssertFalse(isMediaModelType(t), "\(t) must not read as media")
+        }
+    }
+
+    func testAMediaModelIsStillNeverChatPickable() {
+        // Widening the media list also widens the chat-picker EXCLUSION
+        // (`isChatPickable` reads it), which is the direction we want: today
+        // minimax_music3 is excluded only by accident, because it fails the
+        // architecture gate entirely. It must stay excluded for the right
+        // reason — `useModelAndAwaitReady` would push a diffusion checkpoint
+        // through the text loader.
+        for t in ["minimax_music3", "kokoro", "acestep", "flux2-klein-4b", "qwen3_tts"] {
+            let m = LocalModel(id: "test:\(t)", name: t, path: "/tmp/\(t)",
+                               sizeFormatted: "1 GB", modelType: t, source: .mlxServe, kind: .base)
+            XCTAssertFalse(m.isChatPickable, "\(t) must not be chat-pickable")
+        }
+    }
+}
+
+/// Which create pane a media checkpoint belongs to. Mirrors Zig's
+/// `gen.modalityFromType`, which the app had no equivalent of — the browser
+/// could tell that a model was media, but not what KIND, so it could not offer
+/// to open it anywhere.
+final class MediaModalityRoutingTests: XCTestCase {
+
+    func testEveryMediaArchitectureRoutesToItsPane() {
+        let cases: [(String, MediaModality)] = [
+            ("flux2-klein-4b", .image), ("krea2_turbo", .image),
+            ("mage_flow", .image), ("mageflow", .image),
+            ("qwen3_tts", .voice), ("kokoro", .voice), ("dense", .voice),
+            ("acestep", .music), ("minimax_music3", .music),
+            ("AudioVideo", .video), ("minimax_h3", .video),
+            ("hunyuan3d_2_1", .mesh), ("hunyuan3d_2_1_paint", .mesh),
+        ]
+        for (type, want) in cases {
+            XCTAssertEqual(MediaModality(modelType: type), want, "\(type)")
+        }
+    }
+
+    func testANonMediaArchitectureHasNoModality() {
+        for t in ["qwen3", "llama", "bert", ""] {
+            XCTAssertNil(MediaModality(modelType: t), "\(t)")
+        }
+    }
+
+    func testMusicAndVoiceSplitEvenThoughTheServerCallsThemBothAudio() {
+        // Zig's modalityFromType collapses these to `.audio` because they share
+        // one engine slot. The APP has to tell them apart: they are two tabs of
+        // one pane, so a Use button that only knew "audio" would drop a music
+        // model on the Voice tab.
+        XCTAssertEqual(MediaModality(modelType: "acestep")?.experiment, .audio)
+        XCTAssertEqual(MediaModality(modelType: "qwen3_tts")?.experiment, .audio)
+        XCTAssertEqual(MediaModality(modelType: "acestep")?.audioTab, .music)
+        XCTAssertEqual(MediaModality(modelType: "qwen3_tts")?.audioTab, .voice)
+        // Non-audio modalities have no tab to pick.
+        XCTAssertNil(MediaModality(modelType: "flux2-klein-4b")?.audioTab)
+        XCTAssertEqual(MediaModality(modelType: "minimax_h3")?.experiment, .video)
+        XCTAssertEqual(MediaModality(modelType: "hunyuan3d_2_1")?.experiment, .model3d)
+    }
+
+    func testATrellis2PackIsRecognizedFromPipelineJsonAndRoutesToThe3DPane() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("trellis2-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try #"{"name":"Trellis2ImageTo3DPipeline"}"#
+            .write(to: dir.appendingPathComponent("pipeline.json"), atomically: true, encoding: .utf8)
+        XCTAssertEqual(DownloadManager.markerModelType(inDir: dir.path), "trellis2")
+        XCTAssertTrue(DownloadManager.holdsWeightLayout(dir.path))
+        XCTAssertTrue(isMediaModelType("trellis2"))
+        XCTAssertEqual(MediaModality(modelType: "trellis2"), .mesh)
+        // The structure decoder is the completion marker, as on the server.
+        XCTAssertFalse(DownloadManager.holdsCompleteMediaPack(dir.path))
+        let ckpts = dir.appendingPathComponent("microsoft/TRELLIS-image-large/ckpts")
+        try FileManager.default.createDirectory(at: ckpts, withIntermediateDirectories: true)
+        try Data().write(to: ckpts.appendingPathComponent("ss_dec_conv3d_16l8_fp16.safetensors"))
+        XCTAssertTrue(DownloadManager.holdsCompleteMediaPack(dir.path))
+        // Another pipeline.json is not ours.
+        try #"{"name":"SomethingElse"}"#
+            .write(to: dir.appendingPathComponent("pipeline.json"), atomically: true, encoding: .utf8)
+        XCTAssertNil(DownloadManager.markerModelType(inDir: dir.path))
+    }
+
+    func testEveryModalityNamesThePaneItOpens() {
+        for m in MediaModality.allCases {
+            XCTAssertFalse(m.paneName.isEmpty, "\(m) has no pane name for the Use button")
+        }
+    }
+}
+
+/// The media Use button must never reach the chat load path.
+final class MediaUseButtonSourceTests: XCTestCase {
+
+    func testTheMediaUseButtonNeverStartsTheServerOnTheModel() throws {
+        // `useModelAndAwaitReady` → `server.start(modelPath:)` loads a path as
+        // the server's PRIMARY CHAT model. Pointing that at a diffusion
+        // checkpoint runs it through the text loader — the exact failure
+        // `isChatPickable` exists to prevent, and the tempting one-line "fix"
+        // for this issue. The media button opens a pane instead; the pane
+        // loads the model the way it always has.
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let text = try String(
+            contentsOf: root.appendingPathComponent("app/Sources/MLXServe/Views/ModelBrowserView.swift"),
+            encoding: .utf8)
+        guard let start = text.range(of: "private struct UseMediaModelButton"),
+              let end = text.range(of: "\n}", range: start.upperBound..<text.endIndex) else {
+            XCTFail("UseMediaModelButton not found — did it move?")
+            return
+        }
+        let body = String(text[start.lowerBound..<end.upperBound])
+        XCTAssertFalse(body.contains("useModelAndAwaitReady"),
+                       "the media Use button must not load the model as the chat model")
+        XCTAssertFalse(body.contains("server.start"),
+                       "the media Use button must not start the server on the model path")
+        XCTAssertTrue(body.contains("showCreate"),
+                      "the media Use button should route through AppState.showCreate")
+    }
+}
+
+/// `pickableModel` and `mediaModel` are the two halves of the catalogue, and
+/// every on-disk row asks both. Before this, only My Models was fixed and
+/// Discover / Recommended still ended at Delete.
+final class MediaModelResolutionTests: XCTestCase {
+
+    private func local(_ type: String, path: String) -> LocalModel {
+        LocalModel(id: "test:\(type)", name: type, path: path, sizeFormatted: "1 GB",
+                   modelType: type, source: .mlxServe, kind: .base)
+    }
+
+    func testTheTwoHalvesNeverBothAnswer() {
+        // A media checkpoint is never chat-pickable and a chat model has no
+        // modality, so a row asking both gets at most one answer — no ordering
+        // rule needed between them.
+        let models = [local("minimax_music3", path: "/m/music"), local("qwen3", path: "/m/chat")]
+        XCTAssertNil(ModelBrowserUse.pickableModel(atPath: "/m/music", in: models))
+        XCTAssertEqual(ModelBrowserUse.mediaModel(atPath: "/m/music", in: models)?.modality, .music)
+
+        XCTAssertNotNil(ModelBrowserUse.pickableModel(atPath: "/m/chat", in: models))
+        XCTAssertNil(ModelBrowserUse.mediaModel(atPath: "/m/chat", in: models))
+    }
+
+    func testEachMediaKindResolvesToItsOwnPane() {
+        let models = [local("flux2-klein-4b", path: "/m/img"), local("AudioVideo", path: "/m/vid"),
+                      local("qwen3_tts", path: "/m/voice"), local("acestep", path: "/m/music"),
+                      local("hunyuan3d_2_1", path: "/m/mesh")]
+        XCTAssertEqual(ModelBrowserUse.mediaModel(atPath: "/m/img", in: models)?.modality, .image)
+        XCTAssertEqual(ModelBrowserUse.mediaModel(atPath: "/m/vid", in: models)?.modality, .video)
+        XCTAssertEqual(ModelBrowserUse.mediaModel(atPath: "/m/voice", in: models)?.modality, .voice)
+        XCTAssertEqual(ModelBrowserUse.mediaModel(atPath: "/m/music", in: models)?.modality, .music)
+        XCTAssertEqual(ModelBrowserUse.mediaModel(atPath: "/m/mesh", in: models)?.modality, .mesh)
+    }
+
+    func testTheServersRowDecidesThePaneOfAPackItLists() {
+        // An outside plugin's pack: the app's own map has never heard of its type; the server's row names its pane.
+        let models = [local("toy_sound", path: "/m/t/snd"), local("acestep", path: "/m/t/music")]
+        XCTAssertNil(ModelBrowserUse.mediaModel(atPath: "/m/t/snd", in: models))
+        let rows = [APIClient.parseModelInfo(["id": "t/snd", "modality": "sound"]),
+                    APIClient.parseModelInfo(["id": "t/music", "modality": "music"])]
+        XCTAssertEqual(ModelBrowserUse.mediaModel(atPath: "/m/t/snd", in: models, rows: rows)?.modality, .sound)
+        XCTAssertEqual(ModelBrowserUse.mediaModel(atPath: "/m/t/music", in: models, rows: rows)?.modality, .music)
+        XCTAssertEqual(MediaModality(served: "3d"), .mesh)
+        XCTAssertEqual(MediaModality(served: "speech"), .voice)
+        XCTAssertNil(MediaModality(served: "decisions"))
+    }
+
+    func testADecisionCheckpointResolvesToItsOwnUse() {
+        // Decisions are the third half of the catalogue: My Models offers a Use for them,
+        // so a Discover row on the same checkpoint must resolve it too.
+        let models = [local("laya", path: "/m/laya"), local("qwen3", path: "/m/chat"), local("acestep", path: "/m/music")]
+        XCTAssertEqual(ModelBrowserUse.decisionModel(atPath: "/m/laya", in: models)?.path, "/m/laya")
+        XCTAssertNil(ModelBrowserUse.decisionModel(atPath: "/m/chat", in: models))
+        XCTAssertNil(ModelBrowserUse.decisionModel(atPath: "/m/music", in: models))
+        XCTAssertNil(ModelBrowserUse.decisionModel(atPath: nil, in: models))
+    }
+
+    func testPathMatchingIsAsForgivingAsTheChatHalf() {
+        // Same normalization, or the two halves would disagree about which row
+        // a path belongs to.
+        let models = [local("acestep", path: "/m/music")]
+        XCTAssertNotNil(ModelBrowserUse.mediaModel(atPath: "/m/music/", in: models))
+        XCTAssertNotNil(ModelBrowserUse.mediaModel(atPath: "/m/./music", in: models))
+        XCTAssertNil(ModelBrowserUse.mediaModel(atPath: "", in: models))
+        XCTAssertNil(ModelBrowserUse.mediaModel(atPath: nil, in: models))
+    }
+
+    func testEveryOnDiskRowOffersAUse() throws {
+        // Source audit: all three on-disk arms (Recommended, Discover, My
+        // Models) must consult the media half, not just the chat one. The Media
+        // pane passes its modality directly, so it is exempt.
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let text = try String(
+            contentsOf: root.appendingPathComponent("app/Sources/MLXServe/Views/ModelBrowserView.swift"),
+            encoding: .utf8)
+        let uses = text.components(separatedBy: "UseMediaModelButton(").count - 1
+        XCTAssertGreaterThanOrEqual(uses, 4,
+            "expected the media Use button in Recommended, Discover, My Models and the Media pane")
+    }
+
+    /// `dense` is generic: the app keys Ming on the server's markers, and on the Hub on Ming's architecture.
+    func testADenseConfigIsAVoicePackOnlyWithTheServersMarkers() throws {
+        let dir = NSTemporaryDirectory() + "dense-\(UUID().uuidString)"
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        let cfg = (dir as NSString).appendingPathComponent("config.json")
+        try #"{"model_type":"dense","ditar_config":{},"aggregator_config":{}}"#.write(toFile: cfg, atomically: true, encoding: .utf8)
+        XCTAssertFalse(DownloadManager.parseConfigMetadata(atPath: cfg).lacksMediaMarkers)
+        try #"{"model_type":"dense","hidden_size":896}"#.write(toFile: cfg, atomically: true, encoding: .utf8)
+        XCTAssertTrue(DownloadManager.parseConfigMetadata(atPath: cfg).lacksMediaMarkers)
+
+        let ming = local("dense", path: "/m/ming")
+        XCTAssertTrue(ming.isSupportedArchitecture)
+        XCTAssertEqual(MediaModality.of(modelType: ming.mediaModelType, path: ming.path, rows: []), .voice)
+        var other = local("dense", path: "/m/other")
+        other.lacksMediaMarkers = true
+        XCTAssertFalse(other.isSupportedArchitecture)
+        XCTAssertNil(MediaModality.of(modelType: other.mediaModelType, path: other.path, rows: []))
+
+        var row = HFModel(id: "me/dense", downloads: 1, likes: 0, lastModified: nil,
+                          tags: ["dense"], safetensors: nil, pipelineTag: nil)
+        row.config = HFConfigMeta(modelType: "dense", architectures: ["SomeForCausalLM"])
+        XCTAssertFalse(row.isServedMediaRepo)
+        row.config = HFConfigMeta(modelType: "dense", architectures: ["BailingMMNativeForConditionalGeneration"])
+        XCTAssertTrue(row.isServedMediaRepo)
+    }
+}

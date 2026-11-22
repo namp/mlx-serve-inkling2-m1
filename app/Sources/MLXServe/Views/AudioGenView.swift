@@ -1,0 +1,696 @@
+import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
+
+/// Audio generation window — three tabs over one window: **Voice** (neural TTS
+/// with zero-shot voice cloning, Qwen3-TTS), **Music** (prompt-driven music
+/// generation, ACE-Step) and **Sound Effects** (text-to-audio, Stable Audio 3).
+/// Each tab is its own self-contained pane; this container only hosts the
+/// segmented switcher.
+struct AudioGenView: View {
+    enum Tab: String, CaseIterable {
+        case voice = "Voice"
+        case music = "Music"
+        case sound = "Sound Effects"
+    }
+
+    /// The left menu's "Audio & Music" row must reopen on the tab you left it
+    /// on. `ChatView.createPane` UNMOUNTS this view on navigation, so plain
+    /// `@State` reset to Voice on every visit, not only across launches.
+    /// The stored raw values are a persistence contract — renaming the display
+    /// text would silently send everyone back to Voice.
+    @AppStorage("audioGenTab") private var tab: Tab = .voice
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Picker("", selection: $tab) {
+                ForEach(Tab.allCases, id: \.self) { t in
+                    Text(L10n.text(t.rawValue)).tag(t)
+                }
+            }
+            .pickerStyle(.segmented)
+            .controlSize(.large)
+            .labelsHidden()
+            .frame(width: 400)
+            .padding(.top, 10)
+            .padding(.bottom, 14).font(.app(.body))
+
+            switch tab {
+            case .voice: VoiceGenView()
+            case .music: MusicGenView()
+            case .sound: SoundGenView()
+            }
+        }
+    }
+}
+
+/// The style prompt a track was made from, read back out of the `<track>.txt`
+/// sidecar the gen services write beside every WAV.
+///
+/// A history row carries a path and nothing else, so without this a track sent
+/// to chat arrives captioned "Generated audio" — true, and useless in a
+/// transcript you keep. Best-effort by design: an older track, a hand-copied
+/// file or a missing sidecar just falls back to that.
+enum AudioSidecar {
+    static func prompt(forTrack path: String) -> String {
+        let txt = (path as NSString).deletingPathExtension + ".txt"
+        guard let body = try? String(contentsOfFile: txt, encoding: .utf8) else { return "" }
+        guard let range = body.range(of: "# Style prompt\n") else { return "" }
+        let rest = body[range.upperBound...]
+        // The sidecar's sections are separated by a blank line.
+        let end = rest.range(of: "\n\n")?.lowerBound ?? rest.endIndex
+        return String(rest[..<end]).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+/// Vertical list of past generations, shared by the Voice and Music tabs.
+/// Every file the service ever wrote stays listed (newest first, uncapped);
+/// clicking a row plays it through the owning tab's player, replacing
+/// whatever was playing.
+struct AudioHistoryShelf: View {
+    let paths: [String]
+    let playingPath: String?
+    var paused = false
+    let onPlay: (String) -> Void
+    let onStop: () -> Void
+    @AppStorage(InterfacePrefKey.audioPlayerStyle) private var style = AudioPlayerStyle.defaultStyle
+
+    var body: some View {
+        Group {
+            if !paths.isEmpty {
+                Group {
+                    switch style {
+                    case .mlxAmp:
+                        MlxAmpStretched { width, _ in
+                            MlxAmpPlaylist(width: width, height: MlxAmpPlaylist.minHeight, paths: paths, current: playingPath,
+                                           onPlay: onPlay, onStop: onStop)
+                        }
+                        .frame(height: MlxAmpPlaylist.minHeight * MlxAmpStyle.scale)
+                    case .modern:
+                        ModernPlaylist(paths: paths, current: playingPath, paused: paused, onPlay: onPlay, onStop: onStop)
+                            .frame(height: 300)
+                    }
+                }
+                .onAppear { AudioClipPlayer.shared.queue = paths }
+                .onChange(of: paths) { _, p in AudioClipPlayer.shared.queue = p }
+            }
+        }
+    }
+}
+
+/// Which of the Voice pane's inputs the chosen model actually takes.
+enum VoiceGenInputs {
+    /// A model that speaks in its own built-in voices takes no `ref_audio`
+    /// (a named 400 server-side), so the whole section goes away rather than
+    /// asking for a clip nothing would read.
+    static func showsReference(_ model: AudioModelPreset) -> Bool {
+        model.supportsCloning
+    }
+}
+
+/// Voice tab — neural TTS with zero-shot voice cloning, run natively by the
+/// embedded mlx-serve server. Same shell as ImageGen/VideoGen: a model
+/// picker, the text to speak, a reference-voice section (record or pick a file)
+/// with an optional transcript, and a player for the result.
+struct VoiceGenView: View {
+    @EnvironmentObject var service: AudioGenService
+    @EnvironmentObject var server: ServerManager
+    @Environment(\.openWindow) private var openWindow
+    @EnvironmentObject var downloads: DownloadManager
+    @EnvironmentObject var appState: AppState
+
+    @StateObject private var recorder = AudioRecorder()
+
+    @State private var text: String = ""
+    @State private var model: AudioModelPreset = .qwen3TTS06B8bit
+    /// Selected network model's routing id (`<model>@<peer>`); nil = local.
+    @State private var lanModel: String? = nil
+    @State private var refAudioURL: URL? = nil
+    @State private var refText: String = ""
+    @State private var speed: Double = 1.0
+    @State private var temperature: Double = 0.7
+    @State private var showAdvanced: Bool = false
+
+    @State private var refError: String? = nil
+    /// True while a drag carrying a file hovers the reference-voice section —
+    /// drives its dashed-border highlight (see `MediaDropTarget`).
+    @State private var isDropTargeted: Bool = false
+    /// Dictation into the text editor: the voice-mode recognizer emits one
+    /// finalized utterance per silence gap; each is appended via `Dictation`.
+    /// Created lazily on first use — never at launch (audio-graph TCC rule).
+    @State private var dictation: (any SpeechRecognizing)? = nil
+    @State private var dictating: Bool = false
+    @State private var dictationError: String? = nil
+    @State private var showRAMWarning: Bool = false
+    @State private var ramWarningMessage: String = ""
+    @State private var pendingRequest: AudioGenRequest? = nil
+    // The app-wide singleton, not a per-view instance — see the matching note
+    // in MusicGenView: a private player left playing when this view unmounts
+    // on tab navigation is a leaked NSSound nothing can stop.
+    @ObservedObject private var clipPlayer = AudioClipPlayer.shared
+    /// Keep the model resident after generating (default off → unload).
+    @State private var keepResident: Bool = false
+    /// Hydration guard — see ImageGenView for the full rationale.
+    @State private var hydrating: Bool = false
+    @State private var didHydrate: Bool = false
+
+    var body: some View {
+        // No window-sized floor — see ImageGenView: pages shrink their
+        // preview side, they don't overflow the detail column.
+        readyView
+        .onAppear {
+            if !didHydrate {
+                hydrating = true
+                hydrate()
+                didHydrate = true
+                DispatchQueue.main.async { hydrating = false }
+            }
+            // Freshen the network-model list so LAN entries are current in
+            // the picker (discovery lands seconds after the server boots).
+            if server.status == .running { Task { await server.refreshModels() } }
+        }
+        .onDisappear { stopDictation() }
+        .onChange(of: model) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: stickySnapshot) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: service.phase) { _, phase in
+            // A new generation stops whatever is still playing.
+            if case .running = phase { stopPlayback() }
+            if case .completed(let path) = phase { play(path) }
+        }
+    }
+
+    private func play(_ path: String) {
+        clipPlayer.play(path)
+    }
+
+    private func stopPlayback() {
+        clipPlayer.stop()
+    }
+
+    private var readyView: some View {
+        HSplitView {
+            ScrollView {
+                // The model decides what the rest of the pane means — whether
+                // there is a voice to clone at all, and how long a reference
+                // it wants — so it is read before the inputs it governs.
+                VStack(alignment: .leading, spacing: 14) {
+                    modelSection
+                    textSection
+                    if VoiceGenInputs.showsReference(model) { referenceSection }
+                    advancedSection
+                    // Generate stands apart from the settings it acts on.
+                    actionRow.padding(.top, 14)
+                }
+                // Full-width, leading-aligned frame OUTSIDE the padding: a
+                // child that will not compress otherwise makes the stack
+                // oversized, and the ScrollView centres the overflow.
+                .padding(16)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(minWidth: 340, idealWidth: 380)
+
+            VStack(spacing: 12) {
+                previewArea
+                AudioHistoryShelf(
+                    paths: service.recent,
+                    playingPath: clipPlayer.playingPath,
+                    paused: clipPlayer.isPaused,
+                    onPlay: { play($0) },
+                    onStop: { stopPlayback() }
+                )
+                outputFolderLink
+            }
+            .padding(16)
+            // The preview gives way in a small window.
+            .frame(minWidth: 280)
+        }
+        .alert("Model exceeds your Mac's RAM", isPresented: $showRAMWarning) {
+            Button(role: .cancel) { pendingRequest = nil } label: { Text("Cancel")
+                .font(.app(.body)) }
+            Button(role: .destructive) {
+                if let req = pendingRequest { service.generate(req, server: server) }
+                pendingRequest = nil
+            } label: { Text("Generate Anyway")
+                .font(.app(.body)) }
+        } message: {
+            Text(L10n.text(ramWarningMessage)).font(.app(.body))
+        }
+    }
+
+    // MARK: - Sections
+
+    private var textSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Text to be generated").font(.app(.headline).weight(.semibold))
+                Spacer()
+                dictationButton
+            }
+            TextEditor(text: $text)
+                .font(.app(.body))
+                .frame(height: 120)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5)
+                )
+            if let err = dictationError {
+                Text(err).font(.app(.caption2)).foregroundStyle(.orange)
+            }
+        }
+    }
+
+    // MARK: - Dictation
+
+    /// Start, state and stop in ONE control: a running mic is the loudest thing
+    /// in the pane, and the way to end it is the thing you are already looking
+    /// at. The partial transcript is not shown — every finished utterance lands
+    /// in the editor below, which is where you would read it anyway.
+    private var dictationButton: some View {
+        Button { toggleDictation() } label: {
+            HStack(spacing: 5) {
+                Image(systemName: dictating ? "microphone.fill" : "microphone")
+                Text(L10n.text(dictating ? "Listening…" : "Speak it"))
+                if dictating { Image(systemName: "stop.fill") }
+            }
+            .font(.app(.caption))
+            .foregroundStyle(dictating ? AnyShapeStyle(Color.white) : AnyShapeStyle(.primary))
+            .padding(.horizontal, 9)
+            .padding(.vertical, 4)
+            .background(
+                // The pane's other buttons are bordered controls, so this one
+                // takes their corner, not a pill's.
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(dictating
+                          ? AnyShapeStyle(Color.orange)
+                          : AnyShapeStyle(Color.primary.opacity(0.08)))
+            )
+        }
+        .buttonStyle(.plain)
+        .help(L10n.text(dictating ? "Stop dictation" : "Dictate the text instead of typing it"))
+    }
+
+    private func toggleDictation() {
+        dictating ? stopDictation() : startDictation()
+    }
+
+    private func startDictation() {
+        dictationError = nil
+        Task {
+            let rec = dictation ?? makeSpeechRecognizer()
+            dictation = rec
+            let ready = await rec.preflight()
+            if let issue = VoicePreflight.firstIssue(ready) {
+                dictationError = VoicePreflight.detail(for: issue)
+                return
+            }
+            rec.onFinalTranscript = { text = Dictation.appending($0, to: text) }
+            rec.onError = { msg in
+                dictationError = msg
+                stopDictation()
+            }
+            do {
+                try rec.start()
+                dictating = true
+            } catch {
+                dictationError = error.localizedDescription
+            }
+        }
+    }
+
+    private func stopDictation() {
+        dictation?.stop()
+        dictating = false
+    }
+
+    /// Best-per-capability up front, everything else behind "Other Models", and
+    /// the Download button ON the model — see `MediaModelChooser`. The transfer
+    /// bar and residency both belong to the model, not to the output, so they
+    /// sit with it rather than beside Generate.
+    private var modelSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            modelChooser
+            if lanModel == nil && !downloads.bundleReady(model.bundle) {
+                BundleDownloadBar(bundle: model.bundle, showsStartButton: false)
+            }
+        }
+    }
+
+    /// Residency rides the switcher's row: it is a property of the model, and
+    /// the only thing about it the pane still has to say once it is picked.
+    private var keepResidentToggle: AnyView {
+        AnyView(
+            Toggle(isOn: $keepResident) {
+                Text("Keep model loaded after generating")
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+                .font(.app(.caption))
+                .controlSize(.small)
+                .help("On: the model stays resident so the next generation is instant. Off (default): it's unloaded to free GPU memory.")
+        )
+    }
+
+    private var modelChooser: some View {
+        MediaModelChooser.pane(
+            all: AudioModelPreset.all,
+            onThisMac: CustomMediaModels.audioPresets(from: server.allModels),
+            // "speech", not "audio": see ModelInfo.lanAdvertises — a peer's
+            // music model advertises "audio" too.
+            capability: "speech",
+            selected: $model, lanModel: $lanModel,
+            capabilityOf: { $0.capabilityLabel },
+            resolveCustom: { [models = server.allModels] in
+                CustomMediaModels.audioPreset(for: $0, from: models)
+            },
+            bundleOf: { $0.bundle },
+            downloads: downloads,
+            onDownloadFinished: { appState.refreshModels() },
+            persist: persist,
+            accessory: keepResidentToggle)
+        .onChange(of: model) { _, _ in guard !hydrating else { return }; persist() }
+    }
+
+    private var referenceSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Reference voice").font(.app(.headline).weight(.semibold))
+
+            if let url = refAudioURL {
+                MediaDropWellFilled(isTargeted: isDropTargeted) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 8) {
+                            Image(systemName: "waveform.circle.fill").foregroundStyle(.blue)
+                            Text(url.lastPathComponent)
+                                .font(.app(.caption)).lineLimit(1).truncationMode(.middle)
+                            Spacer()
+                            if clipPlayer.playingPath == url.path {
+                                Button { clipPlayer.stop() } label: { Image(systemName: "stop.circle.fill") }
+                                    .buttonStyle(.borderless).help("Stop preview")
+                            } else {
+                                Button { playReference(url) } label: { Image(systemName: "play.circle") }
+                                    .buttonStyle(.borderless).help("Preview reference")
+                            }
+                            Button { clearReference() } label: { Image(systemName: "xmark.circle.fill") }
+                                .buttonStyle(.borderless).foregroundStyle(.secondary).help("Clear reference")
+                        }
+                        // In the well with the clip it describes, not under it.
+                        Text("Transcript of reference (optional)").font(.app(.rowTitle))
+                            .padding(.top, 6)
+                        TextField("", text: $refText,
+                                  prompt: Text("Optional — the reference audio alone clones the voice"))
+                            .textFieldStyle(.roundedBorder)
+                            .font(.app(.caption))
+                    }
+                }
+            } else if recorder.isRecording {
+                MediaDropWellFilled(isTargeted: isDropTargeted) {
+                    HStack(spacing: 10) {
+                        Image(systemName: "microphone.fill")
+                            .font(.app(.caption))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(Capsule().fill(Color.orange))
+                        ProgressView(value: Double(recorder.level)).frame(width: 120)
+                        Text(String(format: "%.1fs", recorder.duration))
+                            .font(.app(.caption).monospacedDigit()).foregroundStyle(.secondary)
+                        Spacer()
+                        Button { stopRecording() } label: {
+                            Label("Stop", systemImage: "stop.fill").font(.app(.body))
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
+            } else {
+                // Two ways in, one clip slot — the same well the picture panes
+                // use, split down the middle.
+                MediaDropWellPair(
+                    isTargeted: isDropTargeted,
+                    leading: MediaDropWellOption(
+                        title: "Choose audio file…",
+                        systemImage: "waveform.badge.plus",
+                        caption: "or drag one here",
+                        action: chooseReferenceFile),
+                    trailing: MediaDropWellOption(
+                        title: "Record audio…",
+                        systemImage: "microphone.badge.plus",
+                        caption: L10n.format("~%llds recommended", Int64(model.recommendedRefSeconds)),
+                        action: startRecording))
+            }
+
+            if refAudioURL == nil {
+                // The well already says how to add a clip and how long it wants
+                // one; what is left to say is what happens without it.
+                Text("Without a reference, the model's default voice is used.")
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
+            }
+
+            if let err = refError {
+                Text(err).font(.app(.caption2)).foregroundStyle(.orange)
+            }
+        }
+        // One clip slot, so a drop replaces what's there. Routed through
+        // `acceptReference` so a dropped file is transcoded exactly like a
+        // picked one — see `MediaDropTarget`.
+        .mediaDrop(.audio, isTargeted: $isDropTargeted) { urls in
+            if let url = urls.first { acceptReference(url) }
+        }
+    }
+
+    private var advancedSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            FoldingSectionHeader(title: "Advanced options", isExpanded: $showAdvanced)
+            if showAdvanced {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Speed (\(String(format: "%.2fx", speed)))").font(.app(.caption))
+                    Slider(value: $speed, in: 0.5...2.0, step: 0.05)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Temperature (\(String(format: "%.2f", temperature)))").font(.app(.caption))
+                    Slider(value: $temperature, in: 0.1...1.5, step: 0.05)
+                    Text("Higher = more expressive and varied.").font(.app(.caption2)).foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private var actionRow: some View {
+        HStack {
+            if service.isRunning {
+                Button(role: .destructive) { service.cancel() } label: {
+                    Label("Cancel", systemImage: "stop.fill").font(.app(.body)).frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+            } else {
+                Button { tryGenerate() } label: {
+                    Label("Generate", systemImage: "waveform").font(.app(.body)).frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.return, modifiers: [.command])
+                .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (lanModel == nil && !downloads.bundleReady(model.bundle)))
+            }
+        }
+    }
+
+    private var previewArea: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 8).fill(Color.black.opacity(0.15))
+            Group {
+                switch service.phase {
+                case .idle:
+                    ContentUnavailableView("No audio yet", systemImage: "waveform",
+                                           description: Text("Enter text, add a reference voice, and press Generate.").font(.app(.body)))
+                case .running(let step, let total, let message):
+                    VStack(spacing: 12) {
+                        LoadingModelsRow()
+                        // Audio length is unknown until the model stops (total==0)
+                        // → indeterminate bar; encode/decode stages are determinate.
+                        if total == 0 {
+                            ProgressView().frame(width: 240)
+                        } else {
+                            ProgressView(value: Double(step), total: max(1, Double(total)))
+                                .progressViewStyle(.linear).frame(width: 240)
+                        }
+                        Text(message).font(.app(.footnote)).foregroundStyle(.secondary)
+                    }
+                case .completed(let path):
+                    completedPreview(path: path)
+                case .failed(let msg):
+                    ContentUnavailableView {
+                        Label("Failed", systemImage: "exclamationmark.triangle").font(.app(.body))
+                    } description: {
+                        Text(msg)
+                    } actions: {
+                        Button { showLogWindow() } label: { Text("Show log")
+                            .font(.app(.body)) }
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func completedPreview(path: String) -> some View {
+        // One control, two states: pausing left the shelf lit under a clip
+        // that had stopped making sound, so there is no pause any more.
+        let playing = clipPlayer.playingPath == path
+        return VStack(spacing: 12) {
+            Image(systemName: "waveform.circle.fill")
+                .font(.system(size: 64)).foregroundStyle(.tint)
+                .symbolEffect(.variableColor.iterative.dimInactiveLayers.reversing,
+                              options: .repeat(.continuous), isActive: playing)
+            Button {
+                playing ? clipPlayer.stop() : clipPlayer.play(path)
+            } label: {
+                Label(playing ? "Stop" : "Play", systemImage: playing ? "stop.fill" : "play.fill").font(.app(.body))
+            }
+            .buttonStyle(.bordered)
+            // The name and the way to reach the file belong together, centred
+            // under the clip they describe.
+            HStack(spacing: 8) {
+                Text(URL(fileURLWithPath: path).lastPathComponent)
+                    .font(.app(.caption)).foregroundStyle(.secondary)
+                    .lineLimit(1).truncationMode(.middle)
+                Button {
+                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+                } label: { Image(systemName: "folder") }
+                .buttonStyle(.borderless).help("Reveal in Finder")
+            }
+        }
+        .padding(16)
+    }
+
+    private var outputFolderLink: some View {
+        Button {
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: MediaStorage.audiosRoot)])
+        } label: {
+            Label("Open output folder in Finder", systemImage: "folder").font(.app(.caption))
+        }
+        .buttonStyle(.borderless)
+        .foregroundStyle(.secondary)
+        .help(MediaStorage.audiosRoot)
+    }
+
+    // MARK: - Reference actions
+
+    private func chooseReferenceFile() {
+        refError = nil
+        let panel = OpenPanel.make()
+        panel.allowedContentTypes = [.audio, .wav, .mp3, .mpeg4Audio, .aiff]
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        guard AppActivation.runModal(panel) == .OK, let url = panel.url else { return }
+        acceptReference(url)
+    }
+
+    /// The one way a FILE becomes the reference clip, whether it was picked or
+    /// dropped: a dropped file gets the same 24 kHz mono transcode, and a
+    /// transcode failure the same visible reason rather than a file that
+    /// silently doesn't attach.
+    private func acceptReference(_ url: URL) {
+        refError = nil
+        do {
+            refAudioURL = try AudioReference.normalizedReferenceWav(fromFile: url)
+        } catch {
+            refError = error.localizedDescription
+        }
+    }
+
+    private func startRecording() {
+        refError = nil
+        stopDictation() // one mic user at a time
+        Task {
+            guard await AudioRecorder.requestPermission() else {
+                refError = "Microphone access denied. Enable it in System Settings ▸ Privacy ▸ Microphone."
+                return
+            }
+            do { try recorder.start() }
+            catch { refError = error.localizedDescription }
+        }
+    }
+
+    private func stopRecording() {
+        guard let data = recorder.stop() else {
+            refError = "Nothing was recorded."
+            return
+        }
+        do {
+            refAudioURL = try AudioReference.normalizedReferenceWav(fromRecordedPCM: data)
+        } catch {
+            refError = error.localizedDescription
+        }
+    }
+
+    private func clearReference() {
+        if let url = refAudioURL { try? FileManager.default.removeItem(at: url) }
+        refAudioURL = nil
+        refText = ""
+    }
+
+    private func playReference(_ url: URL) {
+        clipPlayer.play(url.path)
+    }
+
+    // MARK: - Sticky settings
+
+    private func hydrate() {
+        let s = AudioGenSettings.load()
+        model = s.resolvedModel(models: server.allModels)
+        lanModel = LanPick.lanId(s.modelId)
+        speed = s.speed
+        temperature = s.temperature
+        keepResident = s.keepResident
+        text = s.text
+        refText = s.refText
+        // The clip is a temp transcode; only restore it while it still exists.
+        refAudioURL = s.refAudioPath.flatMap { FileManager.default.fileExists(atPath: $0) ? URL(fileURLWithPath: $0) : nil }
+    }
+
+    /// Every sticky field (knobs AND the typed draft) as one `Equatable`
+    /// blob, so a single `onChange` persists all of it.
+    private var stickySnapshot: AudioGenSettings {
+        var s = AudioGenSettings()
+        s.modelId = LanPick.persisted(lanModel: lanModel, presetId: model.id)
+        s.speed = speed
+        s.temperature = temperature
+        s.keepResident = keepResident
+        s.text = text
+        s.refText = refText
+        s.refAudioPath = refAudioURL?.path
+        return s
+    }
+
+    private func persist() { stickySnapshot.save() }
+
+    // MARK: - Generate
+
+    private func tryGenerate() {
+        stopDictation() // the open mic would pick up the played result
+        // A clip the pane is no longer showing must not still shape the
+        // request: the same predicate decides both.
+        let clones = VoiceGenInputs.showsReference(model)
+        let req = AudioGenRequest(
+            model: model,
+            text: text,
+            refAudioPath: clones ? refAudioURL?.path : nil,
+            refText: clones ? refText : "",
+            speed: speed,
+            temperature: temperature,
+            keepResident: keepResident,
+            lanModelId: lanModel
+        )
+        persist()
+        let total = RAMChecker.totalGB
+        let needed = model.approxRAMGB
+        if total < needed {
+            ramWarningMessage = "This model needs about \(needed) GB of RAM, but your Mac has \(total) GB total. It may run very slowly or fail. Continue?"
+            pendingRequest = req
+            showRAMWarning = true
+            return
+        }
+        service.generate(req, server: server)
+    }
+
+    private func showLogWindow() {
+        AppActivation.openWindow(id: "serverLog", using: openWindow)
+    }
+}
