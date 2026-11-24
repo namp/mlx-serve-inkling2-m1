@@ -47,7 +47,11 @@ HEAD_PREFIXES = ("lm_head", "model.language_model.embed_tokens")
 def target_bits(prefix: str, attn_bits: int, head_bits: int) -> int | None:
     if prefix in HEAD_PREFIXES:
         return head_bits
-    if ".self_attn." in prefix and prefix.rsplit(".", 1)[-1] in ATTN_PROJS:
+    if (
+        prefix.startswith("model.language_model.")
+        and ".self_attn." in prefix
+        and prefix.rsplit(".", 1)[-1] in ATTN_PROJS
+    ):
         return attn_bits
     return None
 
@@ -78,6 +82,7 @@ def main() -> None:
     ap.add_argument("--src", required=True, help="Source Inkling-2-Mini MLX directory")
     ap.add_argument("--dst", required=True, help="Destination directory (created if missing)")
     ap.add_argument("--mtp", default=None, help="Optional path to mtp.safetensors to hardlink/copy")
+    ap.add_argument("--vision", default=None, help="Optional path to model-vision.safetensors to hardlink/copy")
     ap.add_argument("--attn-bits", type=int, default=4, choices=(4, 6, 8))
     ap.add_argument("--head-bits", type=int, default=6, choices=(4, 6, 8))
     ap.add_argument("--group-size", type=int, default=64)
@@ -188,6 +193,8 @@ def main() -> None:
     for fname in (
         "chat_template.jinja",
         "generation_config.json",
+        "preprocessor_config.json",
+        "processor_config.json",
         "special_tokens_map.json",
         "tokenizer_config.json",
         "tokenizer.json",
@@ -196,16 +203,22 @@ def main() -> None:
         if p.exists():
             shutil.copy2(p, dst / fname)
 
-    mtp_src = Path(args.mtp) if args.mtp else (src / "mtp.safetensors")
-    if mtp_src.exists():
-        mtp_dst = dst / "mtp.safetensors"
-        if mtp_dst.exists():
-            mtp_dst.unlink()
-        try:
-            os.link(mtp_src, mtp_dst)
-        except OSError:
-            shutil.copy2(mtp_src, mtp_dst)
-        print(f"Linked/copied {mtp_src.name}")
+    for opt_path, default_name in (
+        (args.mtp, "mtp.safetensors"),
+        (args.vision, "model-vision.safetensors"),
+    ):
+        if default_name in shard_files and not opt_path:
+            continue
+        side_src = Path(opt_path) if opt_path else (src / default_name)
+        if side_src.exists():
+            side_dst = dst / default_name
+            if side_dst.exists():
+                side_dst.unlink()
+            try:
+                os.link(side_src, side_dst)
+            except OSError:
+                shutil.copy2(side_src, side_dst)
+            print(f"Linked/copied {side_src.name}")
 
     dt = time.perf_counter() - t0
     print(
