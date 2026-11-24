@@ -88,9 +88,19 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
         return DrafterStepResult{ .tokens = tokens, .accepted_tokens = 0 };
     }
     if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
+    const has_native = plugin_driver.nativeDrafter(self.xfm) != null;
+    // Direct n-gram copy check for native drafters (zero drafter forward, zero rollback): fires even during
+    // stage-drafting backoff when the output begins echoing/editing context spans (>= 8 matching tokens; >= 10 to
+    // wake out of an active serial pipeline).
+    var copy_buf: [16]u32 = undefined;
+    var copy_n: usize = 0;
+    if (has_native) {
+        const pipelined = self.has_pending_logits or self.has_pending_token;
+        copy_n = try nativeCopyProposal(self, allocator, &copy_buf, if (pipelined) 10 else 8);
+    }
     // A skipped round is a tick of the serial pipeline; the first drafted round after it drains the pipeline.
     if (self.dspark_pol) |*pol| {
-        if (pol.pin_rows == 0 and !pol.drafting.shouldDraft() and self.dflashCanPipeline()) return try self.dsparkPlainPipelined(allocator);
+        if (copy_n == 0 and pol.pin_rows == 0 and !pol.drafting.shouldDraft() and self.dflashCanPipeline()) return try self.dsparkPlainPipelined(allocator);
         pol.plain_watch = null;
         if (self.has_pending_logits or self.has_pending_token) switch (try self.drainPipelineForSpec(allocator)) {
             .drained => |tok| return try mtpSerialOneToken(allocator, tok),
@@ -99,8 +109,113 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
         };
     }
     if (try self.checkStop()) return null; // t1 is this block's first emit: stop before drafting
-    if (plugin_driver.nativeDrafter(self.xfm) != null) return nativeRound(self, allocator);
+    if (has_native) {
+        if (copy_n == 0) copy_n = try nativeCopyProposal(self, allocator, &copy_buf, 8);
+        if (copy_n > 0) return nativeCopyRound(self, allocator, copy_buf[0 .. 1 + copy_n]);
+        return nativeRound(self, allocator);
+    }
     return modules.call("dspark_round", .{ self, allocator });
+}
+
+/// Whether clean sampled requests can use exact single-sync Gumbel-Max coupling in `inkling2`'s native drafter.
+fn canGumbelCouple(self: *const Generator) bool {
+    const min_p_off = if (self.sampling.min_p) |mp| mp <= 0.0 else true;
+    return self.dspark_stochastic and
+        self.sampling.temperature >= 0.01 and
+        self.sampling.top_p >= 0.9999 and
+        self.sampling.top_k == 0 and
+        min_p_off and
+        self.sampling.logit_bias.len == 0 and
+        !self.sampling.suppress_cjk and
+        !self.sampling.penalized() and
+        self.sampling.constraint == null and
+        self.logprobs_n == 0 and
+        !env.on(.MLX_SERVE_KEYED_SAMPLING) and
+        std.c.getenv("INKLING_NO_GUMBEL") == null and
+        plugin_driver.nativeGumbelCapable(self.xfm);
+}
+
+/// Records a native drafted round into `dspark_pol`; wakes immediately from backoff if a high-acceptance probe
+/// (>= 5 committed tokens and >= 20% faster than serial) shows generation entered a predictable code/math/echo span.
+fn recordNativePolicy(pol: anytype, n_tokens: u32, wall_ms: f32) void {
+    if (!std.math.isFinite(pol.plain.ms) or pol.plain.ms <= 0) return;
+    const gain = @as(f32, @floatFromInt(n_tokens)) * pol.plain.ms;
+    if (pol.drafting.period > 1 and n_tokens >= 5 and gain >= wall_ms * 1.20) {
+        pol.drafting.gain = gain;
+        pol.drafting.wall = wall_ms;
+        pol.drafting.owed = 0;
+        pol.drafting.period = 1;
+        return;
+    }
+    pol.drafting.record(gain, wall_ms);
+}
+
+/// Checks `mtpLookupIndex` for a >= `min_suffix`-token trailing suffix match; fills `buf[0..1+n]` with
+/// `[t1, copy_drafts...]` and returns `n` (0 = none). Uses 6 drafts normally (stays inside verifyQmm M<=7 on M1/M2),
+/// or up to 15 drafts at short context (`<= 2048`) on a strong (>= 16-token) verbatim agreement.
+fn nativeCopyProposal(self: *Generator, allocator: std.mem.Allocator, buf: *[16]u32, min_suffix: u32) !usize {
+    const remaining: u32 = self.max_tokens -| self.completion_tokens -| 1;
+    if (remaining < 2) return 0;
+    const idx = try self.mtpLookupIndex(allocator);
+    const max_q: u32 = @min(remaining, 15);
+    const found = idx.matchBest(self.next_token_id, max_q) orelse return 0;
+    if (found.suffix < min_suffix) return 0;
+    const wide_ok = found.suffix >= @import("mtp_lookup.zig").STRONG_SUFFIX and self.ctx.cache.step <= 2048;
+    const lim: usize = @min(found.draft.len, @as(usize, @intCast(@min(remaining, if (wide_ok) @as(u32, 15) else @as(u32, 6)))));
+    var n: usize = 0;
+    while (n < lim) : (n += 1) {
+        const tok = found.draft[n];
+        buf[1 + n] = tok;
+        if (std.mem.indexOfScalar(u32, self.eos_token_ids, tok) != null) {
+            n += 1;
+            break;
+        }
+    }
+    if (n < 2) return 0;
+    buf[0] = self.next_token_id;
+    return n;
+}
+
+/// One copy-proposed round on the served plugin's native drafter (0 ms draft forward, deduped verify, zero rollback).
+fn nativeCopyRound(self: *Generator, allocator: std.mem.Allocator, proposal: []const u32) !?DrafterStepResult {
+    try plugin_settle.activate(self.xfm, &self.ctx);
+    if (self.has_pending_logits or self.has_pending_token) switch (try self.drainPipelineForSpec(allocator)) {
+        .drained => |tok| return try mtpSerialOneToken(allocator, tok),
+        .stopped => return null,
+        .already_clean, .stay_disabled => return error.PipelineHalfState,
+    };
+    const n_drafts: u32 = @intCast(proposal.len - 1);
+    const cap = @min(capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens), abi.max_round_tokens - 1);
+    const use_gumbel = canGumbelCouple(self);
+    if (self.dspark_stochastic and !use_gumbel) {
+        var v = try plugin_driver.nativeVerifyWithDrafts(self.xfm, &self.ctx, proposal, cap, self.eos_token_ids);
+        defer _ = mlx.mlx_array_free(v.logits);
+        const ids = v.round.tokens[0..v.round.n];
+        var closed = false;
+        errdefer if (!closed) {
+            _ = plugin_driver.nativeFinish(self.xfm, &self.ctx, 0) catch 0;
+        };
+        const verdict = try stochasticVerdict(self, v.logits, ids, self.xfm.config.vocab_size, cap);
+        closed = true;
+        const position = try plugin_driver.nativeFinish(self.xfm, &self.ctx, verdict.accepted);
+        const tokens = try allocator.dupe(u32, ids[0 .. 1 + verdict.accepted]);
+        errdefer allocator.free(tokens);
+        self.dspark_copies += 1;
+        self.dspark_copy_drafted += n_drafts;
+        self.dspark_copy_accepted += verdict.accepted;
+        return self.commitDsparkRound(allocator, .{ .tokens = tokens, .accepted = verdict.accepted, .next_token = verdict.next_token }, @intCast(position));
+    }
+    const gumbel: ?plugin_driver.GumbelSample = if (use_gumbel) .{
+        .inv_temp = 1.0 / self.sampling.temperature,
+        .seed = self.prng.random().int(u32),
+    } else null;
+    const r = try plugin_driver.nativeRoundWithDraftsOpt(self.xfm, &self.ctx, proposal, cap, self.eos_token_ids, gumbel);
+    const tokens = try allocator.dupe(u32, r.tokens[0..r.n]);
+    errdefer allocator.free(tokens);
+    self.dspark_copies += 1;
+    self.dspark_copy_drafted += n_drafts;
+    self.dspark_copy_accepted += r.accepted;
+    return self.commitDsparkRound(allocator, .{ .tokens = tokens, .accepted = r.accepted, .next_token = r.next_token }, @intCast(r.position));
 }
 
 /// A sampled round of the served plugin's drafter: the plugin drafts and verifies, the engine accepts under the
@@ -121,9 +236,7 @@ fn nativeSampledRound(self: *Generator, allocator: std.mem.Allocator, cap: u32) 
     const tokens = try allocator.dupe(u32, ids[0 .. 1 + verdict.accepted]);
     errdefer allocator.free(tokens);
     self.dspark_stats.record(v.round.rows -| 1, verdict.accepted);
-    if (self.dspark_pol) |*pol| if (std.math.isFinite(pol.plain.ms)) {
-        pol.drafting.record(@as(f32, @floatFromInt(1 + verdict.accepted)) * pol.plain.ms, @as(f32, @floatFromInt(watch.read())) / @as(f32, std.time.ns_per_ms));
-    };
+    if (self.dspark_pol) |*pol| recordNativePolicy(pol, 1 + verdict.accepted, @as(f32, @floatFromInt(watch.read())) / @as(f32, std.time.ns_per_ms));
     return self.commitDsparkRound(allocator, .{ .tokens = tokens, .accepted = verdict.accepted, .next_token = verdict.next_token }, @intCast(position));
 }
 
@@ -138,15 +251,19 @@ fn nativeRound(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResu
         .already_clean, .stay_disabled => return error.PipelineHalfState,
     };
     const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
-    if (self.dspark_stochastic) return nativeSampledRound(self, allocator, @min(cap, abi.max_round_tokens - 1));
+    const use_gumbel = canGumbelCouple(self);
+    if (self.dspark_stochastic and !use_gumbel) return nativeSampledRound(self, allocator, @min(cap, abi.max_round_tokens - 1));
     const watch = io_util.Stopwatch.init(self.timer.io);
-    const r = try plugin_driver.nativeRound(self.xfm, &self.ctx, self.next_token_id, @min(cap, abi.max_round_tokens - 1), self.eos_token_ids);
+    const t1_slice = [_]u32{self.next_token_id};
+    const gumbel: ?plugin_driver.GumbelSample = if (use_gumbel) .{
+        .inv_temp = 1.0 / self.sampling.temperature,
+        .seed = self.prng.random().int(u32),
+    } else null;
+    const r = try plugin_driver.nativeRoundWithDraftsOpt(self.xfm, &self.ctx, &t1_slice, @min(cap, abi.max_round_tokens - 1), self.eos_token_ids, gumbel);
     const tokens = try allocator.dupe(u32, r.tokens[0..r.n]);
     errdefer allocator.free(tokens);
     self.dspark_stats.record(r.rows -| 1, r.accepted);
-    if (self.dspark_pol) |*pol| if (std.math.isFinite(pol.plain.ms)) {
-        pol.drafting.record(@as(f32, @floatFromInt(r.n)) * pol.plain.ms, @as(f32, @floatFromInt(watch.read())) / @as(f32, std.time.ns_per_ms));
-    };
+    if (self.dspark_pol) |*pol| recordNativePolicy(pol, r.n, @as(f32, @floatFromInt(watch.read())) / @as(f32, std.time.ns_per_ms));
     return self.commitDsparkRound(allocator, .{ .tokens = tokens, .accepted = r.accepted, .next_token = r.next_token }, @intCast(r.position));
 }
 

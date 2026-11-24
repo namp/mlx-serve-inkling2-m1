@@ -609,6 +609,11 @@ pub const Forward = extern struct {
     /// the conversation's, and a state that kept it is one the prefix cache cannot restore. Read it only when `size`
     /// reaches it.
     stop_ids: Span(u32) = .{},
+    /// Optional Gumbel-Max coupling parameters for `NativeDrafter.step` (clean T > 0, top_p = 1, top_k = 0):
+    /// `sample_inv_temp > 0` enables coupled Gumbel-Max drafting and target picking with `sample_seed`. Read only
+    /// when `size` reaches it.
+    sample_inv_temp: f32 = 0,
+    sample_seed: u32 = 0,
 };
 
 /// Directional ablation (Arditi et al. 2024): slot i's forward removes `strengths[i]` times the component along its

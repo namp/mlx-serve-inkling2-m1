@@ -1438,13 +1438,32 @@ pub fn nativeStages(xfm: *const Transformer) u32 {
     return xfm.config.plugin.?.parsed.spec.native_stages;
 }
 
+/// Whether the served plugin supports coupled Gumbel-Max sampling directly inside `NativeDrafter.step`.
+pub fn nativeGumbelCapable(xfm: *const Transformer) bool {
+    const b = xfm.plugin orelse return false;
+    if (nativeDrafter(xfm) == null) return false;
+    return std.mem.eql(u8, b.table.name.slice(), "inkling2");
+}
+
+pub const GumbelSample = struct { inv_temp: f32, seed: u32 };
+
 /// One native drafter round from the committed token `t1` (`NativeDrafter.step`); the model's state,
 /// `ctx.cache.step` and `ctx.moe_seq_offset` move to the round's position.
 pub fn nativeRound(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32, stop_ids: []const u32) !abi.Round {
+    const tokens = [_]u32{t1};
+    return nativeRoundWithDraftsOpt(xfm, ctx, &tokens, cap, stop_ids, null);
+}
+
+/// Native drafter round with optional caller-supplied draft tokens (`tokens[0] = t1`, `tokens[1..] = copy drafts`).
+pub fn nativeRoundWithDrafts(xfm: *Transformer, ctx: *ForwardCtx, tokens: []const u32, cap: u32, stop_ids: []const u32) !abi.Round {
+    return nativeRoundWithDraftsOpt(xfm, ctx, tokens, cap, stop_ids, null);
+}
+
+/// Native drafter round with optional copy drafts and optional coupled Gumbel-Max sampling.
+pub fn nativeRoundWithDraftsOpt(xfm: *Transformer, ctx: *ForwardCtx, tokens: []const u32, cap: u32, stop_ids: []const u32, gumbel: ?GumbelSample) !abi.Round {
     const b = xfm.plugin.?;
     if (ctx.ablation != null) try roundServes(xfm, b, ctx);
     const nd = nativeDrafter(xfm).?;
-    const tokens = [_]u32{t1};
     const slot_ids = [_]u32{settle.slotId(b, ctx)};
     const pos = [_]u32{@intCast(ctx.cache.step)};
     var ablated: Ablated = .{};
@@ -1455,7 +1474,7 @@ pub fn nativeRound(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32, stop_
     const f: abi.Forward = .{
         .mode = .decode,
         .rows = 1,
-        .tokens = .of(&tokens),
+        .tokens = .of(tokens),
         .slots = .of(&slot_ids),
         .positions = .of(&pos),
         .caches = .of(&handles),
@@ -1464,6 +1483,8 @@ pub fn nativeRound(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32, stop_
         .suppress_mask = .{ .ctx = if (xfm.suppress_mask) |m| m.ctx else null },
         .ablation = try ablated.init(&.{ctx}),
         .stop_ids = .of(stop_ids),
+        .sample_inv_temp = if (gumbel) |gs| gs.inv_temp else 0,
+        .sample_seed = if (gumbel) |gs| gs.seed else 0,
     };
     var out: abi.ForwardOut = .{};
     intree.enter(ctx);
@@ -1491,10 +1512,15 @@ pub const Verified = struct { round: abi.Round, logits: Array };
 /// The first half of a native round (`NativeDrafter.verify`): the verified rows' ids and logits `[rows, vocab]`, the
 /// verify left open until `nativeFinish`. The caller frees `logits`.
 pub fn nativeVerify(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32, stop_ids: []const u32) !Verified {
+    const tokens = [_]u32{t1};
+    return nativeVerifyWithDrafts(xfm, ctx, &tokens, cap, stop_ids);
+}
+
+/// First half of a native sampled round with optional caller-supplied copy drafts (`tokens[0] = t1`).
+pub fn nativeVerifyWithDrafts(xfm: *Transformer, ctx: *ForwardCtx, tokens: []const u32, cap: u32, stop_ids: []const u32) !Verified {
     const b = xfm.plugin.?;
     if (ctx.ablation != null) try roundServes(xfm, b, ctx);
     const nd = nativeDrafter(xfm).?;
-    const tokens = [_]u32{t1};
     const slot_ids = [_]u32{settle.slotId(b, ctx)};
     const pos = [_]u32{@intCast(ctx.cache.step)};
     var ablated: Ablated = .{};
@@ -1505,7 +1531,7 @@ pub fn nativeVerify(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32, stop
     const f: abi.Forward = .{
         .mode = .verify,
         .rows = 1,
-        .tokens = .of(&tokens),
+        .tokens = .of(tokens),
         .slots = .of(&slot_ids),
         .positions = .of(&pos),
         .caches = .of(&handles),

@@ -79,6 +79,9 @@ pub var topk_kernel: Kernel = .{ .name = "msv_inkling2_topk", .ins = &.{ "SC", "
 pub var act_kernel: Kernel = .{ .name = "msv_inkling2_act", .ins = &.{ "GU", "IDX", "SC", "PR" }, .outs = &.{"ACT"}, .source = kernelSource("plugins/inkling2/kernels/act.metal") };
 pub var ups_kernel: Kernel = .{ .name = "msv_inkling2_ups", .ins = &.{ "X", "WQ", "WS", "WB", "IDX", "SC", "PR" }, .outs = &.{"ACT"}, .source = kernelSource("plugins/inkling2/kernels/ups.metal"), .header = bank_header };
 pub var downs_kernel: Kernel = .{ .name = "msv_inkling2_downs", .ins = &.{ "ACT", "WQ", "WS", "WB", "IDX", "SC", "WTS", "RES", "ST", "MW", "PR" }, .outs = &.{ "HOUT", "XM" }, .source = kernelSource("plugins/inkling2/kernels/downs.metal"), .header = bank_header };
+pub var plan_experts_kernel: Kernel = .{ .name = "msv_inkling2_plan_experts", .ins = &.{"IDX"}, .outs = &.{ "SLOT_E", "SLOT_P" }, .source = kernelSource("plugins/inkling2/kernels/plan_experts.metal") };
+pub var ups_dedup_kernel: Kernel = .{ .name = "msv_inkling2_ups_dedup", .ins = &.{ "X", "WQ", "WS", "WB", "SLOT_E", "SLOT_P", "SC", "PR" }, .outs = &.{"ACT"}, .source = kernelSource("plugins/inkling2/kernels/ups_dedup.metal"), .header = bank_header };
+pub var downs_dedup_kernel: Kernel = .{ .name = "msv_inkling2_downs_dedup", .ins = &.{ "ACT", "WQ", "WS", "WB", "SLOT_E", "SLOT_P", "SC" }, .outs = &.{"DN"}, .source = kernelSource("plugins/inkling2/kernels/downs_dedup.metal"), .header = bank_header };
 pub var relattn_kernel: Kernel = .{ .name = "msv_inkling2_relattn", .ins = &.{ "q", "k", "v", "rel", "sinks", "key_start", "sizes", "scale" }, .outs = &.{"out"}, .source = kernelSource("plugins/inkling2/kernels/relattn.metal"), .contiguous = false };
 pub var router_kernel: Kernel = .{ .name = "msv_inkling2_router", .ins = &.{ "X", "RT" }, .outs = &.{"SC"}, .source = kernelSource("plugins/inkling2/kernels/router.metal") };
 pub var relsplit_kernel: Kernel = .{ .name = "msv_inkling2_relsplit", .ins = &.{ "q", "k", "v", "rel", "sinks", "sizes", "scale" }, .outs = &.{ "PART", "ML" }, .source = kernelSource("plugins/inkling2/kernels/relsplit.metal"), .contiguous = false };
@@ -86,8 +89,9 @@ pub var relcomb_kernel: Kernel = .{ .name = "msv_inkling2_relcomb", .ins = &.{ "
 /// The Markov kernels' argmax order.
 const markov_header = kernelSource("plugins/inkling2/kernels/markov_header.metal");
 pub var markov_rnn_kernel: Kernel = .{ .name = "msv_inkling2_markov_rnn", .ins = &.{ "W", "B", "ST", "PREV", "ROWS", "NEW", "TOK", "AT" }, .outs = &.{"P"}, .source = kernelSource("plugins/inkling2/kernels/markov_rnn.metal") };
-pub var markov_fold_kernel: Kernel = .{ .name = "msv_inkling2_markov_fold", .ins = &.{ "P", "FOLD", "FSCALE", "FB", "BASE", "AT", "CAP" }, .outs = &.{ "PM", "PI", "PS" }, .source = kernelSource("plugins/inkling2/kernels/markov_fold.metal"), .header = markov_header };
+pub var markov_fold_kernel: Kernel = .{ .name = "msv_inkling2_markov_fold", .ins = &.{ "P", "FOLD", "FSCALE", "FB", "BASE", "AT", "CAP", "SP" }, .outs = &.{ "PM", "PI", "PS" }, .source = kernelSource("plugins/inkling2/kernels/markov_fold.metal"), .header = markov_header };
 pub var markov_pick_kernel: Kernel = .{ .name = "msv_inkling2_markov_pick", .ins = &.{ "PM", "PI", "PS", "P", "ST", "CAP" }, .outs = &.{ "TOKN", "CONF", "NST" }, .source = kernelSource("plugins/inkling2/kernels/markov_pick.metal"), .header = markov_header };
+pub var gumbel_picks_kernel: Kernel = .{ .name = "msv_inkling2_gumbel_picks", .ins = &.{ "LG", "SUPP", "SP" }, .outs = &.{"OUT"}, .source = kernelSource("plugins/inkling2/kernels/gumbel_picks.metal"), .header = markov_header };
 pub var relslots_kernel: Kernel = .{ .name = "msv_inkling2_relslots", .ins = &.{ "q", "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "rel", "sinks", "KEYS", "scale" }, .outs = &.{ "PART", "ML" }, .source = kernelSource("plugins/inkling2/kernels/relslots.metal"), .contiguous = false };
 pub var relmask_kernel: Kernel = .{ .name = "msv_inkling2_relmask", .ins = &.{ "rel", "sinks", "sizes" }, .outs = &.{"M"}, .source = kernelSource("plugins/inkling2/kernels/relmask.metal") };
 pub var sum_kernel: Kernel = .{ .name = "msv_inkling2_sum", .ins = &.{ "DN", "IDX", "INV", "SC", "WTS", "RES", "ST", "MW", "PR" }, .outs = &.{ "HOUT", "XM" }, .source = kernelSource("plugins/inkling2/kernels/sum.metal") };
@@ -261,12 +265,14 @@ pub fn gate(g: *Graph, gates: *const layers.Gates, a: Array, ms: Array, st: Arra
         }
     }
     const tg_x: c_int = if (@rem(d, 128) == 0) 128 else if (@rem(d, 64) == 0) 64 else if (@rem(d, 32) == 0) 32 else 1;
-    const o = try launchGrid(g, &gate_kernel, &.{ a, ms, st, forget, message }, 1, .{.{ .shape = &.{ n, s, d }, .dtype = .float32 }}, .{ d, s, n }, .{ tg_x, 1, 1 }, &.{
+    const srows: c_int = if (!projected and gates.transposed and s <= 16) s else 1;
+    const o = try launchGrid(g, &gate_kernel, &.{ a, ms, st, forget, message }, 1, .{.{ .shape = &.{ n, s, d }, .dtype = .float32 }}, .{ d, @divExact(s, srows), n }, .{ tg_x, 1, 1 }, &.{
         .{ "D", .{ .int = d } },
         .{ "RANK", .{ .int = rank } },
         .{ "PROJ", .{ .int = @intFromBool(projected) } },
         .{ "TRANS", .{ .int = @intFromBool(gates.transposed) } },
         .{ "TG", .{ .int = tg_x } },
+        .{ "SROWS", .{ .int = srows } },
         .{ "GT", .{ .dtype = ops.dtype(forget) } },
     });
     return o[0];
@@ -494,16 +500,21 @@ pub fn markovRuns(g: *const Graph, rnn: Array, fold: Array, rank: c_int) bool {
 /// and the pick with the next state. `base` `[1, block - 1, V]` f32 is the block rows' head logits, `softcap` the
 /// head's (the probability reads the capped logits; 0 = none).
 pub const MarkovStep = struct { token: Array, confidence: Array, state: Array };
+pub const GumbelSpec = struct { inv_t: f32, seed: u32, q0: u32 };
 
 pub fn markovStep(g: *Graph, rnn: Array, rnn_bias: Array, state: Array, prev_rows: Array, rows: Array, newest: Array, token: Array, fold: Array, fold_bias: Array, base: Array, at: c_int, vocab: c_int, softcap: f32) !MarkovStep {
-    return markovStepOpt(g, rnn, rnn_bias, state, prev_rows, rows, newest, token, fold, null, fold_bias, base, at, vocab, softcap);
+    return markovStepGumbel(g, rnn, rnn_bias, state, prev_rows, rows, newest, token, fold, null, fold_bias, base, at, vocab, softcap, null);
 }
 
 pub fn markovStepOpt(g: *Graph, rnn: Array, rnn_bias: Array, state: Array, prev_rows: Array, rows: Array, newest: Array, token: Array, fold: Array, fold_scale: ?Array, fold_bias: Array, base: Array, at: c_int, vocab: c_int, softcap: f32) !MarkovStep {
+    return markovStepGumbel(g, rnn, rnn_bias, state, prev_rows, rows, newest, token, fold, fold_scale, fold_bias, base, at, vocab, softcap, null);
+}
+
+pub fn markovStepGumbel(g: *Graph, rnn: Array, rnn_bias: Array, state: Array, prev_rows: Array, rows: Array, newest: Array, token: Array, fold: Array, fold_scale: ?Array, fold_bias: Array, base: Array, at: c_int, vocab: c_int, softcap: f32, gumbel: ?GumbelSpec) !MarkovStep {
     const step = try g.fromSlice(i32, &.{at}, &.{1});
     const cap = try g.fromSlice(f32, &.{softcap}, &.{1});
     const p = try markovRnn(g, rnn, rnn_bias, state, prev_rows, rows, newest, token, step);
-    const o = try markovPick(g, try markovFoldOpt(g, p, fold, fold_scale, fold_bias, base, step, vocab, cap), p, state, cap);
+    const o = try markovPickOpt(g, try markovFoldGumbel(g, p, fold, fold_scale, fold_bias, base, step, vocab, cap, gumbel), p, state, cap, gumbel != null);
     return .{ .token = o[0], .confidence = o[1], .state = o[2] };
 }
 
@@ -518,27 +529,54 @@ pub fn markovRnn(g: *Graph, rnn: Array, rnn_bias: Array, state: Array, prev_rows
 
 /// `markov_fold.metal`: each fold threadgroup's (max, argmax, sum of exp) over the step's `vocab` logits.
 pub fn markovFold(g: *Graph, p: Array, fold: Array, fold_bias: Array, base: Array, step: Array, vocab: c_int, cap: Array) ![3]Array {
-    return markovFoldOpt(g, p, fold, null, fold_bias, base, step, vocab, cap);
+    return markovFoldGumbel(g, p, fold, null, fold_bias, base, step, vocab, cap, null);
 }
 
 pub fn markovFoldOpt(g: *Graph, p: Array, fold: Array, fold_scale: ?Array, fold_bias: Array, base: Array, step: Array, vocab: c_int, cap: Array) ![3]Array {
+    return markovFoldGumbel(g, p, fold, fold_scale, fold_bias, base, step, vocab, cap, null);
+}
+
+pub fn markovFoldGumbel(g: *Graph, p: Array, fold: Array, fold_scale: ?Array, fold_bias: Array, base: Array, step: Array, vocab: c_int, cap: Array, gumbel: ?GumbelSpec) ![3]Array {
     const groups = @divTrunc(vocab + markov_tg * markov_cols - 1, markov_tg * markov_cols);
     const q8 = fold_scale != null and ops.dtype(fold) == .int8;
     const t_dt = if (q8) ops.dtype(fold_bias) else ops.dtype(fold);
-    return launch(g, &markov_fold_kernel, &.{ p, fold, fold_scale orelse cap, fold_bias, base, step, cap }, 3, .{
+    const sp_vals: [3]u32 = if (gumbel) |gs| .{ @bitCast(gs.inv_t), gs.seed, gs.q0 } else .{ 0, 0, 0 };
+    const sp = try g.fromSlice(u32, &sp_vals, &.{3});
+    return launch(g, &markov_fold_kernel, &.{ p, fold, fold_scale orelse cap, fold_bias, base, step, cap, sp }, 3, .{
         .{ .shape = &.{groups}, .dtype = .float32 }, .{ .shape = &.{groups}, .dtype = .uint32 }, .{ .shape = &.{groups}, .dtype = .float32 },
     }, groups * markov_tg, markov_tg, &.{
         .{ "T", .{ .dtype = t_dt } }, .{ "R", .{ .int = ops.shape(fold)[0] } }, .{ "TG", .{ .int = markov_tg } },
         .{ "VPT", .{ .int = markov_cols } }, .{ "VOCAB", .{ .int = vocab } }, .{ "Q8", .{ .int = @intFromBool(q8) } },
+        .{ "SAMP", .{ .int = @intFromBool(gumbel != null) } },
     });
 }
 
 /// `markov_pick.metal`: the step's token `[1]` int32, its probability `[1]` f32 and the next state `[1, 1, R]`.
 pub fn markovPick(g: *Graph, part: [3]Array, p: Array, state: Array, cap: Array) ![3]Array {
+    return markovPickOpt(g, part, p, state, cap, false);
+}
+
+pub fn markovPickOpt(g: *Graph, part: [3]Array, p: Array, state: Array, cap: Array, samp: bool) ![3]Array {
     const rank = @divExact(ops.shape(p)[0], 3);
     return launch(g, &markov_pick_kernel, &.{ part[0], part[1], part[2], p, state, cap }, 3, .{
         .{ .shape = &.{1}, .dtype = .int32 }, .{ .shape = &.{1}, .dtype = .float32 }, .{ .shape = &.{ 1, 1, rank }, .dtype = ops.dtype(state) },
-    }, 256, 256, &.{ .{ "T", .{ .dtype = ops.dtype(state) } }, .{ "R", .{ .int = rank } } });
+    }, 256, 256, &.{ .{ "T", .{ .dtype = ops.dtype(state) } }, .{ "R", .{ .int = rank } }, .{ "SAMP", .{ .int = @intFromBool(samp) } } });
+}
+
+/// `gumbel_picks.metal`: exact Gumbel-Max target pick per row of `logits` `[rows, vocab]` (already soft-capped),
+/// masked by `suppress` (`[vocab]` bool, optional): `[rows]` int32.
+pub fn gumbelPicks(g: *Graph, logits: Array, rows: c_int, suppress: abi.Array, gs: GumbelSpec) !Array {
+    const lg2 = try g.reshape(logits, &.{ rows, -1 });
+    const has_supp = suppress.ctx != null;
+    const supp_arr: Array = if (has_supp) .{ .ctx = suppress.ctx } else try g.fromSlice(bool, &.{false}, &.{1});
+    const sp = try g.fromSlice(u32, &.{ @bitCast(gs.inv_t), gs.seed, gs.q0 }, &.{3});
+    const o = try launchGrid(g, &gumbel_picks_kernel, &.{ lg2, supp_arr, sp }, 1, .{
+        .{ .shape = &.{rows}, .dtype = .int32 },
+    }, .{ 256, rows, 1 }, .{ 256, 1, 1 }, &.{
+        .{ "T", .{ .dtype = ops.dtype(lg2) } },
+        .{ "HAS_SUPP", .{ .int = @intFromBool(has_supp) } },
+    });
+    return o[0];
 }
 
 /// What a read of the rows takes: q `[1, H, S, hd]` (log-scaled on a global layer past the floor), the bias rows
@@ -819,7 +857,8 @@ fn attend(c: *block.Ctx, L: *const Layer, w: *const Body, p: *const Prep, sinks:
 pub fn routerRows(g: *Graph, x: Array, router: Array) !Array {
     const sh = ops.shape(router);
     const s = ops.shape(x)[1];
-    const o = try launchGrid(g, &router_kernel, &.{ x, router }, 1, .{.{ .shape = &.{ s, sh[0] }, .dtype = .float32 }}, .{ 32 * sh[0], s, 1 }, .{ 32, 1, 1 }, &.{ .{ "D", .{ .int = sh[1] } }, .{ "E", .{ .int = sh[0] } } });
+    const srows: c_int = if (s <= 16) s else 1;
+    const o = try launchGrid(g, &router_kernel, &.{ x, router }, 1, .{.{ .shape = &.{ s, sh[0] }, .dtype = .float32 }}, .{ 32 * sh[0], @divExact(s, srows), 1 }, .{ 32, 1, 1 }, &.{ .{ "D", .{ .int = sh[1] } }, .{ "E", .{ .int = sh[0] } }, .{ "SROWS", .{ .int = srows } } });
     return o[0];
 }
 
@@ -1024,9 +1063,10 @@ pub fn mid(g: *Graph, L: *const Layer, w: *const Body, attn: Array, out_gate: ?A
     var scores: Array = undefined;
     if (gates) |gs| {
         const state = try g.matmul(o[4], try layers.downs(g, gs, 3, 1));
-        const xs = try norm(g, cfg, try gate(g, gs, o[3], msg3, state, 3, 1), @splat(L.post_norm), 1, dt, L.router, w.c_eps);
+        const multi_router = s > 1 and s <= 16;
+        const xs = try norm(g, cfg, try gate(g, gs, o[3], msg3, state, 3, 1), @splat(L.post_norm), 1, dt, if (multi_router) null else L.router, w.c_eps);
         x = xs[0];
-        scores = xs[1];
+        scores = if (multi_router) try routerRows(g, xs[0], L.router) else xs[1];
     } else scores = if (s > 1 and s <= small_rows) try routerRows(g, o[2], L.router) else try g.matmul(o[2], try g.transpose(L.router, &.{ 1, 0 }));
     const rscale = if (w.c_route_scale.ctx != null) w.c_route_scale else try g.fromSlice(f32, &.{cfg.route_scale}, &.{1});
     const picks = try topK(g, scores, L.router_bias, rscale, top_k);
@@ -1054,17 +1094,26 @@ pub fn activation(g: *Graph, gu: Array, sel: Array, scale: Array, caps: Array, s
 /// (pair (row, pick) at `inverse[row * k + pick]`, of expert `sel` there) times `scale[sel]` when `scaled` and their
 /// routing `weights` `[1, S, k]`, summed; then the MLP's short conv behind `st` with `taps`, and the residual.
 pub fn pickSum(g: *Graph, dn: Array, sel: Array, inverse: Array, scale: Array, weights: Array, residual: Array, st: Array, taps: Array, conv_scale: Array, k: c_int, scaled: bool, out_dt: Dtype) ![2]Array {
+    return pickSumOpt(g, dn, sel, inverse, scale, weights, residual, st, taps, conv_scale, k, scaled, false, out_dt);
+}
+
+fn pickSumOpt(g: *Graph, dn: Array, sel: Array, inverse: Array, scale: Array, weights: Array, residual: Array, st: Array, taps: Array, conv_scale: Array, k: c_int, scaled: bool, ident: bool, out_dt: Dtype) ![2]Array {
     const s = ops.shape(residual)[1];
     const d = ops.shape(residual)[2];
     const out: Out = .{ .shape = &.{ 1, s, d }, .dtype = out_dt };
-    return launch(g, &sum_kernel, &.{ dn, sel, inverse, scale, weights, residual, st, taps, conv_scale }, 2, .{ out, out }, s * d, 64, &.{
-        .{ "T", .{ .dtype = out_dt } }, .{ "WT", .{ .dtype = ops.dtype(taps) } }, .{ "K", .{ .int = k } }, .{ "KT", .{ .int = ops.shape(st)[1] + 1 } }, .{ "SCALED", .{ .int = @intFromBool(scaled) } }, .{ "SEQ", seqOf(st) },
+    const roll = ident and ops.shape(st)[0] == 1;
+    const grid_x = if (roll) d else s * d;
+    return launch(g, &sum_kernel, &.{ dn, sel, inverse, scale, weights, residual, st, taps, conv_scale }, 2, .{ out, out }, grid_x, 64, &.{
+        .{ "T", .{ .dtype = out_dt } }, .{ "WT", .{ .dtype = ops.dtype(taps) } }, .{ "K", .{ .int = k } }, .{ "KT", .{ .int = ops.shape(st)[1] + 1 } }, .{ "SCALED", .{ .int = @intFromBool(scaled) } }, .{ "IDENT", .{ .int = @intFromBool(ident) } }, .{ "ROLL", .{ .int = @intFromBool(roll) } }, .{ "SEQ", seqOf(st) },
     });
 }
 
 /// The most rows the packed expert kernels serve: past it MLX's gather, which reads a bank once for every pick of
 /// it, wins on bytes; under it the gather's fixed cost is most of a row.
 pub const packed_rows = 8;
+/// The most rows the grouped 4-pair expert deduplication kernels serve (covers DSpark S=2..8 and n-gram copy S=2..16).
+pub const dedup_rows = 16;
+const dedup_m: c_int = 4;
 
 /// The packed layout `ups.metal` and `downs.metal` read in place, of a bank over `in_dim` inputs: 0 NVFP4, 1 MXFP4,
 /// 2 MXFP8, 3 affine (2 to 6 and 8 bits, groups 32, 64, 128, scales and biases of one float dtype); null = another (a
@@ -1109,11 +1158,15 @@ fn expertsWith(g: *Graph, L: *const Layer, cfg: *const Config, c_caps: Array, c_
     const inter: c_int = @intCast(cfg.moe_intermediate_size);
     const hidden: c_int = @intCast(cfg.hidden_size);
     const kt: c_int = @intCast(cfg.sconv_kernel);
+    const num_experts: c_int = @intCast(cfg.num_experts);
     const n = s * top_k;
-    // A few rows read both packed banks in place, their picks in (row, pick) order; one row either.
-    const few = s > 1 and s <= packed_rows and 32 * top_k <= sure_threads and packedFormat(&L.gate_up, hidden) != null and packedFormat(&L.down, inter) != null;
-    const pairs = try layers.pairs(g, cfg, m.x, m.idx);
-    const sel = if (few) try g.reshape(m.idx, &.{n}) else pairs.sel;
+    const gu_fmt = packedFormat(&L.gate_up, hidden);
+    const dn_fmt = packedFormat(&L.down, inter);
+    // Multi-row verify (S = 2..16): group (row, pick) pairs by expert into slots of up to 4 pairs so each distinct
+    // expert weight matrix is read ONCE per slot across both gate_up and down projections (~50% less DRAM at S=8).
+    const dedup = s > 1 and s <= dedup_rows and num_experts <= sure_threads and gu_fmt != null and dn_fmt != null and std.c.getenv("MLX_SERVE_INKLING2_NO_DEDUP") == null;
+    // Legacy undeduplicated few-row path (escape hatch via MLX_SERVE_INKLING2_NO_DEDUP=1).
+    const few = !dedup and s > 1 and s <= packed_rows and 32 * top_k <= sure_threads and gu_fmt != null and dn_fmt != null;
     const caps = if (c_caps.ctx != null) c_caps else try g.fromSlice(f32, &.{ 1.0 / cfg.gate_softcap, cfg.gate_softcap, 1.0 / cfg.up_softcap, cfg.up_softcap }, &.{4});
     const conv_scale = if (c_conv_scale.ctx != null) c_conv_scale else try g.fromSlice(f32, &.{1.0 / @sqrt(@as(f32, @floatFromInt(kt + 1)))}, &.{1});
     const gu_scale = if (L.gate_up_scale.ctx != null) L.gate_up_scale else caps;
@@ -1122,46 +1175,94 @@ fn expertsWith(g: *Graph, L: *const Layer, cfg: *const Config, c_caps: Array, c_
     const dn_scaled: TArg = .{ .int = @intFromBool(L.down_scale.ctx != null) };
     const act_out: [1]Out = .{.{ .shape = &.{ n, 1, inter }, .dtype = dt }};
     const tail_out: [2]Out = .{ .{ .shape = &.{ 1, s, hidden }, .dtype = dt }, .{ .shape = &.{ 1, s, hidden }, .dtype = dt } };
-    const sorted = pairs.inverse != null;
 
-    const up_rows: c_int = if (@rem(inter, 2) == 0) 2 else 1;
-    const up_gy = @divExact(inter, up_rows);
-    const up_bg: c_int = if (@rem(up_gy, 8) == 0) 8 else if (@rem(up_gy, 4) == 0) 4 else if (@rem(up_gy, 2) == 0) 2 else 1;
-    const act = if (if (s == 1 or few) packedFormat(&L.gate_up, hidden) else null) |fmt|
-        try launchGrid(g, &ups_kernel, &.{ m.x, L.gate_up.w, L.gate_up.s, biasesOf(&L.gate_up), sel, gu_scale, caps }, 1, act_out, .{ 32, up_gy, n }, .{ 32, up_bg, 1 }, &.{
+    const o = if (dedup) blk: {
+        const sel = try g.reshape(m.idx, &.{n});
+        // Tight mathematical upper bound on slots: min(NP, E + floor((NP - E) / M)) when NP > E.
+        const nslots: c_int = if (n <= num_experts) n else num_experts + @divTrunc(n - num_experts, dedup_m);
+        const plan_tg: c_int = @divTrunc(num_experts + 31, 32) * 32;
+        const plan = try launch(g, &plan_experts_kernel, &.{sel}, 2, .{
+            .{ .shape = &.{nslots}, .dtype = .uint32 },
+            .{ .shape = &.{ nslots, dedup_m }, .dtype = .uint32 },
+        }, plan_tg, plan_tg, &.{
+            .{ "E", .{ .int = num_experts } },
+            .{ "NP", .{ .int = n } },
+            .{ "KM", .{ .int = s } },
+            .{ "M", .{ .int = dedup_m } },
+            .{ "NSLOTS", .{ .int = nslots } },
+            .{ "TG", .{ .int = plan_tg } },
+        });
+        const up_sub16 = gu_fmt.? == 0 and @rem(inter, 2) == 0 and @rem(hidden, 16) == 0;
+        const up_gy: c_int = if (up_sub16) @divExact(inter, 2) else inter;
+        const up_bg: c_int = if (@rem(up_gy, 8) == 0) 8 else if (@rem(up_gy, 4) == 0) 4 else if (@rem(up_gy, 2) == 0) 2 else 1;
+        const act = try launchGrid(g, &ups_dedup_kernel, &.{ m.x, L.gate_up.w, L.gate_up.s, biasesOf(&L.gate_up), plan[0], plan[1], gu_scale, caps }, 1, act_out, .{ 32, up_gy, nslots }, .{ 32, up_bg, 1 }, &.{
             .{ "T", .{ .dtype = dt } },                               .{ "K", .{ .int = hidden } }, .{ "I", .{ .int = inter } },
-            .{ "GS", .{ .int = @intCast(L.gate_up.qp.group_size) } }, .{ "FMT", .{ .int = fmt } },  .{ "ROWS", .{ .int = up_rows } },
+            .{ "GS", .{ .int = @intCast(L.gate_up.qp.group_size) } }, .{ "FMT", .{ .int = gu_fmt.? } },
             .{ "BITS", .{ .int = @intCast(L.gate_up.qp.bits) } },     .{ "S", .{ .dtype = ops.dtype(L.gate_up.s) } },
             .{ "SCALED", gu_scaled },                                 .{ "KSEL", .{ .int = top_k } },
-        })
-    else blk: {
-        const gu = try layers.gather(g, pairs.rows, &L.gate_up, sel, sorted);
-        if (!floating(ops.dtype(gu))) return error.Inkling2StepDtype;
-        break :blk .{try activation(g, gu, sel, gu_scale, caps, L.gate_up_scale.ctx != null, dt)};
-    };
-
-    // Barrier-free downs_kernel: each SIMD group sweeps all KSEL experts across ROWS output columns.
-    const dn_rows: c_int = if (@rem(hidden, 4) == 0) 4 else if (@rem(hidden, 2) == 0) 2 else 1;
-    const dn_gy = @divExact(hidden, dn_rows);
-    const dn_bg: c_int = if (@rem(dn_gy, 8) == 0) 8 else if (@rem(dn_gy, 4) == 0) 4 else if (@rem(dn_gy, 2) == 0) 2 else 1;
-    const o = if (if ((s == 1 and 32 * top_k <= sure_threads) or few) packedFormat(&L.down, inter) else null) |fmt| blk: {
-        const packed_out = try launchGrid(g, &downs_kernel, &.{ act[0], L.down.w, L.down.s, biasesOf(&L.down), sel, dn_scale, m.weights, m.residual, st, L.mlp_conv, conv_scale }, 2, .{ if (few) unused else tail_out[0], tail_out[1] }, .{ 32, dn_gy, s }, .{ 32, dn_bg, 1 }, &.{
-            .{ "T", .{ .dtype = dt } },         .{ "WT", .{ .dtype = ops.dtype(L.mlp_conv) } },        .{ "I", .{ .int = inter } },
-            .{ "D", .{ .int = hidden } },       .{ "GS", .{ .int = @intCast(L.down.qp.group_size) } }, .{ "FMT", .{ .int = fmt } },
-            .{ "ROWS", .{ .int = dn_rows } },   .{ "KSEL", .{ .int = top_k } },                        .{ "KT", .{ .int = kt } },
-            .{ "BITS", .{ .int = @intCast(L.down.qp.bits) } }, .{ "S", .{ .dtype = ops.dtype(L.down.s) } },
-            .{ "SCALED", dn_scaled },           .{ "TAIL", .{ .int = @intFromBool(!few) } },
+            .{ "SUB16", .{ .int = @intFromBool(up_sub16) } },
         });
-        if (!few) break :blk packed_out;
-        // The rows' MLP outputs are whole: the conv over them and the add, as the wide sum over one pick a row.
-        const rows_at = try g.arange(0, @floatFromInt(s), 1, .uint32);
-        break :blk try pickSum(g, try g.reshape(packed_out[1], &.{ s, 1, hidden }), rows_at, rows_at, caps, try g.ones(&.{ 1, s, 1 }, .float32), m.residual, st, L.mlp_conv, conv_scale, 1, false, dt);
-    } else blk: {
-        const dn = try layers.gather(g, act[0], &L.down, sel, sorted);
-        if (!floating(ops.dtype(dn))) return error.Inkling2StepDtype;
-        // Unsorted pairs sit in (row, pick) order already.
-        const inverse = pairs.inverse orelse try g.arange(0, @floatFromInt(n), 1, .uint32);
-        break :blk try pickSum(g, dn, sel, inverse, dn_scale, m.weights, m.residual, st, L.mlp_conv, conv_scale, top_k, L.down_scale.ctx != null, dt);
+        const dn_sub8 = dn_fmt.? == 0 and @rem(hidden, 8) == 0 and @rem(inter, 16) == 0;
+        const dn_rows: c_int = if (dn_sub8) 8 else if (@rem(hidden, 2) == 0) 2 else 1;
+        const dn_gy = @divExact(hidden, dn_rows);
+        const dn_bg: c_int = if (dn_sub8) (if (@rem(dn_gy, 4) == 0) 4 else if (@rem(dn_gy, 2) == 0) 2 else 1) else (if (@rem(dn_gy, 8) == 0) 8 else if (@rem(dn_gy, 4) == 0) 4 else if (@rem(dn_gy, 2) == 0) 2 else 1);
+        const dn_out: [1]Out = .{.{ .shape = &.{ n, 1, hidden }, .dtype = .float32 }};
+        const dn = try launchGrid(g, &downs_dedup_kernel, &.{ act[0], L.down.w, L.down.s, biasesOf(&L.down), plan[0], plan[1], dn_scale }, 1, dn_out, .{ 32, dn_gy, nslots }, .{ 32, dn_bg, 1 }, &.{
+            .{ "T", .{ .dtype = dt } },                            .{ "I", .{ .int = inter } },      .{ "D", .{ .int = hidden } },
+            .{ "GS", .{ .int = @intCast(L.down.qp.group_size) } }, .{ "FMT", .{ .int = dn_fmt.? } }, .{ "ROWS", .{ .int = if (dn_sub8) 2 else dn_rows } },
+            .{ "BITS", .{ .int = @intCast(L.down.qp.bits) } },     .{ "S", .{ .dtype = ops.dtype(L.down.s) } },
+            .{ "SCALED", dn_scaled },                              .{ "SUB8", .{ .int = @intFromBool(dn_sub8) } },
+        });
+        // `downs_dedup` already multiplied SC[ex] into f32 `dn` in (row, pick) order: sum + conv + residual in 1 launch.
+        break :blk try pickSumOpt(g, dn[0], sel, sel, dn_scale, m.weights, m.residual, st, L.mlp_conv, conv_scale, top_k, false, true, dt);
+    } else blk_std: {
+        const use_packed_up = (s == 1 or few) and gu_fmt != null;
+        const use_packed_dn = ((s == 1 and 32 * top_k <= sure_threads) or few) and dn_fmt != null;
+        const need_pairs = !use_packed_up or !use_packed_dn;
+        const pairs = if (need_pairs) try layers.pairs(g, cfg, m.x, m.idx) else layers.Pairs{ .sel = try g.reshape(m.idx, &.{n}), .rows = m.x, .inverse = null };
+        const sel = if (few) try g.reshape(m.idx, &.{n}) else pairs.sel;
+        const sorted = pairs.inverse != null;
+
+        const up_sub16 = use_packed_up and gu_fmt.? == 0 and @rem(inter, 4) == 0 and @rem(hidden, 16) == 0;
+        const up_rows: c_int = if (up_sub16) 4 else if (@rem(inter, 2) == 0) 2 else 1;
+        const up_gy = @divExact(inter, up_rows);
+        const up_bg: c_int = if (@rem(up_gy, 8) == 0) 8 else if (@rem(up_gy, 4) == 0) 4 else if (@rem(up_gy, 2) == 0) 2 else 1;
+        const act = if (use_packed_up)
+            try launchGrid(g, &ups_kernel, &.{ m.x, L.gate_up.w, L.gate_up.s, biasesOf(&L.gate_up), sel, gu_scale, caps }, 1, act_out, .{ 32, up_gy, n }, .{ 32, up_bg, 1 }, &.{
+                .{ "T", .{ .dtype = dt } },                               .{ "K", .{ .int = hidden } }, .{ "I", .{ .int = inter } },
+                .{ "GS", .{ .int = @intCast(L.gate_up.qp.group_size) } }, .{ "FMT", .{ .int = gu_fmt.? } }, .{ "ROWS", .{ .int = up_rows } },
+                .{ "BITS", .{ .int = @intCast(L.gate_up.qp.bits) } },     .{ "S", .{ .dtype = ops.dtype(L.gate_up.s) } },
+                .{ "SCALED", gu_scaled },                                 .{ "KSEL", .{ .int = top_k } },
+                .{ "SUB16", .{ .int = @intFromBool(up_sub16) } },
+            })
+        else blk_gu: {
+            const gu = try layers.gather(g, pairs.rows, &L.gate_up, sel, sorted);
+            if (!floating(ops.dtype(gu))) return error.Inkling2StepDtype;
+            break :blk_gu .{try activation(g, gu, sel, gu_scale, caps, L.gate_up_scale.ctx != null, dt)};
+        };
+
+        // Barrier-free downs_kernel: each SIMD group sweeps all KSEL experts across ROWS output columns.
+        const dn_rows: c_int = if (@rem(hidden, 4) == 0) 4 else if (@rem(hidden, 2) == 0) 2 else 1;
+        const dn_gy = @divExact(hidden, dn_rows);
+        const dn_bg: c_int = if (use_packed_dn and dn_fmt.? == 0 and @rem(dn_gy, 4) == 0) 4 else if (@rem(dn_gy, 8) == 0) 8 else if (@rem(dn_gy, 4) == 0) 4 else if (@rem(dn_gy, 2) == 0) 2 else 1;
+        break :blk_std if (use_packed_dn) blk_dn: {
+            const packed_out = try launchGrid(g, &downs_kernel, &.{ act[0], L.down.w, L.down.s, biasesOf(&L.down), sel, dn_scale, m.weights, m.residual, st, L.mlp_conv, conv_scale }, 2, .{ if (few) unused else tail_out[0], tail_out[1] }, .{ 32, dn_gy, s }, .{ 32, dn_bg, 1 }, &.{
+                .{ "T", .{ .dtype = dt } },         .{ "WT", .{ .dtype = ops.dtype(L.mlp_conv) } },        .{ "I", .{ .int = inter } },
+                .{ "D", .{ .int = hidden } },       .{ "GS", .{ .int = @intCast(L.down.qp.group_size) } }, .{ "FMT", .{ .int = dn_fmt.? } },
+                .{ "ROWS", .{ .int = dn_rows } },   .{ "KSEL", .{ .int = top_k } },                        .{ "KT", .{ .int = kt } },
+                .{ "BITS", .{ .int = @intCast(L.down.qp.bits) } }, .{ "S", .{ .dtype = ops.dtype(L.down.s) } },
+                .{ "SCALED", dn_scaled },           .{ "TAIL", .{ .int = @intFromBool(!few) } },
+            });
+            if (!few) break :blk_dn packed_out;
+            // The rows' MLP outputs are whole: the conv over them and the add, as the wide sum over one pick a row.
+            break :blk_dn try pickSumOpt(g, try g.reshape(packed_out[1], &.{ s, 1, hidden }), sel, sel, caps, try g.ones(&.{ 1, s, 1 }, .float32), m.residual, st, L.mlp_conv, conv_scale, 1, false, true, dt);
+        } else blk_gdn: {
+            const dn = try layers.gather(g, act[0], &L.down, sel, sorted);
+            if (!floating(ops.dtype(dn))) return error.Inkling2StepDtype;
+            // Unsorted pairs sit in (row, pick) order already.
+            const inverse = pairs.inverse orelse try g.arange(0, @floatFromInt(n), 1, .uint32);
+            break :blk_gdn try pickSum(g, dn, sel, inverse, dn_scale, m.weights, m.residual, st, L.mlp_conv, conv_scale, top_k, L.down_scale.ctx != null, dt);
+        };
     };
     if (open) |v| {
         v.window = try v.g.keep(try g.concat(&.{ st, try g.astype(try g.concat(&.{ kp, vp, m.op, o[1] }, 2), .float32) }, 1));

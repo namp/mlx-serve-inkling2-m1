@@ -304,7 +304,7 @@ pub const RowCost = struct {
         pub fn add(c: *Cost, ms: f32) void {
             if (!std.math.isFinite(ms) or ms <= 0) return;
             // Ignore first-dispatch Metal shader JIT compile spikes so they never poison verify cost selection.
-            if (c.seen == 0 and ms > 180.0) return;
+            if (c.seen == 0 and ms > 75.0) return;
             if (c.seen < c.seeds) {
                 c.ms = if (c.seen == 0) ms else @min(c.ms, ms);
                 c.seen += 1;
@@ -332,7 +332,8 @@ pub const RowCost = struct {
             sky += x * c.ms;
         };
         if (n < 2) return null;
-        return (n * sky - sk * sy) / (n * skk - sk * sk) / self.plain.ms;
+        const r = (n * sky - sk * sy) / (n * skk - sk * sk) / self.plain.ms;
+        return if (r > 0.05) r else null;
     }
 
     /// The run probability a round verifies drafts down to: 1.34 sqrt(ratio), the curve through the best cut measured
@@ -358,6 +359,9 @@ const Opened = struct {
     cache: ?abi.Handle = null,
     cache_ops: ?*const abi.CacheOps = null,
     started: i64 = 0,
+    draft_us: i64 = 0,
+    is_copy: bool = false,
+    gumbel: ?kernels.GumbelSpec = null,
 
     fn deinit(o: *Opened) void {
         for ([_]abi.Array{ o.fo.logits, o.fo.hidden }) |x| if (x.ctx != null) {
@@ -391,13 +395,32 @@ fn openRound(m: *Loaded, f: *const abi.Forward, stochastic: bool) !Opened {
         const dmax: u32 = if (d.max_steps > 0 and d.max_steps < d.cfg.block - 1) d.max_steps else d.cfg.block - 1;
         break :blk @min(f.accept_cap, dmax);
     } else 0;
+    const gumbel: ?kernels.GumbelSpec = if (f.size >= @offsetOf(abi.Forward, "sample_seed") + @sizeOf(u32) and f.sample_inv_temp > 0)
+        .{ .inv_t = f.sample_inv_temp, .seed = f.sample_seed, .q0 = position + 1 }
+    else
+        null;
+    o.gumbel = gumbel;
     var proposed: ops.Array = .{};
     const first = try g.fromSlice(i32, &.{@intCast(t1)}, &.{1});
-    if (cap > 0 and context > 0 and f.cache_ops != null and f.caches.len == 1) {
+    const t_draft0 = nowUs();
+    if (f.tokens.len > 1 and f.cache_ops != null and f.caches.len == 1) {
+        // Caller supplied copy proposals [t1, d0, d1, ...]: skip drafter completely (0 ms draft cost).
+        const n_copy: u32 = @intCast(@min(f.tokens.len - 1, @min(f.accept_cap, abi.max_round_tokens - 1)));
+        if (n_copy > 0) {
+            o.is_copy = true;
+            o.drafts = n_copy;
+            var prop_i32: [abi.max_round_tokens]i32 = undefined;
+            for (0..n_copy) |k| {
+                o.ids[1 + k] = f.tokens.slice()[1 + k];
+                prop_i32[k] = @intCast(o.ids[1 + k]);
+            }
+            proposed = try g.fromSlice(i32, prop_i32[0..n_copy], &.{@intCast(n_copy)});
+        }
+    } else if (cap > 0 and context > 0 and f.cache_ops != null and f.caches.len == 1) {
         const r: run_mod.Run = .{ .mode = .verify, .rows = 1, .positions = &o.position, .caches = f.caches.slice(), .cache_ops = f.cache_ops };
         var c = r.ctx(g, &m.base.shared);
         const anchor = try g.rmsNorm(try b.embed.TableEmbed.forward(&w.embed, &c, try g.reshape(first, &.{ 1, 1 })), w.embed_norm, cfg.rms_norm_eps);
-        const drafted = try m.drafter.?.draft(g, first, anchor, sp.?.ring, @intCast(position), &w.head.lin, w.head.vocab, w.head.softcap, &sp.?.context);
+        const drafted = try m.drafter.?.draftWithGumbel(g, first, anchor, sp.?.ring, @intCast(position), &w.head.lin, w.head.vocab, w.head.softcap, &sp.?.context, gumbel);
         try ops.evalMany(&.{ drafted.tokens, drafted.confidence });
         const sure = mlx.mlx_array_data_float32(drafted.confidence) orelse return error.Inkling2DraftRound;
         const tokens = mlx.mlx_array_data_int32(drafted.tokens) orelse return error.Inkling2DraftRound;
@@ -406,13 +429,16 @@ fn openRound(m: *Loaded, f: *const abi.Forward, stochastic: bool) !Opened {
             m.row_cost.told = true;
             log.info("[inkling2] draft verify cut {d:.2} (a verified row {d:.2} of a plain step)\n", .{ min_sure, ratio });
         };
-        o.drafts = if (std.c.getenv("INKLING_LEGACY_CUT") != null)
+        o.drafts = if (std.c.getenv("INKLING_PIN_DRAFTS")) |pin_raw|
+            @min(cap, std.fmt.parseInt(u32, std.mem.span(pin_raw), 10) catch cap)
+        else if (std.c.getenv("INKLING_LEGACY_CUT") != null)
             draftsToVerify(sure[0..cap], tokens[0..cap], min_sure, f.stop_ids.slice())
         else
-            chooseDrafts(&m.row_cost, sure[0..cap], tokens[0..cap], f.stop_ids.slice(), stochastic);
+            chooseDrafts(&m.row_cost, sure[0..cap], tokens[0..cap], f.stop_ids.slice(), stochastic, gumbel != null);
         for (0..o.drafts) |k| o.ids[1 + k] = @intCast(tokens[k]);
         proposed = try g.sliceAxis(drafted.tokens, 0, 0, @intCast(o.drafts));
     }
+    o.draft_us = nowUs() - t_draft0;
 
     o.started = nowUs();
     if (o.drafts == 0) {
@@ -431,7 +457,7 @@ fn openRound(m: *Loaded, f: *const abi.Forward, stochastic: bool) !Opened {
 
 /// Expected-tokens-per-ms optimal draft count k in 0..sure.len: maximizes expected ms saved relative to serial
 /// plain steps using measured RowCost timings, avoiding unprofitable v1 rounds and capturing high-confidence k=3..7 runs.
-fn chooseDrafts(rc: *const RowCost, sure: []const f32, tokens: []const i32, stops: []const u32, stochastic: bool) u32 {
+fn chooseDrafts(rc: *const RowCost, sure: []const f32, tokens: []const i32, stops: []const u32, stochastic: bool, gumbel: bool) u32 {
     if (sure.len == 0) return 0;
     var limit: usize = sure.len;
     for (tokens[0..sure.len], 0..) |tok, i| {
@@ -440,8 +466,8 @@ fn chooseDrafts(rc: *const RowCost, sure: []const f32, tokens: []const i32, stop
             break;
         }
     }
-    const plain_ms: f32 = if (rc.plain.seen > 0) rc.plain.ms else 24.0;
-    const cal: f32 = if (stochastic) 0.90 else 0.98;
+    const plain_ms: f32 = if (rc.plain.seen > 0) rc.plain.ms else 21.0;
+    const cal: f32 = if (gumbel) 0.95 else if (stochastic) 0.90 else 0.98;
     var best_k: u32 = 0;
     var best_gain: f32 = 0.0;
     var run: f32 = 1.0;
@@ -451,8 +477,9 @@ fn chooseDrafts(rc: *const RowCost, sure: []const f32, tokens: []const i32, stop
         const k: u32 = @intCast(j + 1);
         run *= std.math.clamp(sure[j] * cal, 0.0, 1.0);
         exp_extra += run;
-        const prior: f32 = if (k == 1) plain_ms * 1.75 else prev_v + plain_ms * 0.32;
-        const vk: f32 = if (rc.verify[k].seen > 0) @min(rc.verify[k].ms, prior * 1.35) else prior;
+        // Measured M1 Max v2 dedup + verifyQmm (M<=7) ladder: ~1.75x plain at k=1, +0.27x plain per extra row.
+        const prior: f32 = if (k == 1) plain_ms * 1.75 else prev_v + plain_ms * 0.27;
+        const vk: f32 = if (rc.verify[k].seen >= 2) @min(rc.verify[k].ms, prior * 1.35) else prior;
         prev_v = vk;
         // Net ms saved vs running plain_ms for 1 token (draft_ms is already sunk once draft() ran).
         const gain = (1.0 + exp_extra) * plain_ms - vk;
@@ -499,14 +526,25 @@ fn commitOpen(m: *Loaded, o: *Opened, accepted: u32) !u64 {
 fn round(m: *Loaded, f: *const abi.Forward, out: *abi.ForwardOut) !void {
     var o = try openRound(m, f, false);
     defer o.deinit();
-    const picked = try picks(o.g, .{ .ctx = o.fo.logits.ctx }, f.suppress_mask);
+    const picked = if (o.gumbel) |gs|
+        try kernels.gumbelPicks(o.g, .{ .ctx = o.fo.logits.ctx }, @intCast(1 + o.drafts), f.suppress_mask, gs)
+    else
+        try picks(o.g, .{ .ctx = o.fo.logits.ctx }, f.suppress_mask);
     try ops.eval(picked);
     const want = mlx.mlx_array_data_int32(picked) orelse return error.Inkling2DraftRound;
     const fwd_ms = msSince(o.started);
-    if (o.drafts == 0) m.row_cost.plain.add(fwd_ms) else m.row_cost.verify[o.drafts].add(fwd_ms);
+    if (!o.is_copy) {
+        if (o.drafts == 0) m.row_cost.plain.add(fwd_ms) else m.row_cost.verify[o.drafts].add(fwd_ms);
+    }
     var accepted: u32 = 0;
     while (accepted < o.drafts and want[accepted] == @as(i32, @intCast(o.ids[1 + accepted]))) accepted += 1;
+    const t_com0 = nowUs();
     const position = try commitOpen(m, &o, accepted);
+    if (std.c.getenv("INKLING_PROFILE_DRAFT") != null) {
+        const d_ms = @as(f32, @floatFromInt(o.draft_us)) / 1000.0;
+        const c_ms = @as(f32, @floatFromInt(nowUs() - t_com0)) / 1000.0;
+        log.info("[ink2-prof] rows={d} acc={d} copy={} gumbel={} draft={d:.2}ms ver={d:.2}ms com={d:.2}ms tot={d:.2}ms\n", .{ 1 + o.drafts, accepted, @intFromBool(o.is_copy), @intFromBool(o.gumbel != null), d_ms, fwd_ms, c_ms, d_ms + fwd_ms + c_ms });
+    }
     out.round = .{ .n = 1 + accepted, .accepted = accepted, .next_token = @intCast(want[accepted]), .rows = 1 + o.drafts, .position = position };
     @memcpy(out.round.tokens[0 .. 1 + accepted], o.ids[0 .. 1 + accepted]);
 }
@@ -526,7 +564,9 @@ fn verifyRound(m: *Loaded, f: *const abi.Forward, out: *abi.ForwardOut) !void {
     const n: c_int = @intCast(1 + o.drafts);
     const logits = try o.g.astype(try o.g.reshape(.{ .ctx = o.fo.logits.ctx }, &.{ n, -1 }), .float32);
     try ops.eval(logits);
-    if (o.drafts == 0) m.row_cost.plain.add(msSince(o.started)) else m.row_cost.verify[o.drafts].add(msSince(o.started));
+    if (!o.is_copy) {
+        if (o.drafts == 0) m.row_cost.plain.add(msSince(o.started)) else m.row_cost.verify[o.drafts].add(msSince(o.started));
+    }
     out.logits = .{ .ctx = o.g.escape(logits).ctx };
     out.round = .{ .n = 1 + o.drafts, .rows = 1 + o.drafts, .position = o.position[0] };
     @memcpy(out.round.tokens[0 .. 1 + o.drafts], o.ids[0 .. 1 + o.drafts]);
@@ -935,13 +975,13 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     return m;
 }
 
-/// Whether the bundled drafter loads: default on Apple9+ (gen >= 15) where batched verify outruns serial;
-/// on M1/M2 (gen < 15), our optimized FP16+Q4-attn+barrier-free MoE serial path (45–48.5 tok/s) beats DSpark
-/// across code/English/Greek/xhigh/8K, so M1/M2 defaults to serial unless INKLING_FORCE_DRAFT=1 is set.
+/// Whether the bundled drafter loads: enabled by default on M1+ (gen >= 13 or unknown 0) now that grouped 4-pair
+/// expert dedup + SUB16/SUB8 NVFP4 kernels + verifyQmm M<=7 cap + exact Gumbel-Max coupling + zero-rollback copy
+/// beat or match serial across code, edits, math, Greek, and long context. Pass INKLING_NO_DRAFT=1 for pure serial.
 fn draftsOn(gen: u32, fused: bool) bool {
     if (!fused or std.c.getenv("INKLING_NO_DRAFT") != null) return false;
     if (std.c.getenv("INKLING_FORCE_DRAFT") != null) return true;
-    return gen >= 15;
+    return gen == 0 or gen >= 13;
 }
 
 fn loadLayer(at: At, c: *const config.Config, i: u32) !layers.Layer {
@@ -1138,10 +1178,10 @@ test "inkling2 draft taps: each engine slot keeps its own ring" {
     try std.testing.expectEqual(@as(c_int, 0), sp.rows(12));
 }
 
-// Bar: the drafter loads from an M3 on (and where the generation is unknown), never on an M1 (g13) or M2 (g14).
-test "inkling2: the bundled drafter loads on Apple9 and later only" {
-    for ([_]u32{ 13, 14 }) |g| try std.testing.expect(!draftsOn(g, true));
-    for ([_]u32{ 0, 15, 16, 17 }) |g| try std.testing.expect(draftsOn(g, true));
+// Bar: the drafter loads on M1+ (gen >= 13) and unknown generation (0) when fused kernels are on.
+test "inkling2: the bundled drafter loads on Apple7+ when fused" {
+    for ([_]u32{ 0, 13, 14, 15, 16, 17 }) |g| try std.testing.expect(draftsOn(g, true));
+    try std.testing.expect(!draftsOn(12, true));
     try std.testing.expect(!draftsOn(17, false));
 }
 

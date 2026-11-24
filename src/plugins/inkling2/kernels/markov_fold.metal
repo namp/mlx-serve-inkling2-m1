@@ -37,15 +37,29 @@ if (v0 < VOCAB) {
         }
     }
 }
+const float cap = CAP[0];
+const float inv_t = SAMP ? as_type<float>(SP[0]) : 1.0f;
+const uint gseed = SAMP ? SP[1] : 0u;
+const uint gq0 = SAMP ? SP[2] : 0u;
 float lg[VPT];
 float m = -INFINITY;
 uint mi = NONE;
 for (uint j = 0; j < VPT; j++) {
     const uint v = v0 + j;
-    lg[j] = v < VOCAB ? BASE[at * V + v] + float(T(T(acc[j]) + FB[v])) : -INFINITY;
-    if (v < VOCAB && (mi == NONE || msv_ink2_better(lg[j], v, m, mi))) {
-        m = lg[j];
-        mi = v;
+    if (v < VOCAB) {
+        const float raw = BASE[at * V + v] + float(T(T(acc[j]) + FB[v]));
+        if (SAMP) {
+            const float cl = (cap > 0 ? cap * metal::precise::tanh(raw / cap) : raw) * inv_t;
+            lg[j] = cl + msv_ink2_gumbel(gseed, gq0, v);
+        } else {
+            lg[j] = raw;
+        }
+        if (mi == NONE || msv_ink2_better(lg[j], v, m, mi)) {
+            m = lg[j];
+            mi = v;
+        }
+    } else {
+        lg[j] = -INFINITY;
     }
 }
 for (ushort off = 16; off > 0; off >>= 1) {
@@ -69,11 +83,16 @@ for (uint g = 1; g < TG / 32; g++) {
         at_top = ri[g];
     }
 }
-const float cap = CAP[0];
-const float ctop = cap > 0 ? cap * metal::precise::tanh(top / cap) : top;
+const float ctop = (!SAMP && cap > 0) ? cap * metal::precise::tanh(top / cap) : top;
 float s = 0.0f;
 for (uint j = 0; j < VPT; j++) {
-    if (v0 + j < VOCAB) s += metal::precise::exp((cap > 0 ? cap * metal::precise::tanh(lg[j] / cap) : lg[j]) - ctop);
+    if (v0 + j < VOCAB) {
+        if (SAMP) {
+            s += metal::precise::exp((lg[j] - top) * 1.15f);
+        } else {
+            s += metal::precise::exp((cap > 0 ? cap * metal::precise::tanh(lg[j] / cap) : lg[j]) - ctop);
+        }
+    }
 }
 s = simd_sum(s);
 if (lane == 0) rs[sg] = s;

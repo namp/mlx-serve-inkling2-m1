@@ -117,10 +117,12 @@ pub const Drafter = struct {
         };
         if (use_f16) {
             if (std.c.getenv("INKLING_DRAFT_MAX")) |raw| {
-                const v = std.fmt.parseInt(u32, std.mem.span(raw), 10) catch (cfg.block - 1);
+                const v = std.fmt.parseInt(u32, std.mem.span(raw), 10) catch @min(@as(u32, 6), cfg.block - 1);
                 d.max_steps = @min(v, cfg.block - 1);
             } else {
-                d.max_steps = cfg.block - 1;
+                // On M1/M2 (no NAX tile), verifyQmm serves up to 7 rows cleanly while 8 rows hits the +16 ms simd_qmm cliff;
+                // capping at 6 drafts (7 verify rows) also saves 1 Markov step per round.
+                d.max_steps = @min(@as(u32, 6), cfg.block - 1);
             }
             @import("../../sdk/util/log.zig").info("[inkling2-draft] M1/M2 FP16 drafter loaded: layer_bits={d} max_steps={d} fold_q8={}\n", .{ qbits, d.max_steps, std.c.getenv("INKLING_NO_FOLD_Q8") == null });
         }
@@ -220,6 +222,10 @@ pub const Drafter = struct {
     /// taps at the `n >= 1` positions before `position`, `head` the trunk's LM head, `vocab` its real rows and `softcap` its
 /// logit soft cap. `cache` carries the context's keys and values over the slot's rounds (null: projected afresh).
     pub fn draft(d: *const Drafter, g: *Graph, t1: Array, anchor: Array, taps: Array, position: c_int, head: *const Linear, vocab: c_int, softcap: f32, cache: ?*ContextKv) !Block {
+        return d.draftWithGumbel(g, t1, anchor, taps, position, head, vocab, softcap, cache, null);
+    }
+
+    pub fn draftWithGumbel(d: *const Drafter, g: *Graph, t1: Array, anchor: Array, taps: Array, position: c_int, head: *const Linear, vocab: c_int, softcap: f32, cache: ?*ContextKv, gumbel: ?kernels.GumbelSpec) !Block {
         const cfg = &d.cfg;
         const hidden: c_int = @intCast(d.hidden);
         const block: c_int = @intCast(cfg.block);
@@ -291,13 +297,17 @@ pub const Drafter = struct {
         if (cache) |cc| cc.end = at;
         // The RNN restarts each block from the newest committed position's mix.
         const newest = try d.mix(g, try tapsOf(g, taps, n - 1, n, cfg.tap_count, hidden), @intCast(d.layers.len), d.rnn_norm);
-        return d.markov(g, t1, rows, newest, base, vocab, softcap, kernels.markovRuns(g, d.rnn.w, d.fold, rank));
+        return d.markovWithGumbel(g, t1, rows, newest, base, vocab, softcap, kernels.markovRuns(g, d.rnn.w, d.fold, rank), gumbel);
     }
 
     /// The Markov head's chain over the block rows `rows` `[1, block - 1, hidden]` and their head logits `base` f32,
     /// from the committed token `t1` and the newest mix `newest` `[1, 1, hidden]`: each step's token and probability.
     /// `fused` runs a step as `kernels.markovStep`'s three launches, else as the op chain.
     pub fn markov(d: *const Drafter, g: *Graph, t1: Array, rows: Array, newest: Array, base: Array, vocab: c_int, softcap: f32, fused: bool) !Block {
+        return d.markovWithGumbel(g, t1, rows, newest, base, vocab, softcap, fused, null);
+    }
+
+    pub fn markovWithGumbel(d: *const Drafter, g: *Graph, t1: Array, rows: Array, newest: Array, base: Array, vocab: c_int, softcap: f32, fused: bool, gumbel: ?kernels.GumbelSpec) !Block {
         const rank: c_int = @intCast(d.cfg.rank);
         const steps: usize = @intCast(ops.shape(rows)[1]);
         const dt = ops.dtype(d.norm);
@@ -310,7 +320,8 @@ pub const Drafter = struct {
         for (0..steps) |i| {
             const at: c_int = @intCast(i);
             if (fused) {
-                const st = try kernels.markovStepOpt(g, d.rnn.w, d.rnn_bias, state, d.prev_rows, dense_rows, newest, prev, d.fold, d.fold_scale, d.fold_bias, base, at, vocab, softcap);
+                const step_gumbel: ?kernels.GumbelSpec = if (gumbel) |gs| .{ .inv_t = gs.inv_t, .seed = gs.seed, .q0 = gs.q0 + @as(u32, @intCast(i)) } else null;
+                const st = try kernels.markovStepGumbel(g, d.rnn.w, d.rnn_bias, state, d.prev_rows, dense_rows, newest, prev, d.fold, d.fold_scale, d.fold_bias, base, at, vocab, softcap, step_gumbel);
                 state = st.state;
                 prev = st.token;
                 drafted[i] = st.token;
