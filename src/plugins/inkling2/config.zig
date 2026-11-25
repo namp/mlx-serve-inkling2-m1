@@ -323,7 +323,12 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
     };
 
     var p: abi.Parsed = .{ .caps = .{ .moe = true, .images = c.vision != null, .batches_decode = fusedOn() } };
-    if (c.draft) |d| if (!stub and dir.exists(dir.ctx, abi.Str.of(draft_file))) {
+    if (!stub and (std.c.getenv("INKLING_NO_DFLASH2") == null) and
+        (dir.exists(dir.ctx, abi.Str.of("dflash2/config.json")) or std.c.getenv("INKLING_DFLASH2_DIR") != null))
+    {
+        p.spec.native_stages = 5;
+        p.spec.native_block = 8;
+    } else if (c.draft) |d| if (!stub and dir.exists(dir.ctx, abi.Str.of(draft_file))) {
         p.spec.native_stages = d.layers;
         p.spec.native_block = d.block;
     };

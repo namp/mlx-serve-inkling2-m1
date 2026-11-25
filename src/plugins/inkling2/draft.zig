@@ -42,8 +42,8 @@ pub const Layer = struct {
     down: Linear,
 };
 
-/// The drafter's layers a context cache holds.
-pub const max_layers = 4;
+/// The drafter's layers a context cache holds (3 for bundled MTP, 5 for DFlash 2).
+pub const max_layers = 8;
 
 /// The drafter's context keys and values a layer (`[1, kv_heads, rows, hd]`, normed and rotated at their positions)
 /// for the positions before `end`, kept across one slot's rounds: a round projects only the rows committed since. It

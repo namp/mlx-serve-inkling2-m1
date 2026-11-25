@@ -19,6 +19,7 @@ const kernels = @import("kernels.zig");
 const vision = @import("vision.zig");
 const media = @import("media.zig");
 const draft = @import("draft.zig");
+const dflash2 = @import("dflash2.zig");
 const kv = @import("../../sdk/bases/kv.zig");
 pub const config = @import("config.zig");
 
@@ -269,7 +270,7 @@ fn draftVerify(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
 
 fn draftActive(mp: *anyopaque) callconv(.c) bool {
     const m: *Loaded = @ptrCast(@alignCast(mp));
-    return m.drafter != null;
+    return m.dflash2 != null or m.drafter != null;
 }
 
 fn draftFinish(mp: *anyopaque, accepted: u32, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
@@ -391,7 +392,10 @@ fn openRound(m: *Loaded, f: *const abi.Forward, stochastic: bool) !Opened {
     const sp = w.spec;
     if (sp) |x| if (f.slots.len == 1) x.select(slot_id);
     const context: c_int = if (sp) |x| x.rows(position) else 0;
-    const cap: u32 = if (m.drafter) |d| blk: {
+    const cap: u32 = if (m.dflash2) |df| blk: {
+        const dmax: u32 = if (df.max_steps > 0 and df.max_steps < df.cfg.block - 1) df.max_steps else df.cfg.block - 1;
+        break :blk @min(f.accept_cap, dmax);
+    } else if (m.drafter) |d| blk: {
         const dmax: u32 = if (d.max_steps > 0 and d.max_steps < d.cfg.block - 1) d.max_steps else d.cfg.block - 1;
         break :blk @min(f.accept_cap, dmax);
     } else 0;
@@ -420,23 +424,36 @@ fn openRound(m: *Loaded, f: *const abi.Forward, stochastic: bool) !Opened {
         const r: run_mod.Run = .{ .mode = .verify, .rows = 1, .positions = &o.position, .caches = f.caches.slice(), .cache_ops = f.cache_ops };
         var c = r.ctx(g, &m.base.shared);
         const anchor = try g.rmsNorm(try b.embed.TableEmbed.forward(&w.embed, &c, try g.reshape(first, &.{ 1, 1 })), w.embed_norm, cfg.rms_norm_eps);
-        const drafted = try m.drafter.?.draftWithGumbel(g, first, anchor, sp.?.ring, @intCast(position), &w.head.lin, w.head.vocab, w.head.softcap, &sp.?.context, gumbel);
-        try ops.evalMany(&.{ drafted.tokens, drafted.confidence });
-        const sure = mlx.mlx_array_data_float32(drafted.confidence) orelse return error.Inkling2DraftRound;
-        const tokens = mlx.mlx_array_data_int32(drafted.tokens) orelse return error.Inkling2DraftRound;
         const min_sure = m.row_cost.cut();
         if (!m.row_cost.told) if (m.row_cost.ratio()) |ratio| {
             m.row_cost.told = true;
             log.info("[inkling2] draft verify cut {d:.2} (a verified row {d:.2} of a plain step)\n", .{ min_sure, ratio });
         };
-        o.drafts = if (std.c.getenv("INKLING_PIN_DRAFTS")) |pin_raw|
-            @min(cap, std.fmt.parseInt(u32, std.mem.span(pin_raw), 10) catch cap)
-        else if (std.c.getenv("INKLING_LEGACY_CUT") != null)
-            draftsToVerify(sure[0..cap], tokens[0..cap], min_sure, f.stop_ids.slice())
-        else
-            chooseDrafts(&m.row_cost, sure[0..cap], tokens[0..cap], f.stop_ids.slice(), stochastic, gumbel != null);
-        for (0..o.drafts) |k| o.ids[1 + k] = @intCast(tokens[k]);
-        proposed = try g.sliceAxis(drafted.tokens, 0, 0, @intCast(o.drafts));
+        if (m.dflash2) |df| {
+            const dr = try df.draftWithGumbel(g, first, anchor, sp.?.ring, @intCast(position), &w.head.lin, w.head.vocab, &sp.?.context, gumbel);
+            const avail: usize = @min(cap, dr.len);
+            o.drafts = if (std.c.getenv("INKLING_PIN_DRAFTS")) |pin_raw|
+                @min(@as(u32, @intCast(avail)), std.fmt.parseInt(u32, std.mem.span(pin_raw), 10) catch @as(u32, @intCast(avail)))
+            else if (std.c.getenv("INKLING_LEGACY_CUT") != null)
+                draftsToVerify(dr.confidence[0..avail], dr.tokens[0..avail], min_sure, f.stop_ids.slice())
+            else
+                chooseDrafts(&m.row_cost, dr.confidence[0..avail], dr.tokens[0..avail], f.stop_ids.slice(), stochastic, gumbel != null);
+            for (0..o.drafts) |k| o.ids[1 + k] = @intCast(dr.tokens[k]);
+            if (o.drafts > 0) proposed = try g.fromSlice(i32, dr.tokens[0..o.drafts], &.{@intCast(o.drafts)});
+        } else {
+            const drafted = try m.drafter.?.draftWithGumbel(g, first, anchor, sp.?.ring, @intCast(position), &w.head.lin, w.head.vocab, w.head.softcap, &sp.?.context, gumbel);
+            try ops.evalMany(&.{ drafted.tokens, drafted.confidence });
+            const sure = mlx.mlx_array_data_float32(drafted.confidence) orelse return error.Inkling2DraftRound;
+            const tokens = mlx.mlx_array_data_int32(drafted.tokens) orelse return error.Inkling2DraftRound;
+            o.drafts = if (std.c.getenv("INKLING_PIN_DRAFTS")) |pin_raw|
+                @min(cap, std.fmt.parseInt(u32, std.mem.span(pin_raw), 10) catch cap)
+            else if (std.c.getenv("INKLING_LEGACY_CUT") != null)
+                draftsToVerify(sure[0..cap], tokens[0..cap], min_sure, f.stop_ids.slice())
+            else
+                chooseDrafts(&m.row_cost, sure[0..cap], tokens[0..cap], f.stop_ids.slice(), stochastic, gumbel != null);
+            for (0..o.drafts) |k| o.ids[1 + k] = @intCast(tokens[k]);
+            proposed = try g.sliceAxis(drafted.tokens, 0, 0, @intCast(o.drafts));
+        }
     }
     o.draft_us = nowUs() - t_draft0;
 
@@ -603,8 +620,9 @@ pub const Loaded = struct {
     owned: loader.Owned = .{},
     /// The image tower and merger; null on a pack shipped without them.
     tower: ?vision.Tower = null,
-    /// The bundled drafter and the taps it reads; null on a pack shipped without one.
+    /// The bundled drafter (mtp.safetensors) and optional DFlash 2 drafter (`dflash2/` or INKLING_DFLASH2_DIR).
     drafter: ?*draft.Drafter = null,
+    dflash2: ?*dflash2.Drafter = null,
     /// The cost a verified row adds here, which sets how sure a draft must be to be verified.
     row_cost: RowCost = .{},
     /// A sampled round's verify, open until its finish.
@@ -618,6 +636,7 @@ pub const Loaded = struct {
             o.deinit();
             gpa.destroy(o);
         }
+        if (m.dflash2) |df| df.deinit();
         if (m.drafter) |d| d.deinit();
         m.spec.deinit();
         m.owned.release();
@@ -963,12 +982,19 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
         },
     };
     if (c.vision) |v| m.tower = try vision.Tower.load(ctx, v, c.block_json);
-    if (c.draft) |dc| if (draftsOn(device.deviceGeneration().gen, config.fusedOn())) if (try draft.Drafter.loadOpt(ctx, dc, c.hidden_size, &head, r.s, use_f16)) |d| {
-        m.drafter = d;
-        m.tap_visits = dc.taps;
-        m.spec = .{ .visits = m.tap_visits[0 .. dc.tap_count - 1], .keep = @intCast(dc.window - 1) };
-        m.base.weights.spec = &m.spec;
-    };
+    if (draftsOn(device.deviceGeneration().gen, config.fusedOn())) {
+        if (try dflash2.Drafter.loadOpt(ctx.model_dir.slice(), c.hidden_size, c.visits(), c.rms_norm_eps, &m.base.weights.embed, m.base.weights.embed_norm, r.s, use_f16)) |df| {
+            m.dflash2 = df;
+            m.tap_visits = df.cfg.taps;
+            m.spec = .{ .visits = m.tap_visits[0 .. df.cfg.tap_count - 1], .keep = @intCast(df.cfg.window - df.cfg.block) };
+            m.base.weights.spec = &m.spec;
+        } else if (c.draft) |dc| if (try draft.Drafter.loadOpt(ctx, dc, c.hidden_size, &head, r.s, use_f16)) |d| {
+            m.drafter = d;
+            m.tap_visits = dc.taps;
+            m.spec = .{ .visits = m.tap_visits[0 .. dc.tap_count - 1], .keep = @intCast(dc.window - 1) };
+            m.base.weights.spec = &m.spec;
+        };
+    }
     // The parse's quant block is freed with it; the forward reads none of it.
     m.base.weights.body.cfg.block_json = "{}";
 
@@ -1144,6 +1170,7 @@ test {
     _ = vision;
     _ = media;
     _ = draft;
+    _ = dflash2;
 }
 
 // Bar: two slots that take turns each keep the taps of their own sequence; with every place taken a new slot
