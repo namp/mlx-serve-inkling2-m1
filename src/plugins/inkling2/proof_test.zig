@@ -2809,3 +2809,237 @@ test "inkling2 load: decode steps lift the command-buffer MB split, prompts and 
     try testing.expectEqual(@as(i32, 77), Limits.mb_split);
     try testing.expectEqual(@as(i32, 50), Limits.op_split);
 }
+
+// Bar: native FP16 NVFP4 prefill expert GEMM matches BF16 gather_qmm + f32 global_scale on skewed routing (including
+// zero-count experts and multi-tile experts) with large unscaled magnitudes that would overflow FP16 without inline SC.
+test "inkling2 kernels: nvfp4PrefillMm matches gather_qmm on skewed FP16 NVFP4 prefill without overflow" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const prev_stream = fx_stream;
+    fx_stream = s;
+    defer fx_stream = prev_stream;
+    var g = ops.Graph.init(a, s);
+    defer g.deinit();
+
+    const E: c_int = 16;
+    const K: c_int = 128;
+    const S: c_int = 96;
+    const top_k: c_int = 4;
+    const N_PAIRS: c_int = S * top_k;
+
+    for ([_]c_int{ 192, 96 }) |N| {
+        // Large raw weights scaled down by SC = 1 / 2688 so raw NVFP4 matmul exceeds FP16 max (> 65504) if unscaled.
+        const w_f32 = try randomRow(&g, a, 9001 + @as(u64, @intCast(N)), &.{ E, N, K }, 40.0, .float32);
+        var pair = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(pair);
+        try mlx.check(mlx.mlx_quantize(&pair, w_f32, mlx.mlx_optional_int.some(16), mlx.mlx_optional_int.some(4), "nvfp4", .{}, s));
+        var wq = mlx.mlx_array_new();
+        var ws = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(&wq, pair, 0));
+        try mlx.check(mlx.mlx_vector_array_get(&ws, pair, 1));
+        const bank = @import("../../sdk/bases/blocks/moe.zig").Bank{
+            .w = try g.adopt(wq),
+            .s = try g.adopt(ws),
+            .qp = .{ .bits = 4, .group_size = 16, .mode = .nvfp4 },
+        };
+        var sc_vals: [16]f32 = undefined;
+        for (&sc_vals, 0..) |*v, i| v.* = (0.5 + 0.05 * @as(f32, @floatFromInt(i))) / 2688.0;
+        const sc = try g.fromSlice(f32, &sc_vals, &.{E});
+
+        const x_f16 = try randomRow(&g, a, 9101 + @as(u64, @intCast(N)), &.{ S, K }, 3.0, .float16);
+        var sel_buf: [S * top_k]u32 = undefined;
+        for (0..@as(usize, @intCast(S))) |tok| {
+            // Skewed routing: expert 0 gets heavy traffic (>32 pairs = multiple BM=16 tiles), experts 14..15 get 0 pairs.
+            sel_buf[tok * 4 + 0] = if (tok % 2 == 0) 0 else @intCast((tok % 12) + 1);
+            sel_buf[tok * 4 + 1] = @intCast((tok * 3 + 1) % 13);
+            sel_buf[tok * 4 + 2] = @intCast((tok * 5 + 2) % 14);
+            sel_buf[tok * 4 + 3] = if (tok % 3 == 0) 1 else @intCast((tok * 7 + 3) % 14);
+        }
+        const sel = try g.fromSlice(u32, &sel_buf, &.{N_PAIRS});
+        const plan = try kernels.nvfp4PrefillPlan(&g, sel, @intCast(E));
+        const got = try kernels.nvfp4PrefillMm(&g, x_f16, &bank, sc, null, plan, @intCast(E), top_k, N_PAIRS);
+
+        // Reference: BF16 gather_qmm + f32 per-expert global_scale, cast to f32.
+        const x_rep = try g.reshape(try g.repeat(try g.reshape(x_f16, &.{ S, 1, K }), top_k, 1), &.{ N_PAIRS, 1, K });
+        const ref_raw = try layers.gather(&g, x_rep, &bank, sel, false);
+        const ref = try g.mul(try g.astype(ref_raw, .float32), try g.reshape(try g.take(sc, sel, 0), &.{ N_PAIRS, 1, 1 }));
+        try expectClose(try g.astype(got, .float32), ref, 2e-2, "nvfp4_prefill vs gather_qmm");
+
+        // Also test fused SWIGLU=1 epilogue against separate activationOut(ref_raw, sc).
+        const caps = try g.fromSlice(f32, &.{ 1.0 / 4.0, 4.0, 1.0 / 25.0, 25.0 }, &.{4});
+        const got_act = try kernels.nvfp4PrefillMm(&g, x_f16, &bank, sc, caps, plan, @intCast(E), top_k, N_PAIRS);
+        const ref_act = try kernels.activationOut(&g, ref_raw, sel, sc, caps, true, .float16);
+        try expectClose(try g.astype(got_act, .float32), try g.astype(ref_act, .float32), 2e-2, "nvfp4_prefill fused swiglu");
+    }
+}
+
+// Bar: LoopCD guidance matches the paper/oMLX reference vectors (including tie margin, clear winner, thinking-skip
+// exact passthrough, and control-token probability preservation) and thinking-state tracker matches GPU vs CPU on
+// both long linear sequences and branching speculative trees.
+test "inkling2 kernels: loopcdGuide and loopcdThinking match reference math, control prob preservation, and tree scans" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const prev_stream = fx_stream;
+    fx_stream = s;
+    defer fx_stream = prev_stream;
+    var g = ops.Graph.init(a, s);
+    defer g.deinit();
+
+    // 1. Tie vs clear-winner margin (exact oMLX PR #5640 test values).
+    const final_v = try g.fromSlice(f32, &.{ 3.0, 3.0, 0.0, 4.0, 1.0, 0.0 }, &.{ 2, 3 });
+    const first_v = try g.fromSlice(f32, &.{ 1.0, 2.0, 0.0, 2.0, 2.0, 0.0 }, &.{ 2, 3 });
+    const want_v = try g.fromSlice(f32, &.{ 4.0, 3.5, 0.0, 4.1104, 0.9448, 0.0 }, &.{ 2, 3 });
+    const gpu_g = try kernels.loopcdGuide(&g, final_v, first_v, null, 0.5, 199_998);
+    const cpu_g = try layers.loopcdGuide(&g, final_v, first_v, null, 0.5, 199_998);
+    try expectClose(gpu_g, want_v, 1e-3, "loopcd_guide margin");
+    try expectClose(gpu_g, cpu_g, 1e-5, "loopcd_guide GPU vs op-chain");
+
+    // 2. Exclude Thinking Blocks: thinking=1 passes final through bit-exact; thinking=0 preserves control token probs.
+    const f_ctrl = try g.fromSlice(f32, &.{ 3.0, 2.0, 2.5, 3.0, 2.0, 2.5 }, &.{ 2, 3 });
+    const r_ctrl = try g.fromSlice(f32, &.{ 0.0, 2.0, 1.0, 0.0, 2.0, 1.0 }, &.{ 2, 3 });
+    const th_flags = try g.fromSlice(f32, &.{ 0.0, 1.0 }, &.{2});
+    const g_ctrl = try kernels.loopcdGuide(&g, f_ctrl, r_ctrl, th_flags, 0.5, 2);
+    const c_ctrl = try layers.loopcdGuide(&g, f_ctrl, r_ctrl, th_flags, 0.5, 2);
+    try expectClose(g_ctrl, c_ctrl, 1e-5, "loopcd_guide skip_thinking GPU vs op-chain");
+    const p_guided = try g.softmax(g_ctrl, -1, true);
+    const p_base = try g.softmax(f_ctrl, -1, true);
+    try ops.evalMany(&.{ g_ctrl, p_guided, p_base });
+    const gd = mlx.mlx_array_data_float32(g_ctrl).?;
+    const pg = mlx.mlx_array_data_float32(p_guided).?;
+    const pb = mlx.mlx_array_data_float32(p_base).?;
+    // Row 0 (not thinking): control token index 2 keeps identical softmax probability, token 0 boosted.
+    try testing.expectApproxEqAbs(pb[2], pg[2], 1e-4);
+    try testing.expect(pg[0] > pb[0] + 0.05);
+    // Row 1 (thinking): exact unguided passthrough.
+    try testing.expectEqual(@as(f32, 3.0), gd[3]);
+    try testing.expectEqual(@as(f32, 2.0), gd[4]);
+    try testing.expectEqual(@as(f32, 2.5), gd[5]);
+
+    // 3. Linear sequence thinking tracker (S = 300 > 256 threads) GPU vs CPU.
+    var seq_ids: [2 * 300]i32 = undefined;
+    for (&seq_ids, 0..) |*x, i| x.* = @intCast((i * 13 + 7) % 200);
+    seq_ids[20] = 291; // open thinking in slot 0
+    seq_ids[25] = 299; // close thinking in slot 0
+    seq_ids[270] = 291; // re-open late in slot 0 (second chunk)
+    seq_ids[300 + 10] = 299; // close thinking in slot 1 (starts thinking=1)
+    const ids_lin = try g.fromSlice(i32, &seq_ids, &.{ 2, 300 });
+    const bef_lin = try g.fromSlice(f32, &.{ 0.0, 1.0 }, &.{ 2, 1 });
+    const t_gpu = try kernels.loopcdThinking(&g, ids_lin, bef_lin, null, 290, 291);
+    const t_cpu = try layers.loopcdThinking(&g, ids_lin, bef_lin, null, 290, 291);
+    try expectClose(t_gpu, t_cpu, 0.0, "loopcd_thinking linear GPU vs CPU");
+
+    // 4. Tree verify thinking tracker (W = 8, branching sibling enters thinking while other stays outside).
+    const tree_ids = try g.fromSlice(i32, &.{ 10, 291, 20, 30, 299, 40, 291, 50 }, &.{ 1, 8 });
+    const tree_par = try g.fromSlice(i32, &.{ -1, 0, 1, 0, 2, 4, 3, 6 }, &.{ 1, 8 });
+    const bef_tree = try g.fromSlice(f32, &.{0.0}, &.{ 1, 1 });
+    const tt_gpu = try kernels.loopcdThinking(&g, tree_ids, bef_tree, tree_par, 290, 291);
+    const tt_cpu = try layers.loopcdThinking(&g, tree_ids, bef_tree, tree_par, 290, 291);
+    try expectClose(tt_gpu, tt_cpu, 0.0, "loopcd_thinking tree GPU vs CPU");
+    try ops.eval(tt_gpu);
+    const td = mlx.mlx_array_data_float32(tt_gpu).?;
+    // Expected: r0=0, r1(291)=1, r2(p=1)=1, r3(p=0)=0, r4(299,p=2)=0, r5(p=4)=0, r6(291,p=3)=1, r7(p=6)=1
+    try testing.expectEqualSlices(f32, &.{ 0, 1, 1, 0, 0, 0, 1, 1 }, td[0..8]);
+}
+
+// Bar: LoopCD on the looped fixture allocates totalVisits = visits + codaVisits, matches the exact contrast of 3-pass
+// vs 1-pass models on identical weights, and stays consistent across chunked prefill and token-by-token decode.
+test "inkling2 proof: LoopCD matches 3-pass vs 1-pass contrast and stays consistent across chunks and decode" {
+    const a = testing.allocator;
+    const env = @import("../../env.zig");
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ar = arena.allocator();
+    const fx = try plugin.conformanceFixture(ar);
+
+    // Reference: 3-pass unguided AND 1-pass (same weights, num_passes=1) on CPU.
+    var fx_1pass = fx;
+    const files_1 = try ar.dupe(fixture.File, fx.files);
+    for (files_1) |*f| if (std.mem.eql(u8, f.name, "config.json")) {
+        f.bytes = try std.mem.replaceOwned(u8, ar, f.bytes, "\"num_passes\":3", "\"num_passes\":1");
+    };
+    fx_1pass.files = files_1;
+
+    var p3 = try conformance.Loaded.openWith(testing.io, ar, plugin.plugin.name, &plugin.table, fx, .{ .gpu = false });
+    defer p3.close();
+    var p1 = try conformance.Loaded.openWith(testing.io, ar, plugin.plugin.name, &plugin.table, fx_1pass, .{ .gpu = false });
+    defer p1.close();
+    var c3 = try test_cache.TestCache.init(a, p3.parsed.shell.num_hidden_layers);
+    defer c3.deinit();
+    var c1 = try test_cache.TestCache.init(a, p1.parsed.shell.num_hidden_layers);
+    defer c1.deinit();
+    const out3 = try step(a, &p3, &c3, &prompt, 0, .all_rows);
+    defer a.free(out3);
+    const out1 = try step(a, &p1, &c1, &prompt, 0, .all_rows);
+    defer a.free(out1);
+
+    // Compute expected LoopCD logits from out3 and out1 via layers.loopcdGuide.
+    const cpu_s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu_s);
+    var g = ops.Graph.init(a, cpu_s);
+    defer g.deinit();
+    const want_arr = try layers.loopcdGuide(
+        &g,
+        try g.fromSlice(f32, out3, &.{ @intCast(prompt.len), VOCAB }),
+        try g.fromSlice(f32, out1, &.{ @intCast(prompt.len), VOCAB }),
+        null,
+        kernels.loopcd_max_strength,
+        kernels.loopcd_first_control,
+    );
+    try ops.eval(want_arr);
+    const want = mlx.mlx_array_data_float32(want_arr).?[0 .. prompt.len * VOCAB];
+
+    // Now open with LoopCD enabled: totalVisits = 16 + 2 = 18.
+    const ov_cd = env.override(.MLX_SERVE_INKLING2_LOOPCD, "1");
+    defer ov_cd.restore();
+    const ov_sk = env.override(.MLX_SERVE_INKLING2_LOOPCD_SKIP_THINKING, null);
+    defer ov_sk.restore();
+
+    var pcd = try conformance.Loaded.openWith(testing.io, ar, plugin.plugin.name, &plugin.table, fx, .{ .gpu = false });
+    defer pcd.close();
+    try testing.expectEqual(@as(u32, 18), pcd.parsed.shell.num_hidden_layers);
+    try testing.expectEqual(@as(u32, 18), pcd.parsed.cache.ssm_state.entries);
+
+    // Whole forward matches exact 3-pass vs 1-pass contrast!
+    var c_whole = try test_cache.TestCache.init(a, pcd.parsed.shell.num_hidden_layers);
+    defer c_whole.deinit();
+    const got_whole = try step(a, &pcd, &c_whole, &prompt, 0, .all_rows);
+    defer a.free(got_whole);
+    for (want, got_whole) |w_v, g_v| try testing.expectApproxEqAbs(w_v, g_v, 1e-4);
+
+    // Chunked prefill + token-by-token decode matches whole forward!
+    var c_inc = try test_cache.TestCache.init(a, pcd.parsed.shell.num_hidden_layers);
+    defer c_inc.deinit();
+    var at: usize = 0;
+    for ([_]usize{ 5, 7 }) |n| {
+        const rows = try step(a, &pcd, &c_inc, prompt[at .. at + n], at, .all_rows);
+        defer a.free(rows);
+        try expectRows(rows, got_whole[at * VOCAB .. (at + n) * VOCAB]);
+        at += n;
+    }
+    while (at < prompt.len) : (at += 1) {
+        const row = try step(a, &pcd, &c_inc, prompt[at .. at + 1], at, .last_row);
+        defer a.free(row);
+        try expectRows(row, got_whole[at * VOCAB .. (at + 1) * VOCAB]);
+    }
+
+    // Also verify GPU forward + skip_thinking runs cleanly end-to-end when Metal is available.
+    if (!mlx.noGpuBackend() and !mlx.virtualGpu() and mlx.metalKernelsAvailable()) {
+        const ov_sk2 = env.override(.MLX_SERVE_INKLING2_LOOPCD_SKIP_THINKING, "1");
+        defer ov_sk2.restore();
+        var pgpu = try conformance.Loaded.openWith(testing.io, ar, plugin.plugin.name, &plugin.table, fx, .{ .gpu = true });
+        defer pgpu.close();
+        var cg = try test_cache.TestCache.init(a, pgpu.parsed.shell.num_hidden_layers);
+        defer cg.deinit();
+        const r1 = try step(a, &pgpu, &cg, prompt[0..12], 0, .last_row);
+        defer a.free(r1);
+        const r2 = try step(a, &pgpu, &cg, prompt[12..13], 12, .last_row);
+        defer a.free(r2);
+        try testing.expectEqual(@as(usize, VOCAB), r1.len);
+        try testing.expectEqual(@as(usize, VOCAB), r2.len);
+        for (r2) |v| try testing.expect(std.math.isFinite(v));
+    }
+}

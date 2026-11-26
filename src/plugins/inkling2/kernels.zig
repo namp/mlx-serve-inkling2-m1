@@ -5,6 +5,8 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
+const device = @import("../../mlx/device.zig");
+const env = @import("../../env.zig");
 const ops = @import("../../mlx/ops.zig");
 const kernelSource = @import("../../mlx/kernels.zig").source;
 const block = @import("../../sdk/bases/block.zig");
@@ -60,6 +62,10 @@ pub var downs_kernel: Kernel = .{ .name = "msv_inkling2_downs", .ins = &.{ "ACT"
 pub var group_kernel: Kernel = .{ .name = "msv_inkling2_group", .ins = &.{"IDX"}, .outs = &.{ "TEXP", "TCNT", "TPICK" }, .source = kernelSource("plugins/inkling2/kernels/group.metal") };
 pub var ups_grp_kernel: Kernel = .{ .name = "msv_inkling2_ups_grp", .ins = &.{ "X", "WQ", "WS", "WB", "TEXP", "TCNT", "TPICK", "SC", "PR" }, .outs = &.{"ACT"}, .source = kernelSource("plugins/inkling2/kernels/ups_grp.metal"), .header = bank_header };
 pub var downs_grp_kernel: Kernel = .{ .name = "msv_inkling2_downs_grp", .ins = &.{ "ACT", "WQ", "WS", "WB", "TEXP", "TCNT", "TPICK", "SC" }, .outs = &.{"DN"}, .source = kernelSource("plugins/inkling2/kernels/downs_grp.metal"), .header = bank_header };
+pub var nvfp4_plan_kernel: Kernel = .{ .name = "msv_inkling2_nvfp4_plan", .ins = &.{"SEL"}, .outs = &.{ "ORDER", "SEG_START", "ITEM_START" }, .source = kernelSource("plugins/inkling2/kernels/nvfp4_plan.metal") };
+pub var nvfp4_prefill_kernel: Kernel = .{ .name = "msv_inkling2_nvfp4_prefill", .ins = &.{ "X", "WQ", "WS", "SC", "PR", "ORDER", "SEG_START", "ITEM_START" }, .outs = &.{"OUT"}, .source = kernelSource("plugins/inkling2/kernels/nvfp4_prefill.metal"), .header = bank_header };
+pub var loopcd_thinking_kernel: Kernel = .{ .name = "msv_inkling2_loopcd_thinking", .ins = &.{ "IDS", "BEFORE", "PARENT", "PR" }, .outs = &.{"OUT"}, .source = kernelSource("plugins/inkling2/kernels/loopcd_thinking.metal") };
+pub var loopcd_guide_kernel: Kernel = .{ .name = "msv_inkling2_loopcd_guide", .ins = &.{ "FINAL", "REF", "THINK", "PR", "CTRL" }, .outs = &.{"OUT"}, .source = kernelSource("plugins/inkling2/kernels/loopcd_guide.metal") };
 pub var qkv_ink2_kernel: Kernel = .{ .name = "msv_inkling2_qkv", .ins = &.{ "q", "kq", "ksc", "kbi", "vq", "vsc", "vbi", "scl", "tk", "bias" }, .outs = &.{ "m_out", "l_out", "o_out" }, .source = kernelSource("plugins/inkling2/kernels/qkv_ink2.metal"), .contiguous = false };
 pub var qkv_ink2_merge_kernel: Kernel = .{ .name = "msv_inkling2_qkv_merge", .ins = &.{ "m_in", "l_in", "o_in", "sinks" }, .outs = &.{"out"}, .source = kernelSource("plugins/inkling2/kernels/qkv_ink2_merge.metal") };
 pub var qkv_ink2_verify_kernel: Kernel = .{ .name = "msv_inkling2_qkv_verify", .ins = &.{ "q", "kq", "ksc", "kbi", "vq", "vsc", "vbi", "k_new", "v_new", "params", "sizes", "rel", "tmeta" }, .outs = &.{ "m_out", "l_out", "o_out" }, .source = kernelSource("plugins/inkling2/kernels/qkv_ink2_verify.metal"), .contiguous = false };
@@ -1471,6 +1477,109 @@ pub fn groupPicks(g: *Graph, sel: Array, num_experts: u32) ![3]Array {
     }, tg, tg, &.{ .{ "E", .{ .int = e } }, .{ "N", .{ .int = n } }, .{ "TG", .{ .int = tg } } });
 }
 
+/// `nvfp4_plan.metal`: GPU worklist for BM=16 expert-grouped NVFP4 prefill GEMM over unsorted `sel` `[N]` u32.
+/// Returns `{ order [N], seg_start [E + 1], item_start [E + 1] }` u32, shared by `gate_up` and `down`.
+pub fn nvfp4PrefillPlan(g: *Graph, sel: Array, num_experts: u32) ![3]Array {
+    const n = ops.shape(sel)[0];
+    const e: c_int = @intCast(num_experts);
+    return launch(g, &nvfp4_plan_kernel, &.{sel}, 3, .{
+        .{ .shape = &.{n}, .dtype = .uint32 },
+        .{ .shape = &.{e + 1}, .dtype = .uint32 },
+        .{ .shape = &.{e + 1}, .dtype = .uint32 },
+    }, 256, 256, &.{ .{ "NE", .{ .int = e } }, .{ "BM", .{ .int = 16 } } });
+}
+
+/// `nvfp4_prefill.metal`: native FP16 NVFP4 expert-grouped `simdgroup_half8x8` GEMM for non-NAX GPUs.
+/// Reads `x` `[rows_x, K]` (T) via `plan` (`x_div = top_k` for `gate_up`, `1` for `down`), applies per-expert `scale`
+/// in f32 before narrowing to T (zero FP16 overflow), and writes directly at unsorted pair slots.
+/// When `caps` is non-null, fuses soft-capped SwiGLU from each lane's even/odd (gate, up) register pair and outputs
+/// `[n_pairs, 1, N / 2]` directly (eliminating the intermediate gate_up tensor and `act_kernel` launch).
+pub fn nvfp4PrefillMm(g: *Graph, x: Array, bank: anytype, scale: Array, caps: ?Array, plan: [3]Array, num_experts: u32, x_div: c_int, n_pairs: c_int) !Array {
+    const dt = ops.dtype(x);
+    const k_size = ops.shape(x)[1];
+    const n_size = ops.shape(bank.w)[1];
+    const e: c_int = @intCast(num_experts);
+    const scaled = scale.ctx != null;
+    const swiglu = caps != null;
+    const out_n = if (swiglu) @divExact(n_size, 2) else n_size;
+    const sc = if (scaled) scale else x;
+    const pr = caps orelse sc;
+    const gy = @divTrunc(n_size + 63, 64);
+    const max_tiles = @min(n_pairs, @divTrunc(n_pairs, 16) + e);
+    const o = try launchGrid(
+        g,
+        &nvfp4_prefill_kernel,
+        &.{ x, bank.w, bank.s, sc, pr, plan[0], plan[1], plan[2] },
+        1,
+        .{.{ .shape = &.{ n_pairs, 1, out_n }, .dtype = dt }},
+        .{ 128, max_tiles, gy },
+        .{ 128, 1, 1 },
+        &.{
+            .{ "T", .{ .dtype = dt } },
+            .{ "K_SIZE", .{ .int = k_size } },
+            .{ "N_SIZE", .{ .int = n_size } },
+            .{ "NE", .{ .int = e } },
+            .{ "XDIV", .{ .int = x_div } },
+            .{ "SCALED", .{ .int = @intFromBool(scaled) } },
+            .{ "SWIGLU", .{ .int = @intFromBool(swiglu) } },
+        },
+    );
+    return o[0];
+}
+
+/// LoopCD hyperparameters matching arXiv:2610.02185 & oMLX PR #5640 for Inkling 2 Mini.
+pub const loopcd_max_strength: f32 = 0.5;
+pub const loopcd_first_control: i32 = 199_998;
+pub const loopcd_thinking_token: i32 = 200_008;
+
+/// Tracks thinking-block state `[B, S]` f32 (0/1) for LoopCD Exclude Thinking Blocks (GPU kernel or CPU fallback).
+pub fn loopcdThinking(g: *Graph, ids: Array, before: Array, parent: ?Array, first_ctrl: i32, think_tok: i32) !Array {
+    if (!mlx.streamIsGpu(g.s) or !enabled()) return layers.loopcdThinking(g, ids, before, parent, first_ctrl, think_tok);
+    const sh = ops.shape(ids);
+    const b = sh[0];
+    const s = sh[1];
+    const is_tree = parent != null;
+    const par = parent orelse ids;
+    const pr = try g.fromSlice(i32, &.{ first_ctrl, think_tok }, &.{2});
+    const tg: c_int = if (is_tree) 1 else 256;
+    const o = try launchGrid(
+        g,
+        &loopcd_thinking_kernel,
+        &.{ try g.contiguous(try g.astype(ids, .int32)), try g.contiguous(try g.astype(before, .float32)), try g.contiguous(try g.astype(par, .int32)), pr },
+        1,
+        .{.{ .shape = &.{ b, s }, .dtype = .float32 }},
+        .{ tg, b, 1 },
+        .{ tg, 1, 1 },
+        &.{.{ "TREE", .{ .int = @intFromBool(is_tree) } }},
+    );
+    return o[0];
+}
+
+/// Fused LoopCD-Logits contrastive guidance `[N, V]` f32 over soft-capped `final` and 1-pass `ref` logits.
+pub fn loopcdGuide(g: *Graph, final: Array, ref: Array, thinking: ?Array, max_strength: f32, first_ctrl: i32) !Array {
+    if (!mlx.streamIsGpu(g.s) or !enabled()) return layers.loopcdGuide(g, final, ref, thinking, max_strength, first_ctrl);
+    const f = try g.contiguous(try g.astype(final, .float32));
+    const r = try g.contiguous(try g.astype(ref, .float32));
+    const sh = ops.shape(f);
+    const n = sh[0];
+    const v = sh[1];
+    const skip = thinking != null;
+    const th = if (thinking) |t| try g.contiguous(try g.reshape(try g.astype(t, .float32), &.{n})) else try g.zeros(&.{1}, .float32);
+    const pr = try g.fromSlice(f32, &.{max_strength}, &.{1});
+    const ctrl = try g.fromSlice(i32, &.{first_ctrl}, &.{1});
+    const o = try launchGrid(
+        g,
+        &loopcd_guide_kernel,
+        &.{ f, r, th, pr, ctrl },
+        1,
+        .{.{ .shape = &.{ n, v }, .dtype = .float32 }},
+        .{ 256, n, 1 },
+        .{ 256, 1, 1 },
+        &.{.{ "SKIP_THINK", .{ .int = @intFromBool(skip) } }},
+    );
+    return o[0];
+}
+
 /// What a packed gate_up launch reads its picks from: the router's logits `[S, E]` f32, ranked inside the launch as
 /// `topK` ranks them (one row), or the picks `[S * k]` u32 a `topK` launch left (more rows).
 pub const UpsRoute = union(enum) { scores: Array, picks: Array };
@@ -1595,6 +1704,27 @@ fn expertsWith(g: *Graph, L: *const Layer, cfg: *const Config, c_caps: Array, c_
             return .{ .h = ft[0], .state = st };
         }
         return .{ .h = ft[0], .state = try convState(g, st, kp, vp, m.op, ft[1]) };
+    }
+
+    const use_nvfp4_prefill = s > packed_rows and dt == .float16 and gu_fmt == 0 and dn_fmt == 0 and
+        !device.naxAvailable() and cfg.num_experts <= 512 and @rem(hidden, 32) == 0 and @rem(inter, 32) == 0 and
+        @as(i64, s) * hidden * 2 >= 4096 and @as(i64, n) * inter * 2 >= 4096 and
+        env.notOff(.MLX_SERVE_INKLING2_PREFILL_FP4);
+    if (use_nvfp4_prefill) {
+        const flat_sel = try g.reshape(picks[0], &.{n});
+        const plan = try nvfp4PrefillPlan(g, flat_sel, cfg.num_experts);
+        const act_p = try nvfp4PrefillMm(g, try g.reshape(m.x, &.{ s, hidden }), &L.gate_up, L.gate_up_scale, caps, plan, cfg.num_experts, top_k, n);
+        const dn = try nvfp4PrefillMm(g, try g.reshape(act_p, &.{ n, inter }), &L.down, L.down_scale, null, plan, cfg.num_experts, 1, n);
+        const inverse = try g.arange(0, @floatFromInt(n), 1, .uint32);
+        const tree_parent: ?Array = if (open) |v| (if (v.tree) |tr| tr.parent else null) else null;
+        const o_p = try pickSumWith(g, dn, flat_sel, inverse, dn_scale, weights, m.residual, st, L.mlp_conv, conv_scale, top_k, false, tree_parent, dt);
+        if (open) |v| {
+            const nslot = ops.shape(st)[0];
+            const rows = try g.astype(try g.concat(&.{ kp, vp, m.op, o_p[1] }, 2), .float32);
+            v.window = try v.g.keep(try g.concat(&.{ st, try g.reshape(rows, &.{ nslot, @divExact(s, nslot), -1 }) }, 1));
+            return .{ .h = o_p[0], .state = st };
+        }
+        return .{ .h = o_p[0], .state = try convState(g, st, kp, vp, m.op, o_p[1]) };
     }
 
     const pairs = try layers.pairs(g, cfg, m.x, picks[0]);

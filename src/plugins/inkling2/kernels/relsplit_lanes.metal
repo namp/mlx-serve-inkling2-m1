@@ -67,8 +67,10 @@ for (int fr = 0; fr < NR; ++fr) {
 threadgroup E Ks[D * LDK];
 threadgroup E Vs[BK * LDV];
 simdgroup_matrix<E, 8, 8> q_frag[NR][D / 8];
+#pragma clang loop unroll(full)
 for (int fr = 0; fr < NR; ++fr) {
     const int r = fr * 8 + int(fm);
+    #pragma clang loop unroll(full)
     for (int db = 0; db < D / 8; ++db) {
         vec<E, 2> qv = vec<E, 2>(E(0));
         if (row_ok[fr]) {
@@ -82,7 +84,9 @@ for (int fr = 0; fr < NR; ++fr) {
 simdgroup_float8x8 acc[NR][D / 8];
 float row_max[NR];
 float row_sum[NR];
+#pragma clang loop unroll(full)
 for (int fr = 0; fr < NR; ++fr) {
+    #pragma clang loop unroll(full)
     for (int db = 0; db < D / 8; ++db) acc[fr][db] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     row_max[fr] = -1e30f;
     row_sum[fr] = 0.0f;
@@ -114,6 +118,7 @@ for (int k0 = kbeg; k0 < kend; k0 += BK) {
             auto vptr = (const device vec<T, 4>*)((own ? vb_head_p + (key - SC) * vb_strides[2] : v_head_p + key * k_row[zl]) + col);
             kv[0] = kptr[0]; kv[1] = kptr[1]; vv[0] = vptr[0]; vv[1] = vptr[1];
         }
+        #pragma clang loop unroll(full)
         for (int j = 0; j < 8; ++j) {
             Ks[(col + j) * LDK + r] = E(float(kv[j / 4][j % 4]));
             Vs[r * LDV + col + j] = E(float(vv[j / 4][j % 4]));
@@ -121,10 +126,13 @@ for (int k0 = kbeg; k0 < kend; k0 += BK) {
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const bool plain_tile = WINDOW == 0 && (k0 + BK <= min(kend, SC)) && (k0 + BK - 1 <= (S - L) - R);
+    #pragma clang loop unroll(full)
     for (int fr = 0; fr < NR; ++fr) {
         simdgroup_float8x8 scores[BK / 8];
+        #pragma clang loop unroll(full)
         for (int kb_i = 0; kb_i < BK / 8; ++kb_i) {
             scores[kb_i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            #pragma clang loop unroll(full)
             for (int db = 0; db < D / 8; ++db) {
                 simdgroup_matrix<E, 8, 8> k_frag;
                 simdgroup_load(k_frag, Ks + db * 8 * LDK + kb_i * 8, LDK);
@@ -132,7 +140,9 @@ for (int k0 = kbeg; k0 < kend; k0 += BK) {
             }
         }
         float tile_max = -INFINITY;
+        #pragma clang loop unroll(full)
         for (int kb_i = 0; kb_i < BK / 8; ++kb_i) {
+            #pragma clang loop unroll(full)
             for (int e = 0; e < 2; ++e) {
                 const int key = k0 + kb_i * 8 + fn + e;
                 float s = -INFINITY;
@@ -163,7 +173,9 @@ for (int k0 = kbeg; k0 < kend; k0 += BK) {
         const float factor = fast::exp2(row_max[fr] - new_max);
         float tile_sum = 0.0f;
         simdgroup_matrix<E, 8, 8> probs[BK / 8];
+        #pragma clang loop unroll(full)
         for (int kb_i = 0; kb_i < BK / 8; ++kb_i) {
+            #pragma clang loop unroll(full)
             for (int e = 0; e < 2; ++e) {
                 const float p = fast::exp2(scores[kb_i].thread_elements()[e] - new_max);
                 probs[kb_i].thread_elements()[e] = E(p);
@@ -174,9 +186,11 @@ for (int k0 = kbeg; k0 < kend; k0 += BK) {
         tile_sum += simd_shuffle_xor(tile_sum, 8);
         row_sum[fr] = row_sum[fr] * factor + tile_sum;
         row_max[fr] = new_max;
+        #pragma clang loop unroll(full)
         for (int db = 0; db < D / 8; ++db) {
             acc[fr][db].thread_elements()[0] *= factor;
             acc[fr][db].thread_elements()[1] *= factor;
+            #pragma clang loop unroll(full)
             for (int kb_i = 0; kb_i < BK / 8; ++kb_i) {
                 simdgroup_matrix<E, 8, 8> v_frag;
                 simdgroup_load(v_frag, Vs + kb_i * 8 * LDV + db * 8, LDV);
@@ -186,6 +200,7 @@ for (int k0 = kbeg; k0 < kend; k0 += BK) {
     }
 }
 
+#pragma clang loop unroll(full)
 for (int fr = 0; fr < NR; ++fr) {
     if (!row_ok[fr]) continue;
     const int r = fr * 8 + int(fm);
@@ -193,6 +208,7 @@ for (int fr = 0; fr < NR; ++fr) {
         const float inv = 1.0f / row_sum[fr];
         const size_t goff = (size_t(row_in + r) * HQ + head) * D;
         const size_t ooff = (size_t(row_out + r) * HQ + head) * D;
+        #pragma clang loop unroll(full)
         for (int db = 0; db < D / 8; ++db) {
             const int c0 = db * 8 + fn;
             OUT[ooff + c0] = T(float(T(acc[fr][db].thread_elements()[0] * inv)) * GATE[goff + c0]);
@@ -200,6 +216,7 @@ for (int fr = 0; fr < NR; ++fr) {
         }
     } else {
         const size_t at = (size_t(split) * LT + row_out + r) * HQ + head;
+        #pragma clang loop unroll(full)
         for (int db = 0; db < D / 8; ++db) {
             PART[at * D + db * 8 + fn] = acc[fr][db].thread_elements()[0];
             PART[at * D + db * 8 + fn + 1] = acc[fr][db].thread_elements()[1];

@@ -2,13 +2,31 @@
 
 Apple M1 / M2 optimizations for **Inkling 2 Mini (`inkling2_loop`)** — developed and tested on an **Apple M1 Max (64 GB)** with **Inkling 2 Mini Uncensored** (and compatible with any Inkling 2 Mini MLX/canonical checkpoint) on top of [ddalcu/mlx-serve](https://github.com/ddalcu/mlx-serve) (`7f41957`, including [PR #1331](https://github.com/ddalcu/mlx-serve/pull/1331), MIT License), plus a virtually lossless Q4-attention / Q6-head requantization tool, Lucebox Fast `o_proj` graft tool, and streaming SSE reasoning fix.
 
-> **Upstream credit & license:** Rebased onto [ddalcu/mlx-serve](https://github.com/ddalcu/mlx-serve) commit `7f41957007ab21a15c4371e3f53e93c27d1b39e8` (incorporating [PR #1331](https://github.com/ddalcu/mlx-serve/pull/1331) by David Dalcu — GPU DFlash 2 best-first tree verification, fused Metal vision tower, `At.joinQuant` 64-row padding, and prefix-cache respell fixes), preserved under the original [MIT License](LICENSE) (see [NOTICE](NOTICE) and [README_UPSTREAM.md](README_UPSTREAM.md) for full upstream documentation). Grouped expert deduplication ideas were adapted for Apple M1/M2 from [dangxingyu/megakernel-zoo](https://github.com/dangxingyu/megakernel-zoo) (`engines/inkling-2-mini_m5max`); native Inkling-2-Mini DFlash 2 contract details follow [incoai/Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) and [ARahim3/mlx-dspark](https://github.com/ARahim3/mlx-dspark); the anti-overthinking `o_proj` graft tool extracts Apache-2.0 deltas from [Lucebox/Inkling-2-Mini-Fast-GGUF](https://huggingface.co/Lucebox/Inkling-2-Mini-Fast-GGUF). No model weights are distributed in this repository.
+> **Upstream credit & license:** Rebased onto [ddalcu/mlx-serve](https://github.com/ddalcu/mlx-serve) commit `7f41957007ab21a15c4371e3f53e93c27d1b39e8` (incorporating [PR #1331](https://github.com/ddalcu/mlx-serve/pull/1331) by David Dalcu — GPU DFlash 2 best-first tree verification, fused Metal vision tower, `At.joinQuant` 64-row padding, and prefix-cache respell fixes), preserved under the original [MIT License](LICENSE) (see [NOTICE](NOTICE) and [README_UPSTREAM.md](README_UPSTREAM.md) for full upstream documentation). Grouped expert deduplication ideas were adapted for Apple M1/M2 from [dangxingyu/megakernel-zoo](https://github.com/dangxingyu/megakernel-zoo) (`engines/inkling-2-mini_m5max`); native Inkling-2-Mini DFlash 2 contract details follow [incoai/Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) and [ARahim3/mlx-dspark](https://github.com/ARahim3/mlx-dspark); the anti-overthinking `o_proj` graft tool extracts Apache-2.0 deltas from [Lucebox/Inkling-2-Mini-Fast-GGUF](https://huggingface.co/Lucebox/Inkling-2-Mini-Fast-GGUF); attention loop unrolling, native FP16 NVFP4 prefill GEMM design, and LoopCD contrastive decoding (`arXiv:2610.02185`) with thinking-block exclusion were inspired by [jundot/omlx](https://github.com/jundot/omlx) v0.8.4 (`#5623`, `#5632`, `#5617`, `#5640`). No model weights are distributed in this repository.
 
 ---
 
 ## Highlights (Inkling 2 Mini Uncensored on Apple M1 Max, 64 GB, `--kv-quant 4`, `--ctx-size 1048576`)
 
-### 1. Rebase onto Upstream PR #1331 + M1 Max GPU DFlash 2 Best-First Tree (`W=8`)
+### 1. Native FP16 NVFP4 Prefill GEMM (`S >= 64`) + Unrolled Attention + LoopCD (`--loopcd-skip-thinking`)
+
+Building on top of the PR #1331 M1-Opt release:
+- **Flash Attention unrolling + plain-tile fast path** (`relattn.metal`, `relsplit.metal`, `relsplit_lanes.metal`): **+28% to +52%** faster isolated M1 Max FP16 attention microbenchmarks.
+- **Native FP16 NVFP4 prefill expert GEMM + fused soft-capped SwiGLU** (`nvfp4_plan.metal`, `nvfp4_prefill.metal`): eliminates M1 Max's BF16 `gather_qmm` fallback across all 20 NVFP4 expert layers (44/48 visits) on `S >= 64` prefill chunks with exact `e2m1 * fp8_e4m3` in normal `half`, swapped grid for L2 weight reuse, and fused SwiGLU (~56.5 MB/visit DRAM saved).
+- **LoopCD contrastive decoding (`arXiv:2610.02185`) with Exclude Thinking Blocks** (`--loopcd` / `--loopcd-skip-thinking`, `loopcd_thinking.metal`, `loopcd_guide.metal`): saves pass-0 `(h, blocks)` after visit 18, runs 6 reference coda visits (54 total visits/caches), keeps thinking blocks 100% unguided while preserving control-token softmax probabilities (`>= 199998`), and works with DFlash 2 `W=8` tree verify, Q4 KV, and RAM/SSD prefix caches.
+- **Thermally-bracketed M1 Max A/B** (`Prev PR1331 M1-Opt A1` → `New Default` → `New + --loopcd-skip-thinking` → `Prev PR1331 M1-Opt A2`, 25s cooldowns, Q4 KV + DFlash 2 `W=8` + `--warmup-full` + `--prefix-cache-entries 0`):
+
+| Workload | Prev PR1331 M1-Opt Avg (`A1`/`A2`) | **New Default (Unroll + FP16 NVFP4 Prefill)** | Delta vs Mean (vs Cold `A1`) | New + `--loopcd-skip-thinking` (54 visits) |
+|---|---:|---:|---:|---:|
+| **`pp_2k` (`2,348` tok)** | `249.0 tok/s` (`273.1` / `224.9`) | **`338.6 tok/s`** (`6.94s`) | **+36.0%** (**+24.0%**) | `257.8 tok/s` (`9.11s`) |
+| **`pp_8k` (`8,105` tok)** | `242.1 tok/s` (`259.1` / `225.2`) | **`308.6 tok/s`** (`26.26s`) | **+27.5%** (**+19.1%**) | **`260.8 tok/s`** (`31.08s`) |
+| **Plain decode step** | `23.1–23.2 ms` | **`18.8 ms`** | **−18.8% latency** | `26.1 ms` (+6 coda visits) |
+| **`code_t0` (DFlash `W=8`)** | `56.53 tok/s` (`53.52` / `59.54`) | `56.01 tok/s` | ~parity | `45.68 tok/s` (−18%) |
+| **`reason_t0` (DFlash `W=8`)** | `71.50 tok/s` (`A1`) | `66.38 tok/s` | ~parity | `61.05 tok/s` (−8% vs New) |
+
+*(Outputs on `pp_2k` and `pp_8k` matched baseline character-for-character. Under deterministic FP16-KV serial decode, `--loopcd-skip-thinking` produced a 100% character-identical thinking block (`232/232` chars) while cleanly guiding the final answer.)*
+
+### 2. Rebase onto Upstream PR #1331 + M1 Max GPU DFlash 2 Best-First Tree (`W=8`)
 
 All proven M1/M2 optimizations (native FP16 trunk, coalesced transposed message gates, `SUB16`/`SUB8` NVFP4 MoE kernels, fused Q4/Q8 KV decode + tree-aware `S=2..8` verify, 4-bit `L.o` bypass, hoisted constants) have been rebased onto upstream **PR #1331** (`mlx-serve 26.11.4`), tuned specifically for M1 Max:
 
@@ -28,7 +46,7 @@ All proven M1/M2 optimizations (native FP16 trunk, coalesced transposed message 
 | **BF16 Vision (`7391`, steady wall)** | `2.36s` (`2.33s` / `2.39s`) | **`1.53s`** (`1.23s` live on `:8085`) | **-35.2%** |
 | **8K Q4 KV (`8,059` pt, `T=1.0`)** | `31.80s` wall (`pp 319.9`, `dec 52.4`) | **`28.53s` wall** (`pp 324.5`, `dec 51.4`) | **-10.3% wall** |
 
-### 2. Earlier M1-Opt Native DFlash 2 + Lucebox Fast `o_proj` Graft Baseline
+### 3. Earlier M1-Opt Native DFlash 2 + Lucebox Fast `o_proj` Graft Baseline
 
 Stacking native **DFlash 2** parallel block-diffusion drafting (`src/plugins/inkling2/dflash2.zig`) with Lucebox's 24-layer `o_proj` anti-overthinking graft (`tools/graft_lucebox_fast.py`) delivers **~2.3–2.5× faster end-to-end wall-clock answers** on M1 Max while preserving uncensored behavior, 1M Q4 KV context, 8 GB SSD prefix cache, and BF16 vision:
 
@@ -46,7 +64,7 @@ Stacking native **DFlash 2** parallel block-diffusion drafting (`src/plugins/ink
   - **8-prompt suite (math, code, diagnosis, Greek, SQLi):** `12,257` → **`5,783` tokens (`-52.8%`)**, `<think>` chars **`-65.6%`**, exact BF16 vision (`7391`) preserved.
   - **6-prompt cold-start & abliteration suite:** `3,862` → **`1,926` tokens (`-50.1%`)**, **`86.1s → 46.8s` (`1.84×` faster; `3.0×` on `T=1.0` Python code)**, zero refusal regressions (`max |cos(ΔW_fast, ΔW_unc)| = 0.00512` across all 24 layers; `99.65%` directional survival under 4-bit `gs=64`).
 
-### 2. Grouped Expert Dedup + `SUB16`/`SUB8` NVFP4 + Shared Gumbel-Max Coupling + N-Gram Copy
+### 4. Grouped Expert Dedup + `SUB16`/`SUB8` NVFP4 + Shared Gumbel-Max Coupling + N-Gram Copy
 
 Clean 4-arm bracketed A/B/A (`Prev M1-Opt A1` → `New Serial` → `New Default (DSpark + Gumbel + Copy)` → `Prev M1-Opt A2`) serving the Q4-attention / Q6-head uncensored pack (with BF16 vision enabled, `--temp 1.0 --top-p 1.0 --top-k 0`):
 
@@ -63,7 +81,7 @@ Clean 4-arm bracketed A/B/A (`Prev M1-Opt A1` → `New Serial` → `New Default 
 
 *(Also live-verified with BF16 vision `model-vision.safetensors` enabled, passing exact image OCR readout in both serial and default DSpark modes, and zero garbled tokens across all `T=1.0` Gumbel-coupled generations.)*
 
-### 3. Baseline vs Stock `ddalcu/mlx-serve` (Previous M1-Opt Serial Pass)
+### 5. Baseline vs Stock `ddalcu/mlx-serve` (Previous M1-Opt Serial Pass)
 
 Bracketed back-to-back head-to-head benchmark (`OPT_1` → `STOCK` → `OPT_2`) on the **Inkling 2 Mini Uncensored** (TokenAI-zer / OpenUncensored-derived mixed-precision) checkpoint, comparing stock `ddalcu/mlx-serve` (`2fe9be8` + SSE fix) serving the canonical 8-bit-attention / NVFP4-expert uncensored pack against the prior M1-opt serial build serving the Q4-attention / Q6-head uncensored pack:
 
@@ -108,6 +126,13 @@ All engine optimizations live cleanly inside `src/plugins/inkling2/`, plus minim
    - Auto-loads from `<model_dir>/dflash2` (symlink `incoai/Inkling-2-Mini-DFlash2` there) or `INKLING_DFLASH2_DIR`; falls back cleanly to `mtp.safetensors` when absent or with `INKLING_NO_DFLASH2=1`.
 7. **Inkling SSE `<|content_thinking|>` Separation Fix** (`src/host/chat/reasoning/think_tags.zig`):
    - Latches `<|content_thinking|>` on model-opened reasoning blocks and guards split boundaries on `<|end_message|>` so streamed thinking stays strictly inside `reasoning_content` without leaking into visible `content`.
+8. **Flash Attention Unrolling & Plain-Tile Fast Path** (`relattn.metal`, `relsplit.metal`, `relsplit_lanes.metal`):
+   - Adds `#pragma clang loop unroll(full)` to all fragment/load/store loops (eliminating register spills on Apple7/8 GPUs) and a mask/bias-free `plain` interior-tile branch for full-attention prefill & split-K tiles (+28% to +52% faster isolated FP16 attention on M1 Max).
+9. **Native FP16 NVFP4 Prefill Expert GEMM + Fused Soft-Capped SwiGLU (`S >= 64`)** (`nvfp4_plan.metal`, `nvfp4_prefill.metal`, `kernels.zig`):
+   - Replaces M1/M2's BF16 `gather_qmm` fallback during prompt prefill across all 20 NVFP4 expert layers (44/48 visits) with a zero-host-sync GPU planner and `BM=16, BN=64, BK=32` FP16 MMA kernel using exact `e2m1 * fp8_e4m3` dequantization in normal `half`, swapped grid for L2 weight reuse, FP32 accumulation + inline tensor scale, and fused soft-capped SwiGLU (`MLX_SERVE_INKLING2_PREFILL_FP4=0` disables).
+10. **LoopCD Contrastive Decoding (`arXiv:2610.02185`) + Exclude Thinking Blocks** (`--loopcd`, `--loopcd-skip-thinking`, `loopcd_thinking.metal`, `loopcd_guide.metal`, `config.zig`, `layers.zig`, `plugin.zig`):
+    - Captures pass-0 `(h, blocks)` after visit 18, runs 6 reference coda visits (54 total visits/caches), and fuses adaptive guidance (`weight = 0.5 * (1 - (p_top1 - p_top2))`) on GPU.
+    - `--loopcd-skip-thinking` tracks per-slot thinking state in layer 0's `.ssm` slot (prefix-cache and batch safe, including `TREE=1` DFlash 2 `W=8` scans), leaves thinking blocks 100% unguided, and applies a `logsumexp` shift to ordinary tokens (`< 199998`) so control-token softmax probabilities remain exact.
 
 ---
 
@@ -175,7 +200,7 @@ Serve with 1M context, Q4 KV caching, and an 8 GB SSD prefix cache (sized for 64
   --temp 1.0 --top-p 1.0 --top-k 0 --warmup-full
 ```
 
-*(Pass `--warmup-full` so PR #1331's load-time `[rounds]` ladder completes before `:8085` opens and arms DFlash 2 GPU best-first tree verification from prompt #1; add `--no-vision` if you don't need multimodal image input.)*
+*(Pass `--warmup-full` so PR #1331's load-time `[rounds]` ladder completes before `:8085` opens and arms DFlash 2 GPU best-first tree verification from prompt #1; add `--loopcd-skip-thinking` for LoopCD contrastive decoding on final answers with unguided thinking blocks, or `--loopcd` for full LoopCD; add `--no-vision` if you don't need multimodal image input.)*
 
 > **Prefix-cache sizing tip:** Under `--kv-quant 4`, a `50K–135K`-token session uses `~0.6–1.5 GB` of KV/checkpoint state, so `2GB` on disk can trigger LRU eviction races between rapid tool-call turns or multiple agent threads — `8GB` keeps 5–12 large sessions warm (`~0.10–0.25s` restore from SSD). Keep `--no-prefix-cache-ram` when using `--ctx-size 1048576` on 64 GB: `mlx-serve` reserves the full manual context at load time, clamping `--prefix-cache-mem` to `0 MB` while downgrading the SSD tier (`2048 -> 512 MB/flush`, `16 -> 8` SSM checkpoints/entry). Only remove `--no-prefix-cache-ram` if you also lower `--ctx-size` (e.g. `262144`) so RAM headroom remains. Note that `mlx-serve` reserves `min(64 GiB, 10% volume)` of free disk before arming the SSD tier.
 
@@ -191,6 +216,9 @@ Serve with 1M context, Q4 KV caching, and an 8 GB SSD prefix cache (sized for 64
 | `INKLING_DRAFT_MAX=1..15` | Cap chain verify drafts per round on M1/M2 (default `7`, `rows ≤ 8`) |
 | `INKLING_NO_DFLASH2=1` | Disable DFlash 2 (`drafter/` and `dflash2/`) and fall back to bundled `mtp.safetensors` |
 | `INKLING_NO_DRAFT=1` | Force pure optimized serial decode (disables both DFlash 2 and bundled drafters) |
+| `MLX_SERVE_INKLING2_PREFILL_FP4=0` | Disable M1/M2 native FP16 NVFP4 prefill expert GEMM (`S >= 64`) |
+| `MLX_SERVE_INKLING2_LOOPCD=1` | Enable LoopCD contrastive decoding (same as `--loopcd`) |
+| `MLX_SERVE_INKLING2_LOOPCD_SKIP_THINKING=1` | Enable LoopCD while skipping guidance inside thinking blocks (same as `--loopcd-skip-thinking`) |
 
 ### Benchmarking
 

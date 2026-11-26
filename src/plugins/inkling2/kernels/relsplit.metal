@@ -33,6 +33,7 @@ const int kend = min(S, kbeg + KPS);
 threadgroup half Ks[D * LDK];
 threadgroup half Vs[BK * LDV];
 simdgroup_half8x8 q_frag[D / 8];
+#pragma clang loop unroll(full)
 for (int db = 0; db < D / 8; ++db) {
     half2 qv = half2(0.0h);
     if (row_ok) {
@@ -43,6 +44,7 @@ for (int db = 0; db < D / 8; ++db) {
     q_frag[db].thread_elements()[1] = qv.y;
 }
 simdgroup_float8x8 acc[D / 8];
+#pragma clang loop unroll(full)
 for (int db = 0; db < D / 8; ++db) acc[db] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 // A finite floor: a split whose keys a row cannot see leaves it at weight 0 in the combine.
 float row_max = -1e30f, row_sum = 0.0f;
@@ -69,6 +71,7 @@ for (int k0 = kbeg; k0 < kend; k0 += BK) {
             auto vp = (const device vec<T, 4>*)((own ? vb_head + (key - SC) * vb_strides[2] : v_head + key * v_strides[2]) + col);
             kv[0] = kp[0]; kv[1] = kp[1]; vv[0] = vp[0]; vv[1] = vp[1];
         }
+        #pragma clang loop unroll(full)
         for (int j = 0; j < 8; ++j) {
             Ks[(col + j) * LDK + r] = half(float(kv[j / 4][j % 4]));
             Vs[r * LDV + col + j] = half(float(vv[j / 4][j % 4]));
@@ -76,8 +79,10 @@ for (int k0 = kbeg; k0 < kend; k0 += BK) {
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     simdgroup_float8x8 scores[BK / 8];
+    #pragma clang loop unroll(full)
     for (int kb = 0; kb < BK / 8; ++kb) {
         scores[kb] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        #pragma clang loop unroll(full)
         for (int db = 0; db < D / 8; ++db) {
             simdgroup_half8x8 k_frag;
             simdgroup_load(k_frag, Ks + db * 8 * LDK + kb * 8, LDK);
@@ -85,18 +90,33 @@ for (int k0 = kbeg; k0 < kend; k0 += BK) {
         }
     }
     float tile_max = -INFINITY;
-    for (int kb = 0; kb < BK / 8; ++kb) {
-        for (int e = 0; e < 2; ++e) {
-            const int key = k0 + kb * 8 + fn + e;
-            const int d = diag - key;
-            const bool visible = row_ok && key < kend && d >= 0 && (WINDOW == 0 || d < WINDOW);
-            float s = -INFINITY;
-            if (visible) {
-                s = scores[kb].thread_elements()[e] * qscale;
-                if (d < R) s += float(bias[d]) * LOG2E;
+    const bool plain = WINDOW == 0 && k0 + BK <= kend && (S - L) - (k0 + BK - 1) >= R;
+    if (plain) {
+        #pragma clang loop unroll(full)
+        for (int kb = 0; kb < BK / 8; ++kb) {
+            #pragma clang loop unroll(full)
+            for (int e = 0; e < 2; ++e) {
+                const float s = row_ok ? scores[kb].thread_elements()[e] * qscale : -INFINITY;
+                scores[kb].thread_elements()[e] = s;
+                tile_max = max(tile_max, s);
             }
-            scores[kb].thread_elements()[e] = s;
-            tile_max = max(tile_max, s);
+        }
+    } else {
+        #pragma clang loop unroll(full)
+        for (int kb = 0; kb < BK / 8; ++kb) {
+            #pragma clang loop unroll(full)
+            for (int e = 0; e < 2; ++e) {
+                const int key = k0 + kb * 8 + fn + e;
+                const int d = diag - key;
+                const bool visible = row_ok && key < kend && d >= 0 && (WINDOW == 0 || d < WINDOW);
+                float s = -INFINITY;
+                if (visible) {
+                    s = scores[kb].thread_elements()[e] * qscale;
+                    if (d < R) s += float(bias[d]) * LOG2E;
+                }
+                scores[kb].thread_elements()[e] = s;
+                tile_max = max(tile_max, s);
+            }
         }
     }
     tile_max = max(tile_max, simd_shuffle_xor(tile_max, 1));
@@ -105,7 +125,9 @@ for (int k0 = kbeg; k0 < kend; k0 += BK) {
     const float factor = fast::exp2(row_max - new_max);
     float tile_sum = 0.0f;
     simdgroup_half8x8 probs[BK / 8];
+    #pragma clang loop unroll(full)
     for (int kb = 0; kb < BK / 8; ++kb) {
+        #pragma clang loop unroll(full)
         for (int e = 0; e < 2; ++e) {
             const float p = fast::exp2(scores[kb].thread_elements()[e] - new_max);
             probs[kb].thread_elements()[e] = half(p);
@@ -116,9 +138,11 @@ for (int k0 = kbeg; k0 < kend; k0 += BK) {
     tile_sum += simd_shuffle_xor(tile_sum, 8);
     row_sum = row_sum * factor + tile_sum;
     row_max = new_max;
+    #pragma clang loop unroll(full)
     for (int db = 0; db < D / 8; ++db) {
         acc[db].thread_elements()[0] *= factor;
         acc[db].thread_elements()[1] *= factor;
+        #pragma clang loop unroll(full)
         for (int kb = 0; kb < BK / 8; ++kb) {
             simdgroup_half8x8 v_frag;
             simdgroup_load(v_frag, Vs + kb * 8 * LDV + db * 8, LDV);
@@ -128,6 +152,7 @@ for (int k0 = kbeg; k0 < kend; k0 += BK) {
 }
 if (row_ok) {
     const size_t at = (size_t(split) * L + fm) * HQ + head;
+    #pragma clang loop unroll(full)
     for (int db = 0; db < D / 8; ++db) {
         PART[at * D + db * 8 + fn] = acc[db].thread_elements()[0];
         PART[at * D + db * 8 + fn + 1] = acc[db].thread_elements()[1];

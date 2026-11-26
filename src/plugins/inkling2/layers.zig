@@ -594,3 +594,78 @@ pub fn messagesFor(g: *Graph, L: *const Layer, bank: Array, partial: Array) !Arr
 pub fn passOutput(g: *Graph, w: *const Body, h: Array) !Array {
     return plainNorm(g, try g.astype(h, .float32), w.ones);
 }
+
+/// CPU/reference LoopCD thinking-block tracker: `[B, S]` f32 (0.0 or 1.0) from `ids` `[B, S]` i32,
+/// `before` `[B, 1]` f32, and optional tree `parent` `[B, S]` i32.
+pub fn loopcdThinking(g: *Graph, ids: Array, before: Array, parent: ?Array, first_ctrl: i32, think_tok: i32) !Array {
+    const sh = ops.shape(ids);
+    const b: usize = @intCast(sh[0]);
+    const s: usize = @intCast(sh[1]);
+    const ids_c = try g.contiguous(try g.astype(ids, .int32));
+    const bef_c = try g.contiguous(try g.astype(before, .float32));
+    if (parent) |par| {
+        const par_c = try g.contiguous(try g.astype(par, .int32));
+        try ops.evalMany(&.{ ids_c, bef_c, par_c });
+        const id_p = mlx.mlx_array_data_int32(ids_c) orelse return error.Inkling2LoopCd;
+        const bf_p = mlx.mlx_array_data_float32(bef_c) orelse return error.Inkling2LoopCd;
+        const pa_p = mlx.mlx_array_data_int32(par_c) orelse return error.Inkling2LoopCd;
+        const out = try g.a.alloc(f32, b * s);
+        defer g.a.free(out);
+        for (0..b) |bi| {
+            const init_st: f32 = if (bf_p[bi] > 0.5) 1.0 else 0.0;
+            for (0..s) |r| {
+                const p = pa_p[bi * s + r];
+                var cur: f32 = if (p < 0) init_st else out[bi * s + @as(usize, @intCast(p))];
+                const tok = id_p[bi * s + r];
+                if (tok >= first_ctrl) cur = if (tok == think_tok) 1.0 else 0.0;
+                out[bi * s + r] = cur;
+            }
+        }
+        return g.fromSlice(f32, out, &.{ @intCast(b), @intCast(s) });
+    }
+    try ops.evalMany(&.{ ids_c, bef_c });
+    const id_p = mlx.mlx_array_data_int32(ids_c) orelse return error.Inkling2LoopCd;
+    const bf_p = mlx.mlx_array_data_float32(bef_c) orelse return error.Inkling2LoopCd;
+    const out = try g.a.alloc(f32, b * s);
+    defer g.a.free(out);
+    for (0..b) |bi| {
+        var cur: f32 = if (bf_p[bi] > 0.5) 1.0 else 0.0;
+        for (0..s) |t| {
+            const tok = id_p[bi * s + t];
+            if (tok >= first_ctrl) cur = if (tok == think_tok) 1.0 else 0.0;
+            out[bi * s + t] = cur;
+        }
+    }
+    return g.fromSlice(f32, out, &.{ @intCast(b), @intCast(s) });
+}
+
+/// CPU/reference LoopCD-Logits guidance (arXiv:2610.02185): `final`, `ref` `[N, V]` f32 (soft-capped & trimmed),
+/// optional `thinking` `[N]` f32 (0/1; non-null enables Exclude Thinking Blocks + control-token probability preservation).
+pub fn loopcdGuide(g: *Graph, final: Array, ref: Array, thinking: ?Array, max_strength: f32, first_ctrl: i32) !Array {
+    const f = try g.astype(final, .float32);
+    const r = try g.astype(ref, .float32);
+    const sh = ops.shape(f);
+    const v = sh[sh.len - 1];
+    const probs = try g.softmax(f, -1, true);
+    const top = try g.argmax(probs, -1, true);
+    const idx = try g.arange(0, @floatFromInt(v), 1, ops.dtype(top));
+    const others = try g.where(try g.equal(idx, top), try g.scalar(0.0, .float32), probs);
+    const margin = try g.sub(try g.max(probs, -1, true), try g.max(others, -1, true));
+    var weight = try g.mulScalar(try g.sub(try g.scalar(1.0, .float32), margin), max_strength);
+    const diff = try g.sub(f, r);
+    const think = thinking orelse return g.add(f, try g.mul(weight, diff));
+    const is_think = try g.greater(try g.reshape(think, &.{ sh[0], 1 }), try g.scalar(0.5, .float32));
+    weight = try g.where(is_think, try g.scalar(0.0, .float32), weight);
+    const guided = try g.add(f, try g.mul(weight, diff));
+    const ord = try g.less(try g.arange(0, @floatFromInt(v), 1, .int32), try g.scalar(@floatFromInt(first_ctrl), .int32));
+    const neg_inf = try g.scalar(-std.math.inf(f32), .float32);
+    const f_ord = try g.where(ord, f, neg_inf);
+    const g_ord = try g.where(ord, guided, neg_inf);
+    const f_max = try g.max(f_ord, -1, true);
+    const g_max = try g.max(g_ord, -1, true);
+    const f_lse = try g.add(f_max, try g.log(try g.sum(try g.exp(try g.sub(f_ord, f_max)), -1, true)));
+    const g_lse = try g.add(g_max, try g.log(try g.sum(try g.exp(try g.sub(g_ord, g_max)), -1, true)));
+    const shifted = try g.add(guided, try g.sub(f_lse, g_lse));
+    const preserved = try g.where(ord, shifted, f);
+    return g.where(is_think, f, preserved);
+}

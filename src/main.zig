@@ -363,6 +363,12 @@ fn printUsage(io: std.Io) void {
         \\                        off (default), 4, 8     — affine group quant.
         \\                          Per-request override via the `kv_quant`
         \\                          body field.
+        \\  --loopcd            Enable LoopCD contrastive decoding for looped
+        \\                        Inkling 2 models (arXiv:2610.02185).
+        \\  --loopcd-skip-thinking
+        \\                      Enable LoopCD with Exclude Thinking Blocks
+        \\                        (guides answers and tool calls, leaves thinking
+        \\                        blocks and control-token probabilities intact).
         \\  --ablation-profiles <dir> --ablation-key-file <path>
         \\                      Per-request directional ablation (docs/api.md);
         \\                        the key file is 0600, at least 32 bytes.
@@ -1020,6 +1026,11 @@ pub fn main(init: std.process.Init) !void {
             warmup_eager = false;
         } else if (std.mem.eql(u8, args[i], "--warmup-full")) {
             warmup_full = true;
+        } else if (std.mem.eql(u8, args[i], "--loopcd")) {
+            env.set(.MLX_SERVE_INKLING2_LOOPCD, "1");
+        } else if (std.mem.eql(u8, args[i], "--loopcd-skip-thinking")) {
+            env.set(.MLX_SERVE_INKLING2_LOOPCD, "1");
+            env.set(.MLX_SERVE_INKLING2_LOOPCD_SKIP_THINKING, "1");
         } else if (std.mem.eql(u8, args[i], "--prefill-chunk") and i + 1 < args.len) {
             i += 1;
             // `explicit` disables the machine-sized pin, so only a real width

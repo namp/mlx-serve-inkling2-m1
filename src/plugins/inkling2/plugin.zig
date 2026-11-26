@@ -21,6 +21,7 @@ const media = @import("media.zig");
 const draft = @import("draft.zig");
 const dflash2 = @import("dflash2.zig");
 const kv = @import("../../sdk/bases/kv.zig");
+const slot_state = @import("../../sdk/bases/blocks/state.zig");
 const rounds = @import("../../sdk/spec/rounds.zig");
 const sdk_host = @import("../../sdk/host.zig");
 const log = @import("../../sdk/util/log.zig");
@@ -86,6 +87,8 @@ pub const Spec = struct {
     opens: ?[]kernels.Open = null,
     /// A verify's taps `[1, S, taps * hidden]`, held until its accept.
     held: Array = .{},
+    /// A verify's LoopCD thinking flags `[slots, rows]` f32, held until its accept.
+    held_thinking: Array = .{},
     /// Set when a drafter layer attends every committed position: a push hands it each forward's rows, all of them.
     full: ?*const draft.Drafter = null,
 
@@ -160,7 +163,7 @@ pub const Spec = struct {
     }
 
     fn deinit(sp: *Spec) void {
-        for ([_]Array{ sp.ring, sp.held }) |a| if (a.ctx != null) {
+        for ([_]Array{ sp.ring, sp.held, sp.held_thinking }) |a| if (a.ctx != null) {
             _ = mlx.mlx_array_free(a);
         };
         for (sp.parked) |p| if (p.ring.ctx != null) {
@@ -188,14 +191,15 @@ pub const Model = struct {
     /// One forward of `ids` (`[1, rows]` int32). Results are owned by `g`.
     pub fn forward(w: *const Weights, shared: *const block.Shared, g: *ops.Graph, ids: ops.Array, run: run_mod.Run) !run_mod.Out {
         var c = run.ctx(g, shared);
+        const ids_for_cd: ops.Array = if (run.embeds.ctx == null) ids else .{};
         // The embedding is normed before the media rows land on it, as mlx-lm's `embed_inputs`.
         const h = try run.input(g, try g.rmsNorm(try b.embed.TableEmbed.forward(&w.embed, &c, ids), w.embed_norm, w.body.cfg.rms_norm_eps), ids);
-        if (run.slots == 1) return sequence(w, shared, g, h, run);
+        if (run.slots == 1) return sequence(w, shared, g, h, ids_for_cd, run);
         // A verify of several slots' blocks: all their rows as one sequence, each slot's behind its own cache and state.
-        if (run.rows > 1 and w.spec != null and w.spec.?.opens != null) return sequence(w, shared, g, try g.reshape(h, &.{ 1, run.slots * run.rows, -1 }), run);
+        if (run.rows > 1 and w.spec != null and w.spec.?.opens != null) return sequence(w, shared, g, try g.reshape(h, &.{ 1, run.slots * run.rows, -1 }), ids_for_cd, run);
         // Batched slots, a row each, ride the kernels as rows; elsewhere (a CPU stream, several rows) a slot at a time.
         if (run.rows == 1 and kernels.batches(g, &w.body, h, run.slots)) {
-            var out = try sequence(w, shared, g, try g.reshape(h, &.{ 1, run.slots, -1 }), run);
+            var out = try sequence(w, shared, g, try g.reshape(h, &.{ 1, run.slots, -1 }), ids_for_cd, run);
             if (out.hidden.ctx != null) out.hidden = try g.reshape(out.hidden, &.{ run.slots, 1, -1 });
             return out;
         }
@@ -209,7 +213,8 @@ pub const Model = struct {
             one.slots = 1;
             one.positions = run.positions[i .. i + 1];
             one.caches = run.caches[i .. i + 1];
-            const out = try sequence(w, shared, g, try g.sliceAxis(h, 0, at, at + 1), one);
+            const one_ids: ops.Array = if (ids_for_cd.ctx != null) try g.sliceAxis(ids_for_cd, 0, at, at + 1) else .{};
+            const out = try sequence(w, shared, g, try g.sliceAxis(h, 0, at, at + 1), one_ids, one);
             logits[i] = out.logits;
             hidden[i] = out.hidden;
         }
@@ -220,7 +225,7 @@ pub const Model = struct {
     }
 
     /// The forward over the embedded rows `h_in`: one sequence's `[1, S, D]`, or batched slots as rows `[1, N, D]`.
-    fn sequence(w: *const Weights, shared: *const block.Shared, g: *ops.Graph, h_in: ops.Array, run: run_mod.Run) !run_mod.Out {
+    fn sequence(w: *const Weights, shared: *const block.Shared, g: *ops.Graph, h_in: ops.Array, ids_in: ops.Array, run: run_mod.Run) !run_mod.Out {
         const cfg = &w.body.cfg;
         var c = run.ctx(g, shared);
         var h = h_in;
@@ -236,8 +241,12 @@ pub const Model = struct {
         var loop_blocks: c_int = 0;
         var bank: ops.Array = .{};
         var bank_partial: ops.Array = .{};
+        // LoopCD saves the 1-pass state right before pass 1 resets to `loop_in`.
+        var first_pass_h: ops.Array = .{};
+        var first_pass_blocks: ?ops.Array = null;
 
         const visits = cfg.visits();
+        const total_visits = cfg.totalVisits();
         const spec: ?*Spec = if (batched) null else w.spec;
         var taps: [config.max_taps]ops.Array = undefined;
         for (0..visits) |v| {
@@ -248,9 +257,14 @@ pub const Model = struct {
                     loop_stack = blocks;
                     loop_blocks = n_blocks;
                 } else {
+                    const keep_first = cfg.loopcd and at.pass == 1;
+                    if (keep_first) {
+                        first_pass_h = h;
+                        first_pass_blocks = blocks;
+                    }
                     bank = try g.sliceAxis(blocks.?, 2, loop_blocks + 1, n_blocks);
                     bank_partial = try layers.passOutput(g, &w.body, h);
-                    if (h.ctx != loop_in.ctx) g.drop(h);
+                    if (h.ctx != loop_in.ctx and !keep_first) g.drop(h);
                     h = loop_in;
                     blocks = loop_stack;
                     n_blocks = loop_blocks;
@@ -277,9 +291,9 @@ pub const Model = struct {
                 blocks = try g.keep(stack);
                 n_blocks += 1;
             }
-            if (old.ctx != loop_in.ctx) g.drop(old);
+            if (old.ctx != loop_in.ctx and old.ctx != first_pass_h.ctx) g.drop(old);
             try run.capture(g, @intCast(v), h);
-            try run.cadence(v, visits, h);
+            try run.cadence(v, total_visits, h);
         }
         const stepped: ?ops.Array = try kernels.finalStream(g, &w.body, h, blocks, w.final_norm);
         var final = stepped orelse try g.astype(try g.rmsNorm(try layers.finalInput(g, &w.body, h, blocks), w.final_norm, cfg.rms_norm_eps), ops.dtype(h));
@@ -296,7 +310,73 @@ pub const Model = struct {
             } else try sp.push(g, run.positions[0] + @as(u64, @intCast(from)), parts[0 .. sp.visits.len + 1]);
         }
         if (batched) final = try g.reshape(final, &.{ run.slots, 1, -1 });
-        return run.finish(g, &c, final, layers.Head, &w.head);
+        if (!cfg.loopcd) return run.finish(g, &c, final, layers.Head, &w.head);
+
+        // LoopCD: run the coda layers on the saved 1-pass state using dedicated reference cache/state slots.
+        var rh = first_pass_h;
+        var rblocks = first_pass_blocks;
+        for (visits..total_visits) |v_ref| {
+            const at_ref = cfg.visit(@intCast(v_ref));
+            var lg = g.scope();
+            defer lg.deinit();
+            c.g = &lg;
+            c.layer = @intCast(v_ref);
+            const L = &w.body.layers[at_ref.layer];
+            const open_ref: ?*kernels.Open = if (spec) |sp| (if (sp.opens) |o| &o[v_ref] else null) else null;
+            const rstep: ?layers.Post = try kernels.visit(&c, L, &w.body, rh, rblocks, null, open_ref);
+            if (rstep == null and (open_ref != null or batched)) return error.Inkling2KernelVisit;
+            const rout = rstep orelse try layers.layerForward(L, &w.body, &c, rh, rblocks, null);
+            c.g = g;
+            const rold = rh;
+            rh = try g.keep(rout.h);
+            if (rout.blocks) |stack| rblocks = try g.keep(stack);
+            if (rold.ctx != first_pass_h.ctx) g.drop(rold);
+            try run.cadence(v_ref, total_visits, rh);
+        }
+        if (first_pass_h.ctx != null and first_pass_h.ctx != loop_in.ctx) g.drop(first_pass_h);
+        const rstepped: ?ops.Array = try kernels.finalStream(g, &w.body, rh, rblocks, w.final_norm);
+        var ref_final = rstepped orelse try g.astype(try g.rmsNorm(try layers.finalInput(g, &w.body, rh, rblocks), w.final_norm, cfg.rms_norm_eps), ops.dtype(rh));
+        if (batched) ref_final = try g.reshape(ref_final, &.{ run.slots, 1, -1 });
+
+        var thinking_rows: ?ops.Array = null;
+        if (cfg.loopcd_skip_thinking) {
+            const is_open = spec != null and spec.?.opens != null;
+            c.layer = 0;
+            const before_opt: ?ops.Array = if (c.cache_ops != null and c.caches.len > 0)
+                (if (run.slots > 1) try slot_state.get(&c, .ssm) else try kv.state(&c, .ssm))
+            else
+                null;
+            const before = if (before_opt) |b_arr| try g.reshape(b_arr, &.{ run.slots, 1 }) else try g.zeros(&.{ run.slots, 1 }, .float32);
+            const tree_parent: ?ops.Array = if (is_open) (if (spec.?.opens.?[0].tree) |t| t.parent else null) else null;
+            const t_seq = if (ids_in.ctx != null)
+                try kernels.loopcdThinking(g, try g.reshape(ids_in, &.{ run.slots, run.rows }), before, tree_parent, kernels.loopcd_first_control, kernels.loopcd_thinking_token)
+            else
+                try g.zeros(&.{ run.slots, run.rows }, .float32);
+            if (is_open) {
+                if (spec.?.held_thinking.ctx != null) _ = mlx.mlx_array_free(spec.?.held_thinking);
+                spec.?.held_thinking = g.escape(t_seq);
+            } else if (c.cache_ops != null and c.caches.len > 0) {
+                const last_t = try g.contiguous(try g.sliceAxis(t_seq, 1, run.rows - 1, run.rows));
+                if (run.slots > 1) try slot_state.put(&c, .ssm, last_t) else try kv.setState(&c, .ssm, last_t);
+            }
+            thinking_rows = t_seq;
+        }
+
+        const main_out = try run.finish(g, &c, final, layers.Head, &w.head);
+        if (run.logits == .none) return main_out;
+        var ref_run = run;
+        ref_run.want_hidden = false;
+        const ref_out = try ref_run.finish(g, &c, ref_final, layers.Head, &w.head);
+        var think_arg: ?ops.Array = null;
+        if (thinking_rows) |t_seq| {
+            think_arg = switch (run.logits) {
+                .last_row => try g.reshape(try g.sliceAxis(t_seq, 1, run.rows - 1, run.rows), &.{run.slots}),
+                .all_rows => try g.reshape(t_seq, &.{run.slots * run.rows}),
+                .none => unreachable,
+            };
+        }
+        const guided = try kernels.loopcdGuide(g, main_out.logits, ref_out.logits, think_arg, kernels.loopcd_max_strength, kernels.loopcd_first_control);
+        return .{ .logits = guided, .hidden = main_out.hidden };
     }
 };
 
@@ -414,9 +494,10 @@ const Opened = struct {
     n: usize = 0,
     rows: u32 = 1,
     held: ops.Array = .{},
+    held_thinking: ops.Array = .{},
 
     fn deinit(o: *Opened) void {
-        for ([_]abi.Array{ o.fo.logits, o.fo.hidden, .{ .ctx = o.held.ctx } }) |x| if (x.ctx != null) {
+        for ([_]abi.Array{ o.fo.logits, o.fo.hidden, .{ .ctx = o.held.ctx }, .{ .ctx = o.held_thinking.ctx } }) |x| if (x.ctx != null) {
             _ = mlx.mlx_array_free(.{ .ctx = x.ctx });
         };
         gpa.free(o.opens);
@@ -606,7 +687,7 @@ fn openGroup(m: *Loaded, fs: []const abi.Forward) !*Opened {
         }
     }
     const sp = w.spec.?;
-    o.opens = try gpa.alloc(kernels.Open, cfg.visits());
+    o.opens = try gpa.alloc(kernels.Open, cfg.totalVisits());
     @memset(o.opens, .{ .g = g });
     sp.opens = o.opens;
     defer sp.opens = null;
@@ -628,6 +709,8 @@ fn openGroup(m: *Loaded, fs: []const abi.Forward) !*Opened {
     // Other slots' rounds may open before this one's accept: its taps stay with it.
     o.held = sp.held;
     sp.held = .{};
+    o.held_thinking = sp.held_thinking;
+    sp.held_thinking = .{};
     return o;
 }
 
@@ -663,6 +746,13 @@ fn commitLane(m: *Loaded, o: *Opened, i: usize, accepted: u32) !u64 {
     const r: run_mod.Run = .{ .mode = .verify, .rows = kept, .positions = &positions, .caches = &handles, .cache_ops = o.cache_ops };
     var c = r.ctx(o.g, &m.base.shared);
     try kernels.commit(&c, &m.base.weights.body.cfg, o.opens, kept, i, o.n);
+    if (o.held_thinking.ctx != null) {
+        const at_slot: c_int = @intCast(i);
+        const row_t = try o.g.sliceAxis(o.held_thinking, 0, at_slot, at_slot + 1);
+        const last_t = try o.g.contiguous(try o.g.sliceAxis(row_t, 1, kept - 1, kept));
+        c.layer = 0;
+        try kv.setState(&c, .ssm, last_t);
+    }
     const at: c_int = @intCast(i * o.rows);
     try sp.push(o.g, lane.position, &.{try o.g.sliceAxis(o.held, 1, at, at + kept)});
     return @as(u64, lane.position) + @as(u64, @intCast(kept));
@@ -849,7 +939,7 @@ fn stepGroup(m: *Loaded, fs: []const abi.Forward, outs: []abi.ForwardOut) !abi.V
         sp.context = contexts[i];
     }
 
-    const opens = try gpa.alloc(kernels.Open, cfg.visits());
+    const opens = try gpa.alloc(kernels.Open, cfg.totalVisits());
     defer gpa.free(opens);
     const tctx: kernels.TreeCtx = .{ .parent = tree.parent, .meta = tree.tmeta };
     for (opens) |*o| o.* = .{ .g = &g, .tree = tctx };
@@ -879,6 +969,11 @@ fn stepGroup(m: *Loaded, fs: []const abi.Forward, outs: []abi.ForwardOut) !abi.V
     sp.held = .{};
     defer if (held.ctx != null) {
         _ = mlx.mlx_array_free(held);
+    };
+    const held_thinking = sp.held_thinking;
+    sp.held_thinking = .{};
+    defer if (held_thinking.ctx != null) {
+        _ = mlx.mlx_array_free(held_thinking);
     };
     if (!v.isOk()) return v;
 
@@ -937,6 +1032,14 @@ fn stepGroup(m: *Loaded, fs: []const abi.Forward, outs: []abi.ForwardOut) !abi.V
         const crun: run_mod.Run = .{ .mode = .verify, .rows = @intCast(kept), .positions = &p_one, .caches = &h_one, .cache_ops = fs[0].cache_ops };
         var cc = crun.ctx(&g, &m.base.shared);
         try kernels.commitPath(&cc, cfg, opens, path[0..kept], i, n);
+        if (held_thinking.ctx != null) {
+            const at_slot: c_int = @intCast(i);
+            const last_r: c_int = @intCast(path[kept - 1]);
+            const row_t = try g.sliceAxis(held_thinking, 0, at_slot, at_slot + 1);
+            const last_t = try g.contiguous(try g.sliceAxis(row_t, 1, last_r, last_r + 1));
+            cc.layer = 0;
+            try kv.setState(&cc, .ssm, last_t);
+        }
 
         const at: c_int = @intCast(i * w_rows);
         const lane_taps = if (linear)
@@ -1345,6 +1448,7 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     const embed_dt = if (embed.s.ctx != null) ops.dtype(embed.s) else ops.dtype(embed.w);
     const use_f16 = (gen != 0 and gen < 15) and embed_dt == .bfloat16 and std.c.getenv("INKLING_FORCE_BF16") == null;
     if (use_f16) log.info("[inkling2] M1/M2 native FP16 trunk + coalesced gates enabled (gen={d})\n", .{gen});
+    if (c.loopcd) log.info("[inkling2] LoopCD enabled: coda_visits={d} total_visits={d} skip_thinking={}\n", .{ c.codaVisits(), c.totalVisits(), c.loopcd_skip_thinking });
     const at: At = .{ .r = &r, .o = &m.owned, .release = release, .f16_opt = use_f16 };
     try at.castLinearInPlace(&embed);
     try m.owned.linear(embed);

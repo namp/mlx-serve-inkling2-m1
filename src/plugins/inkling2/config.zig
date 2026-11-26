@@ -161,6 +161,10 @@ pub const Config = struct {
     core_end: u32 = 0,
     passes: u32 = 1,
     gate_rank: u32 = 0,
+    /// LoopCD contrastive decoding (arXiv:2610.02185): runs coda layers on pass-0 state as reference.
+    loopcd: bool = false,
+    /// LoopCD Exclude Thinking Blocks: leaves thinking blocks and control-token probabilities unguided.
+    loopcd_skip_thinking: bool = false,
     quant: abi.Quant = .{},
     block_json: []const u8 = "{}",
     vision: ?Vision = null,
@@ -174,17 +178,28 @@ pub const Config = struct {
         return c.core_end - c.core_start;
     }
 
-    /// Layer applications per token.
+    /// Main-branch layer applications per token (excludes LoopCD reference coda visits).
     pub fn visits(c: *const Config) u32 {
         return c.num_hidden_layers + (c.passes - 1) * c.core();
     }
 
-    /// The layer visit `v` runs and its pass through the loop (0 outside it).
+    /// Extra reference coda visits appended when LoopCD is active (0 when off).
+    pub fn codaVisits(c: *const Config) u32 {
+        return if (c.loopcd and c.core_end < c.num_hidden_layers) c.num_hidden_layers - c.core_end else 0;
+    }
+
+    /// Total cache and state entries per token (main visits + LoopCD reference coda visits).
+    pub fn totalVisits(c: *const Config) u32 {
+        return c.visits() + c.codaVisits();
+    }
+
+    /// The layer visit `v` runs and its pass through the loop (0 outside it, and 0 for LoopCD reference coda).
     pub fn visit(c: *const Config, v: u32) struct { layer: u32, pass: u32 } {
         if (v < c.core_start or c.core() == 0) return .{ .layer = v, .pass = 0 };
         const looped = c.passes * c.core();
         if (v < c.core_start + looped) return .{ .layer = c.core_start + (v - c.core_start) % c.core(), .pass = (v - c.core_start) / c.core() };
-        return .{ .layer = v - looped + c.core(), .pass = 0 };
+        if (v < c.visits()) return .{ .layer = v - looped + c.core(), .pass = 0 };
+        return .{ .layer = c.core_end + (v - c.visits()), .pass = 0 };
     }
 
     /// Depth blocks opened by layers below `layer`.
@@ -396,6 +411,8 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
     c.core_end = 0;
     c.passes = 1;
     c.gate_rank = 0;
+    c.loopcd = false;
+    c.loopcd_skip_thinking = false;
     c.quant = .{};
     c.block_json = "{}";
     c.vision = null;
@@ -446,7 +463,11 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
             c.gate_rank == 0 or c.gate_rank > 4096 or c.blocksBefore(c.core_end) - c.blocksBefore(c.core_start) < 2)
             return unsupported("loop_config out of range");
     }
-    if (c.visits() > max_visits) return unsupported("too many layer visits");
+    if (@import("../../env.zig").on(.MLX_SERVE_INKLING2_LOOPCD) and c.passes >= 2 and c.core() > 0 and c.core_end < c.num_hidden_layers) {
+        c.loopcd = true;
+        c.loopcd_skip_thinking = @import("../../env.zig").on(.MLX_SERVE_INKLING2_LOOPCD_SKIP_THINKING);
+    }
+    if (c.totalVisits() > max_visits) return unsupported("too many layer visits");
 
     if (field(root, "vision_config")) |vc| if (vc == .object) {
         c.vision = readVision(vc.object) orelse return unsupported("vision_config out of range");
@@ -481,8 +502,8 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
         .vocab_size = c.unpadded_vocab_size,
         .hidden_size = c.hidden_size,
         .intermediate_size = c.moe_intermediate_size,
-        // The engine sizes caches and bills per layer applied.
-        .num_hidden_layers = c.visits(),
+        // The engine sizes caches and bills per layer applied (including LoopCD reference coda visits).
+        .num_hidden_layers = c.totalVisits(),
         .num_attention_heads = c.num_attention_heads,
         .num_key_value_heads = c.num_key_value_heads,
         .head_dim = c.head_dim,
@@ -498,7 +519,7 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
     }
     c.quant = llama.readQuant(root) catch return unsupported("the quantization block");
     s.quant = c.quant;
-    p.cache.ssm_state = .{ .entries = c.visits(), .dtype = .f32 };
+    p.cache.ssm_state = .{ .entries = c.totalVisits(), .dtype = .f32 };
     c.ring = sliding_ring.rows(c.sliding_window);
     p.cache.sliding_ring = c.ring;
     if (!stub) generation.apply(dir, s);
@@ -518,7 +539,7 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
 pub fn layout(p: *const abi.Parsed, span: ?*const abi.LayerSpan, out: [*]abi.LayerCache, cap: u32) callconv(.c) u32 {
     if (span != null) return 0;
     const c = of(p);
-    const n = @min(c.visits(), cap);
+    const n = @min(c.totalVisits(), cap);
     for (out[0..n], 0..) |*o, v| {
         const g = c.global[c.visit(@intCast(v)).layer];
         o.* = .{
