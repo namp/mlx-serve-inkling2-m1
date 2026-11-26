@@ -104,6 +104,9 @@ pub const ForwardCtx = struct {
     /// A prompt forward read at most at its last row's logits (no prompt logprobs): a model declaring
     /// `Caps.prompt_last_row` is asked for that row alone.
     last_row_logits: bool = false,
+    /// An interior prefill chunk whose logits and hidden rows are discarded: `owns_decode_state` plugins receive
+    /// `abi.Logits.none` with `want_hidden = false`.
+    no_logits: bool = false,
     /// The engine's prompt forwarding: a prompt chunk, or the split prefill's final-token span, which is one row and so
     /// reaches the plugin as `Mode.decode`. False from the first decode step on. Reaches plugins as `Forward.prefill`,
     /// which the calibration tap gates on: by mode alone, the last prompt token is dropped.
@@ -209,6 +212,9 @@ pub const ForwardCtx = struct {
     /// A served model's id for this slot (`Forward.slots`), 0 until its first forward, and what its last `defer_host`
     /// forward left owed (`plugin/settle.zig`).
     plugin_slot: u32 = 0,
+    /// The request's first prompt forward names this earlier slot (`Forward.adopt_slot`); cleared once handed over.
+    adopt_slot: u32 = 0,
+    adopt_len: u64 = 0,
     plugin_owed: abi.Owed = .none,
 
     /// The shell's own sequence (`defaultCtx`, rebuilt per call): one id across its forwards.

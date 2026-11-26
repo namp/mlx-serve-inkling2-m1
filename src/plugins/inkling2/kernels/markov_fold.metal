@@ -15,51 +15,24 @@ const uint lane = thread_index_in_simdgroup;
 const uint sg = t / 32;
 const uint V = FOLD_shape[1];
 const size_t at = size_t(AT[0]);
-for (uint r = t; r < R; r += TG) lat[r] = float(T(metal::precise::tanh(P[2 * R + r]))) * (Q8 ? FSCALE[r] : 1.0f);
+for (uint r = t; r < R; r += TG) lat[r] = float(T(metal::precise::tanh(P[2 * R + r])));
 threadgroup_barrier(mem_flags::mem_threadgroup);
 const uint v0 = (tg * TG + t) * VPT;
 float acc[VPT];
 for (uint j = 0; j < VPT; j++) acc[j] = 0.0f;
-if (v0 < VOCAB) {
-    if (Q8) {
-        const device char* fq = (const device char*)FOLD;
-        for (uint r = 0; r < R; r++) {
-            const vec<char, VPT> f = *(const device vec<char, VPT>*)(fq + size_t(r) * V + v0);
-            const float lr = lat[r];
-            for (uint j = 0; j < VPT; j++) acc[j] += lr * float(f[j]);
-        }
-    } else {
-        const device T* ft = (const device T*)FOLD;
-        for (uint r = 0; r < R; r++) {
-            const vec<T, VPT> f = *(const device vec<T, VPT>*)(ft + size_t(r) * V + v0);
-            const float lr = lat[r];
-            for (uint j = 0; j < VPT; j++) acc[j] += lr * float(f[j]);
-        }
-    }
+if (v0 < VOCAB) for (uint r = 0; r < R; r++) {
+    const vec<T, VPT> f = *(const device vec<T, VPT>*)(FOLD + size_t(r) * V + v0);
+    for (uint j = 0; j < VPT; j++) acc[j] += lat[r] * float(f[j]);
 }
-const float cap = CAP[0];
-const float inv_t = SAMP ? as_type<float>(SP[0]) : 1.0f;
-const uint gseed = SAMP ? SP[1] : 0u;
-const uint gq0 = SAMP ? SP[2] : 0u;
 float lg[VPT];
 float m = -INFINITY;
 uint mi = NONE;
 for (uint j = 0; j < VPT; j++) {
     const uint v = v0 + j;
-    if (v < VOCAB) {
-        const float raw = BASE[at * V + v] + float(T(T(acc[j]) + FB[v]));
-        if (SAMP) {
-            const float cl = (cap > 0 ? cap * metal::precise::tanh(raw / cap) : raw) * inv_t;
-            lg[j] = cl + msv_ink2_gumbel(gseed, gq0, v);
-        } else {
-            lg[j] = raw;
-        }
-        if (mi == NONE || msv_ink2_better(lg[j], v, m, mi)) {
-            m = lg[j];
-            mi = v;
-        }
-    } else {
-        lg[j] = -INFINITY;
+    lg[j] = v < VOCAB ? BASE[at * V + v] + float(T(T(acc[j]) + FB[v])) : -INFINITY;
+    if (v < VOCAB && (mi == NONE || msv_ink2_better(lg[j], v, m, mi))) {
+        m = lg[j];
+        mi = v;
     }
 }
 for (ushort off = 16; off > 0; off >>= 1) {
@@ -83,16 +56,11 @@ for (uint g = 1; g < TG / 32; g++) {
         at_top = ri[g];
     }
 }
-const float ctop = (!SAMP && cap > 0) ? cap * metal::precise::tanh(top / cap) : top;
+const float cap = CAP[0];
+const float ctop = cap > 0 ? cap * metal::precise::tanh(top / cap) : top;
 float s = 0.0f;
 for (uint j = 0; j < VPT; j++) {
-    if (v0 + j < VOCAB) {
-        if (SAMP) {
-            s += metal::precise::exp((lg[j] - top) * 1.15f);
-        } else {
-            s += metal::precise::exp((cap > 0 ? cap * metal::precise::tanh(lg[j] / cap) : lg[j]) - ctop);
-        }
-    }
+    if (v0 + j < VOCAB) s += metal::precise::exp((cap > 0 ? cap * metal::precise::tanh(lg[j] / cap) : lg[j]) - ctop);
 }
 s = simd_sum(s);
 if (lane == 0) rs[sg] = s;

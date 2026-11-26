@@ -1,16 +1,44 @@
-// Inkling 2, a few rows: the picked experts' gate and up projections and the soft-capped SwiGLU in one launch, the
-// packed bank read in place.
-// SUB16 == 1 (FMT == 0 NVFP4, K%16==0, I%4==0): 16-lane sub-warps with uint2 (16-val group, 128B exact cache-line
-// loads, 9 exact full iterations on K=2304, HALF the scale loads/decodes, hoisted 2^22, fma()). Each half-warp owns
-// 2 intermediate rows (4 weight rows); each SIMD group owns ROWS=4 intermediate rows -> 273 GB/s on M1 Max.
+// Inkling 2, one row (or small non-grouped fallback): router picks (when ROUTE), picked experts' gate/up projections
+// and soft-capped SwiGLU in one launch, the packed bank read in place.
+// SUB16 == 1 (FMT == 0 NVFP4, K%16==0, I%4==0): 16-lane sub-warps with uint2 (128B exact cache-line loads, 9 exact
+// full iters on K=2304, hoisted 2^22, fma(), f32 global_scale before narrowing) -> 273 GB/s on M1 Max.
 // SUB16 == 0: general fallback supporting MXFP4, MXFP8, affine (2..8 bits) and arbitrary I.
 const uint lane = thread_index_in_simdgroup;
 const uint e = thread_position_in_grid.z;
+const uint tid = thread_position_in_threadgroup.x + 32 * thread_position_in_threadgroup.y;
+constexpr uint TGN = 32 * SGS;
+threadgroup float key[E];
+threadgroup float raw[KSEL];
+threadgroup uint pick[KSEL];
+uint ex = 0;
+if (ROUTE) {
+    const uint srow0 = (e / KSEL) * E;
+    float sig[(E + TGN - 1) / TGN];
+    for (uint f = tid, j = 0; f < E; f += TGN, j++) {
+        sig[j] = 1.0f / (1.0f + exp(-SCR[srow0 + f]));
+        key[f] = sig[j] + RB[f];
+    }
+    if (tid < KSEL) { pick[tid] = tid; raw[tid] = 0.0f; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint f = tid, j = 0; f < E; f += TGN, j++) {
+        const float mine = key[f];
+        uint rank = 0;
+        for (uint h = 0; h < E; h++) rank += (key[h] > mine || (key[h] == mine && h < f)) ? 1u : 0u;
+        if (rank < KSEL && mine == mine) { pick[rank] = f; raw[rank] = sig[j]; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    ex = pick[e % KSEL];
+    if (thread_position_in_grid.y == 0 && tid == 0) {
+        float tot = 0.0f;
+        for (uint k = 0; k < KSEL; k++) tot += raw[k];
+        PIDX[e] = ex;
+        PWTS[e] = raw[e % KSEL] / (tot + 1e-20f) * RS[0];
+    }
+} else ex = IDX[e];
 const device T* x = X + size_t(e / KSEL) * K;
 constexpr uint WPR = FMT == 2 ? K / 4 : K / 8;
 constexpr uint WBR = K * BITS / 8;
 constexpr uint SPR = K / GS;
-const uint ex = IDX[e];
 
 if (SUB16) {
     const uint hid = lane >> 4;
@@ -41,14 +69,14 @@ if (SUB16) {
             acc[r] = fma(d, mlxserve_fp4_scale(uint(srow[r * SPR + g])), acc[r]);
         }
     }
-    const float sc = (SCALED ? SC[ex] : 1.0f) * 4194304.0f;
+    const float sc = SCALED ? SC[ex] : 1.0f;
     for (uint r = 0; r < 2; r++) {
         float gv = acc[2 * r], uv = acc[2 * r + 1];
         gv += simd_shuffle_xor(gv, 8); gv += simd_shuffle_xor(gv, 4); gv += simd_shuffle_xor(gv, 2); gv += simd_shuffle_xor(gv, 1);
         uv += simd_shuffle_xor(uv, 8); uv += simd_shuffle_xor(uv, 4); uv += simd_shuffle_xor(uv, 2); uv += simd_shuffle_xor(uv, 1);
         if (slane == r) {
-            const float g = SCALED ? (gv * sc) : float(T(gv * sc));
-            const float u = SCALED ? (uv * sc) : float(T(uv * sc));
+            const float g = PRESCALE ? (gv * 4194304.0f * sc) : (float(T(gv * 4194304.0f)) * sc);
+            const float u = PRESCALE ? (uv * 4194304.0f * sc) : (float(T(uv * 4194304.0f)) * sc);
             const float capped = (precise::tanh(g * PR[0]) * PR[1]) * (precise::tanh(u * PR[2]) * PR[3]);
             ACT[e * I + row0 + r] = T(capped / (1.0f + precise::exp(-g)));
         }
@@ -63,52 +91,18 @@ if (SUB16) {
     const device S* ba = (const device S*)WB + base * SPR;
     float acc[2 * ROWS];
     for (uint r = 0; r < 2 * ROWS; r++) acc[r] = 0.0f;
-    if (FMT == 0) {
-        for (uint w = lane; w < WPR; w += 32) {
-            const device vec<T, 4>* xp = (const device vec<T, 4>*)(x + w * 8);
-            const vec<T, 4> x0 = xp[0], x1 = xp[1];
-            const float xr0 = float(x0[0]), xr1 = float(x0[1]), xr2 = float(x0[2]), xr3 = float(x0[3]);
-            const float xr4 = float(x1[0]), xr5 = float(x1[1]), xr6 = float(x1[2]), xr7 = float(x1[3]);
-            const uint sidx = w >> 1;
-            for (uint r = 0; r < 2 * ROWS; r++) {
-                const uint q = wrow[r * WPR + w];
-                const float2 p0 = mlxserve_e2m1x2(q, 0), p1 = mlxserve_e2m1x2(q, 1);
-                const float2 p2 = mlxserve_e2m1x2(q, 2), p3 = mlxserve_e2m1x2(q, 3);
-                float d = fma(xr0, p0.x, xr4 * p0.y);
-                d = fma(xr1, p1.x, fma(xr5, p1.y, d));
-                d = fma(xr2, p2.x, fma(xr6, p2.y, d));
-                d = fma(xr3, p3.x, fma(xr7, p3.y, d));
-                acc[r] = fma(d, mlxserve_fp4_scale(uint(srow[r * SPR + sidx])), acc[r]);
-            }
-        }
-        const float sc = (SCALED ? SC[ex] : 1.0f) * 4194304.0f;
-        for (uint r = 0; r < ROWS; r++) {
-            const float g = SCALED ? (simd_sum(acc[2 * r]) * sc) : float(T(simd_sum(acc[2 * r]) * sc));
-            const float u = SCALED ? (simd_sum(acc[2 * r + 1]) * sc) : float(T(simd_sum(acc[2 * r + 1]) * sc));
-            const float capped = (precise::tanh(g * PR[0]) * PR[1]) * (precise::tanh(u * PR[2]) * PR[3]);
-            if (lane == r) ACT[e * I + row0 + r] = T(capped / (1.0f + precise::exp(-g)));
-        }
-    } else {
-        for (uint k = lane * 16; k < K; k += 512) {
-            float xr[16];
-            const device vec<T, 4>* xp = (const device vec<T, 4>*)(x + k);
-            for (uint v = 0; v < 4; v++) {
-                const vec<T, 4> x4 = xp[v];
-                xr[4 * v + 0] = float(x4[0]);
-                xr[4 * v + 1] = float(x4[1]);
-                xr[4 * v + 2] = float(x4[2]);
-                xr[4 * v + 3] = float(x4[3]);
-            }
-            for (uint r = 0; r < 2 * ROWS; r++)
-                acc[r] += FMT == 3 ? msv_ink2_affine_chunk<S, BITS, GS>(arow + r * WBR, sa + r * SPR, ba + r * SPR, k / 16, xr)
-                                   : msv_ink2_chunk(FMT, wrow + r * WPR, srow + r * SPR, k / 16, xr);
-        }
-        const float sc = SCALED ? SC[ex] : 1.0f;
-        for (uint r = 0; r < ROWS; r++) {
-            const float g = SCALED ? (simd_sum(acc[2 * r]) * sc) : float(T(simd_sum(acc[2 * r])));
-            const float u = SCALED ? (simd_sum(acc[2 * r + 1]) * sc) : float(T(simd_sum(acc[2 * r + 1])));
-            const float capped = (precise::tanh(g * PR[0]) * PR[1]) * (precise::tanh(u * PR[2]) * PR[3]);
-            if (lane == r) ACT[e * I + row0 + r] = T(capped / (1.0f + precise::exp(-g)));
-        }
+    for (uint k = lane * 16; k < K; k += 512) {
+        float xr[16];
+        for (uint i = 0; i < 16; i++) xr[i] = float(x[k + i]);
+        for (uint r = 0; r < 2 * ROWS; r++)
+            acc[r] += FMT == 3 ? msv_ink2_affine_chunk<S, BITS, GS>(arow + r * WBR, sa + r * SPR, ba + r * SPR, k / 16, xr)
+                               : msv_ink2_chunk(FMT, wrow + r * WPR, srow + r * SPR, k / 16, xr);
+    }
+    const float sc = SCALED ? SC[ex] : 1.0f;
+    for (uint r = 0; r < ROWS; r++) {
+        const float g = PRESCALE ? (simd_sum(acc[2 * r]) * sc) : (float(T(simd_sum(acc[2 * r]))) * sc);
+        const float u = PRESCALE ? (simd_sum(acc[2 * r + 1]) * sc) : (float(T(simd_sum(acc[2 * r + 1]))) * sc);
+        const float capped = (precise::tanh(g * PR[0]) * PR[1]) * (precise::tanh(u * PR[2]) * PR[3]);
+        if (lane == r) ACT[e * I + row0 + r] = T(capped / (1.0f + precise::exp(-g)));
     }
 }

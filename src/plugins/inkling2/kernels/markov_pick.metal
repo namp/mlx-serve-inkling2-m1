@@ -41,16 +41,10 @@ for (uint g = 1; g < 8; g++) {
     }
 }
 const float cap = CAP[0];
-const float ctop = (!SAMP && cap > 0) ? cap * metal::precise::tanh(top / cap) : top;
+const float ctop = cap > 0 ? cap * metal::precise::tanh(top / cap) : top;
 float s = 0.0f;
 for (uint i = t; i < NT; i += 256) {
-    if (PI[i] != NONE) {
-        if (SAMP) {
-            s += PS[i] * metal::precise::exp((PM[i] - top) * 1.15f);
-        } else {
-            s += PS[i] * metal::precise::exp((cap > 0 ? cap * metal::precise::tanh(PM[i] / cap) : PM[i]) - ctop);
-        }
-    }
+    if (PI[i] != NONE) s += PS[i] * metal::precise::exp((cap > 0 ? cap * metal::precise::tanh(PM[i] / cap) : PM[i]) - ctop);
 }
 s = simd_sum(s);
 if (lane == 0) rs[sg] = s;

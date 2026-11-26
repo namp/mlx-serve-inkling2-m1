@@ -8,17 +8,17 @@ const uint row0 = thread_position_in_grid.y * SROWS;
 const uint j = thread_position_in_grid.z;
 const uint t = thread_position_in_threadgroup.x;
 const uint S = ST_shape[1];
-if (PROJ) {
+if constexpr (PROJ != 0) {
     const uint e = (j * S + row0) * D + i;
     Y[e] = (1.0f - precise::tanh(F[e])) * A[e] + precise::tanh(G[e]) * MS[e];
-} else if (TRANS) {
+} else if constexpr (TRANS != 0) {
     threadgroup float st_tg[SROWS * RANK];
     for (uint k = t; k < SROWS * RANK; k += TG) {
         st_tg[k] = float(ST[(j * S + row0) * RANK + k]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const device GT* fp = F + size_t(j * RANK) * D + i;
-    const device GT* gp = G + size_t(j * RANK) * D + i;
+    const auto fp = F + size_t(j * RANK) * D + i;
+    const auto gp = G + size_t(j * RANK) * D + i;
     float f[SROWS], g[SROWS];
     for (uint r_i = 0; r_i < SROWS; r_i++) { f[r_i] = 0.0f; g[r_i] = 0.0f; }
     for (uint r = 0; r < RANK; r++) {

@@ -1,14 +1,34 @@
 # mlx-serve-inkling2-m1
 
-Apple M1 / M2 optimizations for **Inkling 2 Mini (`inkling2_loop`)** — developed and tested on an **Apple M1 Max (64 GB)** with **Inkling 2 Mini Uncensored** (and compatible with any Inkling 2 Mini MLX/canonical checkpoint) on top of [ddalcu/mlx-serve](https://github.com/ddalcu/mlx-serve) (`2fe9be8`, MIT License), plus a virtually lossless Q4-attention / Q6-head requantization tool and streaming SSE reasoning fix.
+Apple M1 / M2 optimizations for **Inkling 2 Mini (`inkling2_loop`)** — developed and tested on an **Apple M1 Max (64 GB)** with **Inkling 2 Mini Uncensored** (and compatible with any Inkling 2 Mini MLX/canonical checkpoint) on top of [ddalcu/mlx-serve](https://github.com/ddalcu/mlx-serve) (`7f41957`, including [PR #1331](https://github.com/ddalcu/mlx-serve/pull/1331), MIT License), plus a virtually lossless Q4-attention / Q6-head requantization tool, Lucebox Fast `o_proj` graft tool, and streaming SSE reasoning fix.
 
-> **Upstream credit & license:** Based on [ddalcu/mlx-serve](https://github.com/ddalcu/mlx-serve) commit `2fe9be834a601c70ef1a597563026340f0e722fe` by David Dalcu, preserved under the original [MIT License](LICENSE) (see [NOTICE](NOTICE) and [README_UPSTREAM.md](README_UPSTREAM.md) for full upstream documentation). Grouped expert deduplication and shared Gumbel-Max speculative coupling ideas were adapted for Apple M1/M2 from [dangxingyu/megakernel-zoo](https://github.com/dangxingyu/megakernel-zoo) (`engines/inkling-2-mini_m5max`); native Inkling-2-Mini DFlash 2 contract details (`selector_softcap_mode: "after_correction"`, full `embed_norm ∘ embed_tokens`, valid vocab `200,058`) follow [incoai/Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) and [ARahim3/mlx-dspark](https://github.com/ARahim3/mlx-dspark); the anti-overthinking `o_proj` graft tool extracts Apache-2.0 deltas from [Lucebox/Inkling-2-Mini-Fast-GGUF](https://huggingface.co/Lucebox/Inkling-2-Mini-Fast-GGUF). No model weights are distributed in this repository.
+> **Upstream credit & license:** Rebased onto [ddalcu/mlx-serve](https://github.com/ddalcu/mlx-serve) commit `7f41957007ab21a15c4371e3f53e93c27d1b39e8` (incorporating [PR #1331](https://github.com/ddalcu/mlx-serve/pull/1331) by David Dalcu — GPU DFlash 2 best-first tree verification, fused Metal vision tower, `At.joinQuant` 64-row padding, and prefix-cache respell fixes), preserved under the original [MIT License](LICENSE) (see [NOTICE](NOTICE) and [README_UPSTREAM.md](README_UPSTREAM.md) for full upstream documentation). Grouped expert deduplication ideas were adapted for Apple M1/M2 from [dangxingyu/megakernel-zoo](https://github.com/dangxingyu/megakernel-zoo) (`engines/inkling-2-mini_m5max`); native Inkling-2-Mini DFlash 2 contract details follow [incoai/Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) and [ARahim3/mlx-dspark](https://github.com/ARahim3/mlx-dspark); the anti-overthinking `o_proj` graft tool extracts Apache-2.0 deltas from [Lucebox/Inkling-2-Mini-Fast-GGUF](https://huggingface.co/Lucebox/Inkling-2-Mini-Fast-GGUF). No model weights are distributed in this repository.
 
 ---
 
 ## Highlights (Inkling 2 Mini Uncensored on Apple M1 Max, 64 GB, `--kv-quant 4`, `--ctx-size 1048576`)
 
-### 1. Native Metal DFlash 2 (`incoai/Inkling-2-Mini-DFlash2`) + Lucebox Fast `o_proj` Graft
+### 1. Rebase onto Upstream PR #1331 + M1 Max GPU DFlash 2 Best-First Tree (`W=8`)
+
+All proven M1/M2 optimizations (native FP16 trunk, coalesced transposed message gates, `SUB16`/`SUB8` NVFP4 MoE kernels, fused Q4/Q8 KV decode + tree-aware `S=2..8` verify, 4-bit `L.o` bypass, hoisted constants) have been rebased onto upstream **PR #1331** (`mlx-serve 26.11.4`), tuned specifically for M1 Max:
+
+- **Solo `W=8` GPU best-first tree on M1/M2 (`plugin.zig`):** `simd_qmm` covers `M=8` cleanly on M1 Max (`70.7 ms` vs `70.6 ms` at `W=7`), giving a free 8th tree node that boosts accepted tokens/round by **+12% to +26%**.
+- **Greedy strong-copy bypass (`dspark.zig`):** Skips the 5-layer DFlash 2 forward on greedy n-gram copy matches and verifies up to 15 copied tokens in one pass (`avg=5.00`, 16-row copy rounds).
+- **Tree-mode stochastic prior (`generate/init.zig`):** Uses a `0.80` initial prior (instead of the 1D chain `0.70`) when GPU best-first tree mode (`nativeStepGroupAvail`) is active so our ~20 ms M1 Max serial step doesn't lock `T=1.0` requests out of tree drafting on token 0.
+- **Thermally-bracketed M1 Max A/B (`Prev M1-Opt DFlash2 A1` → `PR #1331 + M1-Opt` → `Prev M1-Opt DFlash2 A2`, 25s cooldown, Fast-Uncensored Q4-attn pack + BF16 vision):**
+
+| Benchmark | Prev M1-Opt Avg (`A1`/`A2`) | **PR #1331 + M1-Opt (`W=8` Tree)** | Delta |
+|---|---:|---:|---:|
+| **Core-6 Effective tok/s** | `52.52 eff tok/s` (`54.57` / `50.47`) | **`54.39 eff tok/s`** | **+3.6%** |
+| **`code_t0` (`T=0`)** | `64.2 tok/s` (`68.4` / `60.0`) | **`73.7 tok/s`** (`avg=5.00`) | **+14.8%** |
+| **`code_t1` (`T=1.0`)** | `56.1 tok/s` (`59.6` / `52.6`) | **`57.4 tok/s`** (`avg=3.77`) | **+2.3%** |
+| **`math_t0` (`T=0`)** | `58.5 tok/s` (`62.6` / `54.4`) | **`62.3 tok/s`** (`avg=4.01`) | **+6.5%** |
+| **`math_t1` (`T=1.0`) / `edit_t0` (`T=0`)** | `55.5` / `65.9 tok/s` | `52.2` / `63.6 tok/s` (`avg=5.00`) | `-5.9%` / `-3.5%` |
+| **`greek_t1` (`T=1.0`)** | `43.5 tok/s` (`45.4` / `41.5`) | `38.0 tok/s` (`avg=1.71`) | `-12.6%` |
+| **BF16 Vision (`7391`, steady wall)** | `2.36s` (`2.33s` / `2.39s`) | **`1.53s`** (`1.23s` live on `:8085`) | **-35.2%** |
+| **8K Q4 KV (`8,059` pt, `T=1.0`)** | `31.80s` wall (`pp 319.9`, `dec 52.4`) | **`28.53s` wall** (`pp 324.5`, `dec 51.4`) | **-10.3% wall** |
+
+### 2. Earlier M1-Opt Native DFlash 2 + Lucebox Fast `o_proj` Graft Baseline
 
 Stacking native **DFlash 2** parallel block-diffusion drafting (`src/plugins/inkling2/dflash2.zig`) with Lucebox's 24-layer `o_proj` anti-overthinking graft (`tools/graft_lucebox_fast.py`) delivers **~2.3–2.5× faster end-to-end wall-clock answers** on M1 Max while preserving uncensored behavior, 1M Q4 KV context, 8 GB SSD prefix cache, and BF16 vision:
 
@@ -152,10 +172,10 @@ Serve with 1M context, Q4 KV caching, and an 8 GB SSD prefix cache (sized for 64
   --os-reserve-gib 16 --max-concurrent 1 \
   --kv-quant 4 \
   --prefix-cache-entries 8 --no-prefix-cache-ram --prefix-cache-disk 8GB \
-  --temp 1.0 --top-p 1.0 --top-k 0
+  --temp 1.0 --top-p 1.0 --top-k 0 --warmup-full
 ```
 
-*(Add `--no-vision` if you don't need multimodal image input; with `model-vision.safetensors` present, BF16 vision works out of the box alongside DSpark.)*
+*(Pass `--warmup-full` so PR #1331's load-time `[rounds]` ladder completes before `:8085` opens and arms DFlash 2 GPU best-first tree verification from prompt #1; add `--no-vision` if you don't need multimodal image input.)*
 
 > **Prefix-cache sizing tip:** Under `--kv-quant 4`, a `50K–135K`-token session uses `~0.6–1.5 GB` of KV/checkpoint state, so `2GB` on disk can trigger LRU eviction races between rapid tool-call turns or multiple agent threads — `8GB` keeps 5–12 large sessions warm (`~0.10–0.25s` restore from SSD). Keep `--no-prefix-cache-ram` when using `--ctx-size 1048576` on 64 GB: `mlx-serve` reserves the full manual context at load time, clamping `--prefix-cache-mem` to `0 MB` while downgrading the SSD tier (`2048 -> 512 MB/flush`, `16 -> 8` SSM checkpoints/entry). Only remove `--no-prefix-cache-ram` if you also lower `--ctx-size` (e.g. `262144`) so RAM headroom remains. Note that `mlx-serve` reserves `min(64 GiB, 10% volume)` of free disk before arming the SSD tier.
 
@@ -163,19 +183,14 @@ Serve with 1M context, Q4 KV caching, and an 8 GB SSD prefix cache (sized for 64
 
 | Env Var | Effect |
 |---|---|
-| `INKLING_FORCE_BF16=1` | Disable M1/M2 native FP16 mode (fall back to BF16) |
+| `INKLING_FORCE_BF16=1` | Disable M1/M2 native FP16 trunk mode (fall back to BF16) |
 | `INKLING_NO_FUSED_QKV=1` | Disable fused Q4/Q8 KV decode attention (`qkv_ink2`) |
 | `INKLING_NO_FUSED_QKV_VERIFY=1` | Disable fused Q4/Q8 KV verify attention (`qkv_ink2_verify`) |
-| `MLX_SERVE_INKLING2_NO_DEDUP=1` | Disable grouped 4-pair expert deduplication during multi-row verify |
-| `INKLING_DFLASH2_DIR=<path>` | Load an external `DFlash2DraftModel` checkpoint directory (default: auto-loads `<model_dir>/dflash2` if present) |
-| `INKLING_DFLASH2_BITS=4\|6\|8\|16` | DFlash 2 drafter layer quantization width in affine BF16 (default `8` on M1/M2, `16` elsewhere) |
-| `INKLING_NO_DFLASH2=1` | Disable DFlash 2 and fall back to bundled `mtp.safetensors` (`dspark`) |
-| `INKLING_NO_DRAFT=1` | Force pure optimized serial decode (disables both DFlash 2 and DSpark drafters) |
-| `INKLING_NO_GUMBEL=1` | Disable Shared Gumbel-Max coupling on `T > 0` (fall back to one-hot Leviathan verify) |
-| `INKLING_DRAFT_BITS=4\|6\|8\|16` | Drafter transformer layer quantization width on M1/M2 (default `8`) |
-| `INKLING_DRAFT_MAX=1..7` | Cap drafted tokens per round on M1/M2 (default `6`, keeping verify `rows ≤ 7` in `verifyQmm`) |
-| `INKLING_NO_FOLD_Q8=1` | Keep Markov `d.fold` in FP16 instead of per-row symmetric INT8 |
-| `INKLING_PROFILE_DRAFT=1` | Log per-round `[ink2-prof]` draft/verify/commit timings |
+| `INKLING_TREE_WIDTH=2..16` | Override solo GPU best-first draft tree width (default `8` on M1/M2) |
+| `MLX_SERVE_INKLING2_TREE=0` | Disable GPU best-first draft tree (`stepGroup`) and fall back to chain verify |
+| `INKLING_DRAFT_MAX=1..15` | Cap chain verify drafts per round on M1/M2 (default `7`, `rows ≤ 8`) |
+| `INKLING_NO_DFLASH2=1` | Disable DFlash 2 (`drafter/` and `dflash2/`) and fall back to bundled `mtp.safetensors` |
+| `INKLING_NO_DRAFT=1` | Force pure optimized serial decode (disables both DFlash 2 and bundled drafters) |
 
 ### Benchmarking
 

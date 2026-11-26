@@ -300,10 +300,11 @@ emitted a real opener, `saw_think_open`). Guard: the stream/non-stream split inv
 the server invariant and branch on the model's choice, never "the model must think".
 
 ### A model that opens its own think block had no way in
-Defect: Gemma 4, LFM2.5-8B-A1B and Muse streamed their thought as the answer. Cause: the model's own opener
-(`<|channel>` + `thought`, a bare `<think>`, Muse's ` to=self<|message|>`) was swallowed by the marker skip before the
-plain arm saw it. Fix: `modelThinkOpener` latches before the marker skip; `promptOpensMuseHeader` arms the header skip
-at stream start. Guard: `test_thinking_tools.sh` 6b, the smoke matrix stream-vs-non-stream thinking check.
+Defect: Gemma 4, LFM2.5-8B-A1B, Muse and Inkling streamed their thought as the answer. Cause: the model's own opener
+(`<|channel>` + `thought`, a bare `<think>`, Muse's ` to=self<|message|>`, Inkling's `<|content_thinking|>`) was
+swallowed by the marker skip before the plain arm saw it. Fix: `modelThinkOpener` latches before the marker skip;
+`promptOpensMuseHeader` arms the header skip at stream start. Guard: `test_thinking_tools.sh` 6b, the smoke matrix
+stream-vs-non-stream thinking check (a family the matrix does not list is not guarded).
 
 ### `.hold_thinking` streamed nothing for seconds with tools
 Defect: with tools and thinking the first reasoning byte arrived after 4.4 s instead of 0.05 s. Cause: the hold arm
@@ -381,3 +382,11 @@ Cause: near its window pi asked `max_tokens` 1; the one token was the message op
 it, found no channel and returned null, and the generic split shipped the raw marker, which the leak trim (cutting at
 the invoke marker) let through. Fix: a text holding only the message head splits to empty content. Guard: corpus `a
 reply cut after its message opener ships no marker`.
+
+### An Inkling call that dropped the `,"` before `args` shipped `{}` (#1329)
+Defect: about half of Inkling 2 Mini's tool calls came back as `"arguments": "{}"` with a required parameter, at temp 0
+every time, serial decode too (the model writes `{"name":"read_file"args":{"path":"README.md"}}`). Cause: the dropped
+`,"` leaves the quotes unpaired, the string-aware brace scan found no balanced body and read it as truncation: NAME +
+`{}`. Fix: an unbalanced payload runs to its end tag (or the next call) and a body that does not parse ships the first
+`args` object that does (`salvageArgs`); a truncated one still ships `{}`. Guard: corpus `a payload missing the comma
+before args keeps its args`.

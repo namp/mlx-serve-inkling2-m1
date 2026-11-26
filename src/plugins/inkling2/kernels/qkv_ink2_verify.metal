@@ -1,8 +1,9 @@
 #define UNR _Pragma("clang loop unroll(full)")
-// Inkling 2 verify (S = 2..5 rows) directly over Q4/Q8 KV cache + S tiny FP16 candidate rows (k_new, v_new).
-// Zero KV dequantization, zero concat copy, reads Q4 KV ONCE for all S * GQA query rows simultaneously!
-// q: [1, HQ, S, DK] (non-contiguous ok), kq/vq: [1, HKV, Tk_old, DK/VPW] u32,
-// k_new/v_new: [1, HKV, S, DK] (T), rel: [1, S, HQ, R] (T).
+// Inkling 2 verify (S = 2..8 rows, chain OR tree) directly over Q4/Q8 KV cache + S tiny candidate rows (k_new, v_new).
+// Zero KV dequantization, zero concat copy, zero Q transpose; reads Q4/Q8 KV ONCE for all S * GQA query rows!
+// q: [1, S, HQ, DK] (p.q directly), kq/vq: [1, HKV, Tk_old, DK/VPW] u32,
+// k_new/v_new: [1, HKV, S, DK] (T), params: [2] f32 { scale, log_alpha },
+// sizes: [3] i32 { Tk, offset, log_n_floor }, rel: [1, S, HQ, R] (T), tmeta: [S, 2] i32 { depth, ancestors_mask }.
 constexpr int VPW = 32 / BITS;
 constexpr int M = SROWS * GQA;
 constexpr int NHT = (M + 7) / 8;
@@ -17,8 +18,11 @@ const uint sg = tid / 32;
 const uint hkv = threadgroup_position_in_grid.y;
 const uint split = threadgroup_position_in_grid.z;
 const uint nsplit = threadgroups_per_grid.z;
-const int Tk = tk[0];
-const float scale = scl[0];
+const int Tk = sizes[0];
+const int offset = sizes[1];
+const int log_n_floor = sizes[2];
+const float scale = params[0];
+const float log_alpha = params[1];
 const uint mask_bits = (1u << BITS) - 1u;
 const int per = Tk > 0 ? (((Tk + int(nsplit * NSG) - 1) / int(nsplit * NSG) + 7) / 8 * 8) : 0;
 const int s0 = int(split * NSG + sg) * per;
@@ -28,6 +32,20 @@ const ushort qid = lane / 4;
 const ushort fm = (qid & 4) + ((lane / 2) % 4);
 const ushort fn = (qid & 2) * 2 + (lane % 2) * 2;
 
+int r_depth[SROWS];
+uint r_mask[SROWS];
+float r_tau[SROWS];
+UNR for (int r = 0; r < SROWS; ++r) {
+  r_depth[r] = TREE ? tmeta[r * 2] : r;
+  r_mask[r] = TREE ? uint(tmeta[r * 2 + 1]) : 0xFFFFFFFFu;
+  float tau = 1.0f;
+  if constexpr (GLOBAL) {
+    const int tp = offset + 1 + r_depth[r];
+    if (tp > log_n_floor) tau = 1.0f + log_alpha * metal::log(float(tp) / float(log_n_floor));
+  }
+  r_tau[r] = tau;
+}
+
 threadgroup float tg[TGF];
 threadgroup float ml_tg[2 * NSG * NHT * 8];
 for (int i = int(tid); i < QTG; i += NSG * 32) {
@@ -36,7 +54,7 @@ for (int i = int(tid); i < QTG; i += NSG * 32) {
     const int r = idx / GQA;
     const int gi = idx % GQA;
     const long hq = (long)hkv * GQA + gi;
-    tg[i] = float(q[hq * (long)q_strides[1] + (long)r * (long)q_strides[2] + e]) * scale;
+    tg[i] = float(q[(long)r * (long)q_strides[1] + hq * (long)q_strides[2] + e]) * (scale * r_tau[r]);
   } else {
     tg[i] = 0.0f;
   }
@@ -97,21 +115,21 @@ if (s0 < s1) {
     simdgroup_float8x8 P[NHT];
     UNR for (int h = 0; h < NHT; ++h) {
       const int idx = int(fm) + 8 * h;
-      const int r = idx / GQA;
+      const int r = min(idx / GQA, SROWS - 1);
       const int gi = idx % GQA;
       const long hq = (long)hkv * GQA + gi;
-      const int da = Tk + r - ra;
-      const int db = Tk + r - rb;
+      const int da = Tk + r_depth[r] - ra;
+      const int db = Tk + r_depth[r] - rb;
       const bool a_ok = (idx < M) && a_in && (WINDOW == 0 || da < WINDOW);
       const bool b_ok = (idx < M) && b_in && (WINDOW == 0 || db < WINDOW);
       float x0 = -INFINITY, x1 = -INFINITY;
       if (a_ok) {
         x0 = S[h].thread_elements()[0];
-        if (da < R) x0 += float(rel[((long)r * HQ + hq) * R + da]);
+        if (da < R) x0 += float(rel[((long)r * HQ + hq) * R + da]) * r_tau[r];
       }
       if (b_ok) {
         x1 = S[h].thread_elements()[1];
-        if (db < R) x1 += float(rel[((long)r * HQ + hq) * R + db]);
+        if (db < R) x1 += float(rel[((long)r * HQ + hq) * R + db]) * r_tau[r];
       }
       float mx = max(x0, x1);
       mx = max(mx, simd_shuffle_xor(mx, 1));
@@ -165,7 +183,8 @@ if (split == 0 && sg == 0) {
   const long kns = k_new_strides[2], vns = v_new_strides[2];
   const int ca = fn, cb = fn + 1;
   const bool ca_in = ca < SROWS, cb_in = cb < SROWS;
-  const long rca = (long)min(ca, SROWS - 1), rcb = (long)min(cb, SROWS - 1);
+  const int ca_c = min(ca, SROWS - 1), cb_c = min(cb, SROWS - 1);
+  const long rca = (long)ca_c, rcb = (long)cb_c;
   simdgroup_float8x8 S[NHT];
   UNR for (int h = 0; h < NHT; ++h) S[h] = simdgroup_float8x8(0.0f);
   UNR for (int j = 0; j < NDK; ++j) {
@@ -182,21 +201,23 @@ if (split == 0 && sg == 0) {
   simdgroup_float8x8 P[NHT];
   UNR for (int h = 0; h < NHT; ++h) {
     const int idx = int(fm) + 8 * h;
-    const int r = idx / GQA;
+    const int r = min(idx / GQA, SROWS - 1);
     const int gi = idx % GQA;
     const long hq = (long)hkv * GQA + gi;
-    const bool a_ok = (idx < M) && ca_in && (ca <= r);
-    const bool b_ok = (idx < M) && cb_in && (cb <= r);
+    const bool vis_a = TREE ? (((r_mask[r] >> ca_c) & 1u) != 0u) : (ca <= r);
+    const bool vis_b = TREE ? (((r_mask[r] >> cb_c) & 1u) != 0u) : (cb <= r);
+    const int da = r_depth[r] - r_depth[ca_c];
+    const int db = r_depth[r] - r_depth[cb_c];
+    const bool a_ok = (idx < M) && ca_in && vis_a && da >= 0 && (WINDOW == 0 || da < WINDOW);
+    const bool b_ok = (idx < M) && cb_in && vis_b && db >= 0 && (WINDOW == 0 || db < WINDOW);
     float x0 = -INFINITY, x1 = -INFINITY;
     if (a_ok) {
       x0 = S[h].thread_elements()[0];
-      const int da = r - ca;
-      if (da < R) x0 += float(rel[((long)r * HQ + hq) * R + da]);
+      if (da < R) x0 += float(rel[((long)r * HQ + hq) * R + da]) * r_tau[r];
     }
     if (b_ok) {
       x1 = S[h].thread_elements()[1];
-      const int db = r - cb;
-      if (db < R) x1 += float(rel[((long)r * HQ + hq) * R + db]);
+      if (db < R) x1 += float(rel[((long)r * HQ + hq) * R + db]) * r_tau[r];
     }
     float mx = max(x0, x1);
     mx = max(mx, simd_shuffle_xor(mx, 1));

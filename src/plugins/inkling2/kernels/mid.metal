@@ -18,18 +18,31 @@ constexpr uint NSG = TG / 32;
 constexpr uint NS = NB + BOUND + 1;
 constexpr uint R1 = 1 + NS + MSG;
 const uint SW = ST_shape[2];
+const uint RPS = OP_shape[1] / ST_shape[0];
+const uint slot = row / RPS;
+const uint pos = row % RPS;
 threadgroup float red1[NSG * R1];
 threadgroup float red2[NSG];
+// The folds of the SIMD groups' partial sums, each by one thread in the order every thread used to run it.
+threadgroup float fold1[R1];
+threadgroup float fold2[1];
 float acc[R1];
 float res[D / TG];
 for (uint r = 0; r < R1; r++) acc[r] = 0.0f;
 for (uint i = t, k = 0; i < D; i += TG, k++) {
     const float x = float(OP[ro + i]);
     float y = 0.0f;
-    // Tap j reads row `row + j` of [ST | the rows]; SEQ 0: tap j of [the row's own ST | the row].
+    // Tap j reads row `pos + j` of [the slot's ST | its rows], or walks PARENT on a tree.
     for (uint j = 0; j < KT; j++) {
-        const bool old = SEQ ? row + j < KT - 1 : j + 1 < KT;
-        y += (old ? ST[(SEQ ? row + j : row * (KT - 1) + j) * SW + OFF + i] : float(OP[(SEQ ? row + j - (KT - 1) : row) * D + i])) * float(AW[i * KT + j]);
+        int p;
+        if constexpr (TREE) {
+            p = int(pos);
+            for (uint stp = 0; stp < KT - 1 - j; ++stp) p = (p >= 0) ? PARENT[slot * RPS + uint(p)] : (p - 1);
+        } else {
+            p = int(pos) + int(j) - int(KT - 1);
+        }
+        const float wv = (p < 0) ? ST[(slot * (KT - 1) + uint(int(KT - 1) + p)) * SW + OFF + i] : float(OP[(slot * RPS + uint(p)) * D + i]);
+        y += wv * float(AW[i * KT + j]);
     }
     y = float(WT(y));
     float r = float(T((y + x) * PR[0]));
@@ -47,11 +60,13 @@ for (uint r = 0; r < R1; r++) {
     if (lane == 0) red1[sg * R1 + r] = acc[r];
 }
 threadgroup_barrier(mem_flags::mem_threadgroup);
-for (uint r = 0; r < R1; r++) {
+for (uint r = t; r < R1; r += TG) {
     float s = 0.0f;
     for (uint g = 0; g < NSG; g++) s += red1[g * R1 + r];
-    acc[r] = s;
+    fold1[r] = s;
 }
+threadgroup_barrier(mem_flags::mem_threadgroup);
+for (uint r = 0; r < R1; r++) acc[r] = fold1[r];
 const float rs = metal::precise::rsqrt(acc[0] / float(D) + 1e-6f);
 acc[NS] *= rs;
 float w[NS];
@@ -72,9 +87,13 @@ for (uint i = t, k = 0; i < D; i += TG, k++) {
 ss = simd_sum(ss);
 if (lane == 0) red2[sg] = ss;
 threadgroup_barrier(mem_flags::mem_threadgroup);
-ss = 0.0f;
-for (uint g = 0; g < NSG; g++) ss += red2[g];
-ss /= float(D);
+if (t == 0) {
+    float s = 0.0f;
+    for (uint g = 0; g < NSG; g++) s += red2[g];
+    fold2[0] = s;
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+ss = fold2[0] / float(D);
 RES[ro + e] = res[e / TG];
 if (MSG) {
     M[ro + e] = mine;
