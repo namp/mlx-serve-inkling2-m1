@@ -1,7 +1,7 @@
 // Inkling 2, barrier-free down projections and weighted sum across all KSEL experts in one launch; with TAIL
-// (one row) the MLP's short conv and residual add too. grid (32, D / ROWS, S), threadgroup (32, BG, 1):
-// each SIMD group owns ROWS output columns of one token row and sweeps all KSEL * (I / 16) chunks with zero
-// threadgroup barriers and zero idle SIMD lanes (8 * 72 = 576 = 18 * 32 on Inkling-2-Mini).
+// (one row) the MLP's short conv, residual add, and 1-row conv-state update NST too. grid (32, D / ROWS, S),
+// threadgroup (32, BG, 1): each SIMD group owns ROWS output columns of one token row and sweeps all KSEL * (I / 16)
+// chunks with zero threadgroup barriers and zero idle SIMD lanes (8 * 72 = 576 = 18 * 32 on Inkling-2-Mini).
 // FMT == 0 hoists 2^22 into sc_cache and uses fma() directly over uint2 groups -> 237 GB/s on M1 Max.
 const uint lane = thread_index_in_simdgroup;
 const uint row0 = thread_position_in_grid.y * ROWS;
@@ -60,14 +60,11 @@ if (FMT == 0) {
         const uint ex = ex_cache[e];
         const float ws = sc_cache[e];
         const device vec<T, 4>* xp = (const device vec<T, 4>*)(ACT + size_t(p) * I + c * 16);
-        float xr[16];
-        for (uint v = 0; v < 4; v++) {
-            const vec<T, 4> x4 = xp[v];
-            xr[4 * v + 0] = float(x4[0]);
-            xr[4 * v + 1] = float(x4[1]);
-            xr[4 * v + 2] = float(x4[2]);
-            xr[4 * v + 3] = float(x4[3]);
-        }
+        const float4 v0 = float4(xp[0]), v1 = float4(xp[1]), v2 = float4(xp[2]), v3 = float4(xp[3]);
+        float xr[16] = {
+            v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w,
+            v2.x, v2.y, v2.z, v2.w, v3.x, v3.y, v3.z, v3.w,
+        };
         const size_t base = size_t(ex) * D + row0;
         if (FMT == 3) {
             const device uchar* arow = (const device uchar*)WQ + base * WBR;
@@ -94,6 +91,21 @@ for (uint r = 0; r < ROWS; r++) {
             for (uint j = 0; j < KT; j++) y += ((j + 1 < KT) ? ST[j * SW + OFF + col] : float(xm)) * float(MW[col * KT + j]);
             y = float(WT(y));
             HOUT[col] = T(RES[col] + float(T((y + float(xm)) * PR[0])));
+            for (uint j = 0; j + 1 < KT - 1; j++) NST[j * SW + OFF + col] = ST[(j + 1) * SW + OFF + col];
+            NST[(KT - 2) * SW + OFF + col] = float(xm);
         }
+    }
+}
+if (TAIL && srow == 0) {
+    const uint gid = thread_position_in_grid.y * 32 + lane;
+    const uint stride = (D / ROWS) * 32;
+    const uint C = KP_shape[2];
+    for (uint col = gid; col < OFF; col += stride) {
+        for (uint j = 0; j + 1 < KT - 1; j++) NST[j * SW + col] = ST[(j + 1) * SW + col];
+        float val;
+        if (col < C) val = float(KP[col]);
+        else if (col < 2 * C) val = float(VP[col - C]);
+        else val = float(OP[col - 2 * C]);
+        NST[(KT - 2) * SW + col] = val;
     }
 }

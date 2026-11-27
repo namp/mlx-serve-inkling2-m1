@@ -649,12 +649,11 @@ pub const KVCache = struct {
     /// A grow: the capacity to allocate, and which of the current rows move into it.
     const Grow = struct { cap: c_int, drop: usize, kept: usize };
 
-    /// Rows a `ringTail` keeps past the window: a next prompt matches a few tokens short of the last one's end.
-    pub const tail_slack = 32;
+    pub const tail_slack = @import("../config/sliding_ring.zig").tail_slack;
 
     /// A sliding ring drops rows in whole blocks of this many, so a whole-buffer view keeps the absolute key-block
     /// boundaries of the hd-256 band kernel (`attn256.metal` BK) and sums as a full buffer does, bit for bit.
-    pub const ring_drop_align = 32;
+    pub const ring_drop_align = @import("../config/sliding_ring.zig").drop_align;
 
     /// The grow a write of `new_len` rows needs, or null. A sliding ring carries only its newest
     /// `keep` rows (up to one drop block more) across and ignores the request's reservation, which sizes a full buffer.

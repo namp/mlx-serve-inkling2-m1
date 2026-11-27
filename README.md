@@ -1,12 +1,35 @@
 # mlx-serve-inkling2-m1
 
-Apple M1 / M2 optimizations for **Inkling 2 Mini (`inkling2_loop`)** — developed and tested on an **Apple M1 Max (64 GB)** with **Inkling 2 Mini Uncensored** (and compatible with any Inkling 2 Mini MLX/canonical checkpoint) on top of [ddalcu/mlx-serve](https://github.com/ddalcu/mlx-serve) (`7f41957`, including [PR #1331](https://github.com/ddalcu/mlx-serve/pull/1331), MIT License), plus a virtually lossless Q4-attention / Q6-head requantization tool, Lucebox Fast `o_proj` graft tool, and streaming SSE reasoning fix.
+Apple M1 / M2 optimizations for **Inkling 2 Mini (`inkling2_loop`)** — developed and tested on an **Apple M1 Max (64 GB)** with **Inkling 2 Mini Uncensored** (and compatible with any Inkling 2 Mini MLX/canonical checkpoint) on top of [ddalcu/mlx-serve](https://github.com/ddalcu/mlx-serve) **`v26.11.4`** (`45df50e`, MIT License), plus a virtually lossless Q4-attention / Q6-head requantization tool, Lucebox Fast `o_proj` graft tool, and streaming SSE reasoning fix.
 
-> **Upstream credit & license:** Rebased onto [ddalcu/mlx-serve](https://github.com/ddalcu/mlx-serve) commit `7f41957007ab21a15c4371e3f53e93c27d1b39e8` (incorporating [PR #1331](https://github.com/ddalcu/mlx-serve/pull/1331) by David Dalcu — GPU DFlash 2 best-first tree verification, fused Metal vision tower, `At.joinQuant` 64-row padding, and prefix-cache respell fixes), preserved under the original [MIT License](LICENSE) (see [NOTICE](NOTICE) and [README_UPSTREAM.md](README_UPSTREAM.md) for full upstream documentation). Grouped expert deduplication ideas were adapted for Apple M1/M2 from [dangxingyu/megakernel-zoo](https://github.com/dangxingyu/megakernel-zoo) (`engines/inkling-2-mini_m5max`); native Inkling-2-Mini DFlash 2 contract details follow [incoai/Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) and [ARahim3/mlx-dspark](https://github.com/ARahim3/mlx-dspark); the anti-overthinking `o_proj` graft tool extracts Apache-2.0 deltas from [Lucebox/Inkling-2-Mini-Fast-GGUF](https://huggingface.co/Lucebox/Inkling-2-Mini-Fast-GGUF); attention loop unrolling, native FP16 NVFP4 prefill GEMM design, and LoopCD contrastive decoding (`arXiv:2610.02185`) with thinking-block exclusion were inspired by [jundot/omlx](https://github.com/jundot/omlx) v0.8.4 (`#5623`, `#5632`, `#5617`, `#5640`). No model weights are distributed in this repository.
+> **Upstream credit & license:** Rebased onto [ddalcu/mlx-serve](https://github.com/ddalcu/mlx-serve) release **`v26.11.4`** (`45df50e`), preserved under the original [MIT License](LICENSE) (see [NOTICE](NOTICE) and [README_UPSTREAM.md](README_UPSTREAM.md) for full upstream documentation). Grouped expert deduplication ideas were adapted for Apple M1/M2 from [dangxingyu/megakernel-zoo](https://github.com/dangxingyu/megakernel-zoo) (`engines/inkling-2-mini_m5max`); native Inkling-2-Mini DFlash 2 contract details follow [incoai/Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) and [ARahim3/mlx-dspark](https://github.com/ARahim3/mlx-dspark); the anti-overthinking `o_proj` graft tool extracts Apache-2.0 deltas from [Lucebox/Inkling-2-Mini-Fast-GGUF](https://huggingface.co/Lucebox/Inkling-2-Mini-Fast-GGUF); attention loop unrolling, native FP16 NVFP4 prefill GEMM design, and LoopCD contrastive decoding (`arXiv:2610.02185`) with thinking-block exclusion were inspired by [jundot/omlx](https://github.com/jundot/omlx) v0.8.4 (`#5623`, `#5632`, `#5617`, `#5640`). No model weights are distributed in this repository.
 
 ---
 
 ## Highlights (Inkling 2 Mini Uncensored on Apple M1 Max, 64 GB, `--kv-quant 4`, `--ctx-size 1048576`)
+
+### 0. Rebase onto Upstream `v26.11.4` (`45df50e`) + M1/M2 Kernel Integration
+
+Combines 100% of our M1/M2 Inkling 2 Mini stack with upstream **`mlx-serve v26.11.4`**:
+- **Upstream `v26.11.4` wins preserved:** cached `HostGpu.launch` Metal dispatches, zero-copy donated `Spec` slack ring buffer, pre-evaluated `Body.consts`, `topk_group.metal` fused top-K + grouping (`-48` launches/verify round), `join_qkv` 6-projection fusion on sliding pass 0 (`-40` projections/step), `downs.metal` 1-row `NST` conv-state fusion (`-48` `state_kernel` launches/step) + `few_tail.metal` `STATE=1`, `relattn.metal` separate `WINDOW==0` plain loop + fused `GATED` output epilogue (`-48` `gated_kernel` launches in prefill), `oQ` pack support, Q8+SLC `markov_fold_q8` / `markov_pick_rnn`, sliding-window prefix-cache resume (`#1291`), and dynamic hot-cache memory-pressure clamping (`#1185`).
+- **M1/M2 (`gen < 15`) protections added on `v26.11.4`:**
+  - `relattn.metal` stays on `BK=16, BQ=32, TG=128` for M1/M2 (avoids upstream's `BK=32` threadgroup memory spill that regressed 8K prefill by `-11.3%` on M1 Max, while keeping upstream's `WINDOW==0` plain loop and fused `GATED` epilogue).
+  - `groupTileWidth` stays on `BM=4` for M1/M2 (keeps our `SUB8=1` 8-lane NVFP4 `downs_grp` fast path active on `s=17..64` prompts instead of falling back to `BM=8, SUB8=0`).
+  - `act.metal` / `sum.metal` `VEC4` gated on matching input/output dtypes so mixed-dtype BF16→FP16 fallback paths remain exact; `qkv_ink2` reuses 1-D `w.consts.rel_params` for `attn_scale`.
+- **Thermally-bracketed M1 Max A/B** (`Prev 7f41957+M1 A1` → **`v26.11.4 + M1`** → `Prev 7f41957+M1 A2`, 25s cooldowns, Q4 KV + DFlash 2 `W=8`, `--prefix-cache-entries 0`, isolated `:18086`):
+
+| Workload | Prev `7f41957+M1` Mean (`A1`/`A2`) | **`v26.11.4 + M1`** | Delta vs Mean |
+|---|---:|---:|---:|
+| **`code_t0` (`T=0`, 256t)** | `35.3 tok/s` (`41.7` / `28.9`) | **`39.8 tok/s`** | **+12.8%** |
+| **`code_t1` (`T=1.0`, 256t)** | `31.9 tok/s` (`35.7` / `28.1`) | **`37.0 tok/s`** | **+16.0%** |
+| **`math_t0` (`T=0`, 256t)** | `33.7 tok/s` (`37.6` / `29.8`) | **`36.3 tok/s`** | **+7.7%** |
+| **`math_t1` (`T=1.0`, 256t)** | `34.4 tok/s` (`38.7` / `30.1`) | **`35.1 tok/s`** | **+2.1%** |
+| **`edit_t0` (`T=0`, copy, 256t)** | `33.0 tok/s` (`37.2` / `28.7`) | **`38.7 tok/s`** (`34/34` copy accepts) | **+17.3%** |
+| **`pp_2k` (`2,179` tok)** | `234.5 tok/s` (`262.5` / `206.5`) | **`238.4 tok/s`** | **+1.7%** |
+| **`pp_8k` (`8,278` tok)** | `212.5 tok/s` (`239.5` / `185.6`) | **`214.6 tok/s`** | **+1.0%** |
+| **Pure serial (`INKLING_NO_DRAFT=1 --no-pld`, cool)** | `54.8 tok/s` (`54.0` / `55.6`) | **`53.2 tok/s`** (`54.7` / `51.6`) | ~parity |
+
+*(All `143` `inkling2` unit/proof/contract tests pass with `0` failures; `--loopcd-skip-thinking` live-verified on 54 visits.)*
 
 ### 1. Native FP16 NVFP4 Prefill GEMM (`S >= 64`) + Unrolled Attention + LoopCD (`--loopcd-skip-thinking`)
 

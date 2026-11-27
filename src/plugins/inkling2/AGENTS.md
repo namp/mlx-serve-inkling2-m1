@@ -29,8 +29,8 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
 - Every read in `plugin.zig` names its tensor twice, mlx-lm's name then the release's (`At`). Same tensors, so both
   layouts serve the same greedy text, which holds only while the release's per-expert multiplier is computed in the
   converter's order of operations (`amax x 2688 / den`, then `/ 2688`): `amax / den` is one ulp off.
-- Refused by name: oMLX's oQ layout (`model.embed`, `attn.in_proj`), a `quant_method` other than the release's
-  `modelopt`, shared experts, a variable loop, a sliding geometry other than the global one.
+- Refused by name: a `quant_method` other than the release's `modelopt`, shared experts, a variable loop, a sliding
+  geometry other than the global one.
 
 ## Rules
 
@@ -50,9 +50,12 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
   value still enters P V at weight 0 in its 32-key tile: a NaN there reaches the row.
 - **Reads of at most `small_rows` rows build a mask (`relmask.metal`) and use MLX's attention**, which beats the flash
   kernel (`relattn.metal`, mlx-lm's, MIT: 16 keys at a time on one threadgroup) at a few rows' latency.
-- **2 to `packed_rows` rows (63) read the packed expert banks in place, their picks GROUPED by expert** (`group`: tiles
-  of up to 4 picks; `ups_grp`, `downs_grp`, then `few_tail`): an expert's bytes are decoded once a tile. One row reads
-  `ups`/`downs`; MLX's gather wins only from 64 rows (its sorted tiles start there; under it, it reads a bank a pick).
+- **2 to `packed_rows` rows (64) read the packed expert banks in place, their picks GROUPED by expert** (`group`: tiles
+  of up to 4 picks for <= 128 picks, 8 past that; `ups_grp`, `downs_grp`, `few_tail`): an expert's bytes are decoded once a tile.
+  One row reads `ups`/`downs`; MLX's gather wins only past 64 rows.
+- **Non-NAX wide-tile sorted MoE prefill (`moeWide`, `tile_scan.metal` + `moe_wide.metal`)**: serves non-NAX Apple9+
+  from `moe_wide_min_rows` (1536, covering 2048/4096 chunks) with fused soft-capped SwiGLU and direct `rmap` reads;
+  below 1536 per-expert tiles underfill and stock sorted `gather_qmm` is faster.
 - **2 to 16 rows read the keys on the NAX tensor unit in one pass** (`relsplit_nax.metal`, `splitReadNax`; up to four
   slots' blocks a launch, `splitReadNaxLanes`: a kernel takes 31 buffers). `relsplit.metal` serves a GPU without NAX, its
   splits joined in `relcomb` (normalised after the sum: contract gate 4). Under 4 KB of keys MLX binds them `constant`: old path.
@@ -69,7 +72,7 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
 - **A verify's rows (2 to `open_rows`) read the cache where it lies, their own keys a second source of `relsplit`**,
   `split_rows` a launch: joined to the cache, every global visit copied all of it, and past 8 rows the mask path
   walked the keys once per row and head (at 32K a ninth row cost more than the eight before it).
-- **A few-row f32 dot stays in a kernel** (`routerRows`, `gate`'s dots, 2 to `small_rows` rows): on NAX, MLX's f32
+- **A few-row f32 dot stays in a kernel** (`routerRows`, `gate`'s dots, 2 to `packed_rows` rows): on NAX, MLX's f32
   matmul past one row is TF32 (~1e-3) at ~7x a row's latency; its one-row path is exact.
 - **A kernel is more exact than its op chain**, and on the random fixture a last bit flips an expert pick:
   rows-against-one-row proofs hold on the CPU stream, a GPU proof compares forwards of the same width (batched: a
@@ -115,12 +118,15 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
 - **The draft head loads on Apple9+ only, with the kernels on** (`draftsOn`, told to the engine by `NativeDrafter.active`):
   on an M1 a few-row verify costs so much more than a step that drafted decode ran under serial, and only the kernels
   serve a verified or batched visit (`MLX_SERVE_INKLING2_FUSED=0` also batches no slots).
+- **A one-row read of a quantized cache runs off the packed words** (`layers.packedRead`: the SDK's decode kernel under a bias a
+  head and the sinks, from `KV_ATTN_FUSED_MIN_TK` keys; on NAX too, where only this read takes the simdgroup-matrix kernel):
+  dense, every global visit dequantized its whole cache each token (-30% at 32K). `auto` engages it from an 8192-token prompt.
 - **A sliding visit keeps a ring of window + 2048 rows** (`Config.ring`, declared as `CacheFacts.sliding_ring`;
   `layers.appendKv` at every append): kept whole, the 40 sliding visits held several times the KV a long prompt needs, and every
   prefix-cache entry with it. A match more than the slack behind an entry's end then misses.
-- **The draft head's Markov chain runs three launches a step** (`markovStep`: `markov_rnn`, `markov_fold`,
-  `markov_pick`) and picks in MLX's argmax order (a NaN first, the lower index on ties); `draft.markov`'s op chain
-  serves any other stream or dtype and is the proof's reference.
+- **The draft head's 3 layers and Markov chain**: `draft_bits = 8` joins `q|k|v`, `k_ctx|v_ctx`, `gate|up` and quantizes
+  the layers to affine 8-bit g64; `fold` is group-64 uint8+f16 (`markov_fold_q8.metal`, `~55 MB < 96 MB` SLC) and
+  `markov_pick_rnn.metal` fuses pick + next-step RNN (`LAW=0` greedy, `LAW=1` Gumbel-max + parallel law probs). `draft.markov`'s op chain is the proof reference.
 - **Batched decode**: slots are rows with their own cache and conv state (`attendSlots`, `state.get`/`put`); their
   reads run as one `relslots` launch per 8 slots (each slot's K, V and K's strides a buffer: a kernel takes 31) into
   `relcomb`. A CPU stream or several rows a slot run a slot at a time.
@@ -128,12 +134,11 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
 - **A verify of several slots is ONE forward** (`openGroup`, `Spec.opens`, `NativeDrafter.verify_group`/`finish_group`): blocks stack
   `rows` a slot (shorter ones padded), the conv kernels read `RPS` rows behind each slot's own state, `attendOpen` reads each
   slot's own cache, `commitLane` keeps a slot's accepted rows. A slot's rows equal its verify alone (proof test).
-- **The DFlash2 draft batches across slots** (`draftBatch`, `pickBatch`): dense work over every lane's rows, attention
-  per lane over its own context; it differs from a lane alone by matmul tiling (cosine 0.95+) and accepts the same.
-  The bundled head drafts a slot at a time.
-- **A DFlash2 group's width is the GPU's, the bundled head's 2** (`groupWidth`, `NativeDrafter.group_width`): 16 with NAX,
-  8 elsewhere; past it the slots decode plain in the batched group. The head keeps too few drafts a grouped round for a
-  wider group to beat the plain batched steps it replaces.
+- **Both drafters batch across slots** (`dflash2.draftBatch`, `draft.draftBatchPacked`, `draft.draftBatchSampled`): dense
+  work over every lane's rows, attention per lane over its own context; `stepGroupBundled` runs greedy and sampled
+  bundled groups in one GPU sync with adaptive width (`bundledGroupRows`) and `markov_fold_batch` sharing one `FOLD` read per 8 lanes.
+- **Group widths (`groupWidth`, `NativeDrafter.group_width`)**: DFlash2 takes `max_open` (16) on NAX, 8 elsewhere;
+  the bundled head takes 8 on NAX (batched draft + BM=8 grouped MoE), 2 elsewhere.
 - **A quantized pack's joined projections are whole 64-row tiles** (`At.joinQuant`: zero rows behind the parts, `widths`
   the parts alone): the tensor unit's quantized matmul takes no other output width, and a verify's rows fell to a slow lane.
 - **The q, k and v gates' down projections are a matmul a gate from 16 rows** (`gateDowns`): MLX's batched matmul leaves
@@ -141,6 +146,11 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
 
 ## Packs and proof
 
+- oMLX's oQ packs (`model.embed`, `mlx-community/Inkling-2-Mini-oQ4e-mtp`) load as they are (`At.oq`): mlx-lm's
+  tensors under `oqLeaf`'s names, the projections off one input cut from one row-joined weight (`cutRows`; a sliding
+  layer's `in_proj` is q, k, v, r, gate, sink), a looped layer's gates and message queries stacked under the layer.
+  Its `quantization` block is keyed by its own names; its gates' down projection, widened to f32, is held at the
+  pack's float width (the norms'), so it serves the mlx-lm pack's greedy text.
 - The release needs no conversion. `tests/convert_inkling2.py --bits 4|5|6|8|16` writes mlx-lm's layout with the
   attention, embedding and head affine (the experts keep the release's bytes) and copies the draft head: at 4 bits
   its names, dtypes and shapes equal `mlx-community/Inkling-2-Mini-4bit`'s.
@@ -152,12 +162,15 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
   place (`ups`/`downs` FMT 3), more go through MLX's gather. Score a pack with `tests/inkling2_kld.py`: no bf16 experts.
 - **An fp16 gather is for affine banks only** (`gatherRowsDtype`, GPUs before Apple9 that lack bf16): NVFP4 and MXFP8
   raw outputs carry the per-expert multiplier's inverse and overflow fp16 (the answer was `!!`).
-- `proof_test.zig`: whole == chunked == stepwise on the tiny looped fixture (CPU), planted state mutations, the media
+- `proof_test.zig`: whole == chunked == stepwise on the tiny looped fixture (CPU), the fixture in oQ's layout against
+  mlx-lm's bit for bit (dense and quantized), planted state mutations, the media
   splice, a verified block's commit, batched slots against each slot alone (CPU) or reordered and re-neighboured
   (GPU), and each kernel against its chain.
 - `contract.zig`: `gated`, `state`, `relmask`, `act`, `sum`, `topk`, `gate` (its one-row arm), `relsplit`, `relattn_nax`,
-  `relcomb`, `relslots`, `markov_rnn`, `markov_fold`, `markov_pick`, `oproj`, `router`, `norm`.
+  `relcomb`, `relslots`, `markov_rnn`, `markov_fold`, `markov_pick`, `markov_fold_batch`, `markov_pick_batch`,
+  `markov_pick_sample`, `oproj`, `router`, `norm`.
 - Contract entries owed (GPU proofs in `proof_test.zig` cover each): `pre`, `prep`, `mid`, `ups`, `downs`, `relattn`,
-  `gate`'s prompt arm, `group`, `ups_grp`, `downs_grp`, `few_tail`, `relsplit_nax`, `relsplit_lanes`, `commit_conv`,
+  `gate`'s prompt arm, `group`, `ups_grp`, `downs_grp`, `few_tail`, `topk_group`, `tile_scan`, `moe_wide`,
+  `markov_fold_q8`, `markov_pick_rnn`, `relsplit_nax`, `relsplit_lanes`, `commit_conv`,
   `accept_tree`, `sample_tree_draw`/`_mass`/`_search`, `dflash_conv`/`_edges`/`_top16_shard`/`_top16_merge`/`_tree`.
 - Not verified: an image against mlx-lm's tower, the drafter's tokens against oMLX's.

@@ -1,8 +1,8 @@
 // Inkling 2, a few rows: the gate_up projection and soft-capped SwiGLU of the picks grouped by expert (group.metal): a tile of
-// up to 4 picks of one expert reads that expert's rows once. grid (32 * N, I / 2, 1), threadgroup (32, SGS, 1): a tile is a
-// threadgroup along x, and each half of a SIMD group (16 lanes, 16 values of x a sweep) owns one intermediate row.
+// up to BM (4 or 8) picks of one expert reads that expert's rows once. grid (32 * MAX_TILES, I / 2, 1), threadgroup (32, SGS, 1): a tile
+// is a threadgroup along x, and each half of a SIMD group (16 lanes, 16 values of x a sweep) owns one intermediate row.
 // FMT == 0 (NVFP4): direct uint2 + mlxserve_e2m1x2 + fma() + hoisted 2^22 + cnt-specialized unroll + f32 global_scale
-// before narrowing (zero FP16 overflow, ~265 GB/s on M1 Max).
+// before narrowing when PRESCALE == 1 (zero FP16 overflow, ~265 GB/s on M1 Max).
 const uint tile = threadgroup_position_in_grid.x;
 const uint exp_id = TEXP[tile];
 if (exp_id == 0xFFFFFFFFu) return;
@@ -11,34 +11,56 @@ const uint lane = thread_index_in_simdgroup;
 const uint sub = lane & 15u;
 const uint half_sg = lane >> 4;
 const uint row0 = thread_position_in_grid.y * 2u + half_sg;
-const uint p0 = TPICK[tile * 4u + 0u];
-const uint p1 = (cnt > 1u) ? TPICK[tile * 4u + 1u] : p0;
-const uint p2 = (cnt > 2u) ? TPICK[tile * 4u + 2u] : p0;
-const uint p3 = (cnt > 3u) ? TPICK[tile * 4u + 3u] : p0;
+const uint tbase = tile * uint(BM);
+const uint p0 = TPICK[tbase + 0u];
+const uint p1 = (cnt > 1u) ? TPICK[tbase + 1u] : p0;
+const uint p2 = (cnt > 2u) ? TPICK[tbase + 2u] : p0;
+const uint p3 = (cnt > 3u) ? TPICK[tbase + 3u] : p0;
+uint p4 = p0, p5 = p0, p6 = p0, p7 = p0;
+if constexpr (BM > 4) {
+    p4 = (cnt > 4u) ? TPICK[tbase + 4u] : p0;
+    p5 = (cnt > 5u) ? TPICK[tbase + 5u] : p0;
+    p6 = (cnt > 6u) ? TPICK[tbase + 6u] : p0;
+    p7 = (cnt > 7u) ? TPICK[tbase + 7u] : p0;
+}
 const uint r0 = p0 / KSEL;
 const uint r1 = p1 / KSEL;
 const uint r2 = p2 / KSEL;
 const uint r3 = p3 / KSEL;
+uint r4 = r0, r5 = r0, r6 = r0, r7 = r0;
+if constexpr (BM > 4) {
+    r4 = p4 / KSEL;
+    r5 = p5 / KSEL;
+    r6 = p6 / KSEL;
+    r7 = p7 / KSEL;
+}
 
 constexpr uint WPR = FMT == 2 ? K / 4 : K / 8;
 constexpr uint WBR = K * BITS / 8;
 constexpr uint SPR = K / GS;
 const size_t base = size_t(exp_id) * (2 * I) + 2 * row0;
 
-float ag0 = 0.0f, ag1 = 0.0f, ag2 = 0.0f, ag3 = 0.0f;
-float au0 = 0.0f, au1 = 0.0f, au2 = 0.0f, au3 = 0.0f;
+#define SUM16(v) do { \
+    v += simd_shuffle_xor(v, 8); \
+    v += simd_shuffle_xor(v, 4); \
+    v += simd_shuffle_xor(v, 2); \
+    v += simd_shuffle_xor(v, 1); \
+} while (0)
 
-if (FMT == 0) {
+float ag0 = 0.0f, ag1 = 0.0f, ag2 = 0.0f, ag3 = 0.0f, ag4 = 0.0f, ag5 = 0.0f, ag6 = 0.0f, ag7 = 0.0f;
+float au0 = 0.0f, au1 = 0.0f, au2 = 0.0f, au3 = 0.0f, au4 = 0.0f, au5 = 0.0f, au6 = 0.0f, au7 = 0.0f;
+
+if constexpr (FMT == 0) {
     const device uint2* wrow = (const device uint2*)(WQ + base * WPR);
     const device uchar* srow = (const device uchar*)WS + base * SPR;
     constexpr uint NG = K / 16u;
-    const device T* xs[4] = {
-        X + size_t(r0) * K,
-        X + size_t(r1) * K,
-        X + size_t(r2) * K,
-        X + size_t(r3) * K
+    const device T* xs[8] = {
+        X + size_t(r0) * K, X + size_t(r1) * K, X + size_t(r2) * K, X + size_t(r3) * K,
+        X + size_t(r4) * K, X + size_t(r5) * K, X + size_t(r6) * K, X + size_t(r7) * K
     };
-    float acc[2][4] = { { 0.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 0.0f } };
+    float acc[2][BM];
+    for (uint r = 0; r < 2; r++)
+        for (uint i = 0; i < uint(BM); i++) acc[r][i] = 0.0f;
 #define INK2_UG_LOOP(N) \
     for (uint g = sub; g < NG; g += 16u) { \
         vec<T, 4> xv0[N], xv1[N], xv2[N], xv3[N]; \
@@ -69,10 +91,41 @@ if (FMT == 0) {
     if (cnt == 1u) { INK2_UG_LOOP(1) }
     else if (cnt == 2u) { INK2_UG_LOOP(2) }
     else if (cnt == 3u) { INK2_UG_LOOP(3) }
-    else { INK2_UG_LOOP(4) }
+    else if (cnt == 4u || BM <= 4) { INK2_UG_LOOP(4) }
+    else {
+        if constexpr (BM > 4) {
+            for (uint g = sub; g < NG; g += 16u) {
+                for (uint r = 0; r < 2; r++) {
+                    const uint2 q = wrow[r * NG + g];
+                    const float sf = mlxserve_fp4_scale(uint(srow[r * SPR + g]));
+                    const float2 f0 = mlxserve_e2m1x2(q.x, 0), f1 = mlxserve_e2m1x2(q.x, 1);
+                    const float2 f2 = mlxserve_e2m1x2(q.x, 2), f3 = mlxserve_e2m1x2(q.x, 3);
+                    const float2 h0 = mlxserve_e2m1x2(q.y, 0), h1 = mlxserve_e2m1x2(q.y, 1);
+                    const float2 h2 = mlxserve_e2m1x2(q.y, 2), h3 = mlxserve_e2m1x2(q.y, 3);
+                    for (uint i = 0; i < cnt; i++) {
+                        const device vec<T, 4>* xp = (const device vec<T, 4>*)(xs[i] + g * 16u);
+                        const vec<T, 4> v0 = xp[0], v1 = xp[1], v2 = xp[2], v3 = xp[3];
+                        float d = fma(float(v0[0]), f0.x, float(v1[0]) * f0.y);
+                        d = fma(float(v0[1]), f1.x, fma(float(v1[1]), f1.y, d));
+                        d = fma(float(v0[2]), f2.x, fma(float(v1[2]), f2.y, d));
+                        d = fma(float(v0[3]), f3.x, fma(float(v1[3]), f3.y, d));
+                        d = fma(float(v2[0]), h0.x, fma(float(v3[0]), h0.y, d));
+                        d = fma(float(v2[1]), h1.x, fma(float(v3[1]), h1.y, d));
+                        d = fma(float(v2[2]), h2.x, fma(float(v3[2]), h2.y, d));
+                        d = fma(float(v2[3]), h3.x, fma(float(v3[3]), h3.y, d));
+                        acc[r][i] = fma(d, sf, acc[r][i]);
+                    }
+                }
+            }
+        }
+    }
 #undef INK2_UG_LOOP
     ag0 = acc[0][0]; ag1 = acc[0][1]; ag2 = acc[0][2]; ag3 = acc[0][3];
     au0 = acc[1][0]; au1 = acc[1][1]; au2 = acc[1][2]; au3 = acc[1][3];
+    if constexpr (BM > 4) {
+        ag4 = acc[0][4]; ag5 = acc[0][5]; ag6 = acc[0][6]; ag7 = acc[0][7];
+        au4 = acc[1][4]; au5 = acc[1][5]; au6 = acc[1][6]; au7 = acc[1][7];
+    }
 } else {
     const device uint* wrow_g = WQ + base * WPR;
     const device uint* wrow_u = wrow_g + WPR;
@@ -84,6 +137,35 @@ if (FMT == 0) {
     const device S* sa_u = sa_g + SPR;
     const device S* ba_g = (const device S*)WB + base * SPR;
     const device S* ba_u = ba_g + SPR;
+
+    if (cnt == 1u) {
+        const device T* x0p = X + size_t(r0) * K;
+        for (uint k = sub * 16u; k < K; k += 256u) {
+            const device vec<T, 4>* xp = (const device vec<T, 4>*)(x0p + k);
+            const float4 v0 = float4(xp[0]), v1 = float4(xp[1]), v2 = float4(xp[2]), v3 = float4(xp[3]);
+            float xr[16] = {
+                v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w,
+                v2.x, v2.y, v2.z, v2.w, v3.x, v3.y, v3.z, v3.w,
+            };
+            const uint c = k >> 4;
+            if constexpr (FMT == 3) {
+                ag0 += msv_ink2_affine_chunk<S, BITS, GS>(arow_g, sa_g, ba_g, c, xr);
+                au0 += msv_ink2_affine_chunk<S, BITS, GS>(arow_u, sa_u, ba_u, c, xr);
+            } else {
+                ag0 += msv_ink2_chunk(FMT, wrow_g, srow_g, c, xr);
+                au0 += msv_ink2_chunk(FMT, wrow_u, srow_u, c, xr);
+            }
+        }
+        SUM16(ag0); SUM16(au0);
+        if (sub == 0u) {
+            const float sc = SCALED ? SC[exp_id] : 1.0f;
+            const float g = PRESCALE ? (ag0 * sc) : (float(T(ag0)) * sc);
+            const float u = PRESCALE ? (au0 * sc) : (float(T(au0)) * sc);
+            const float capped = (precise::tanh(g * PR[0]) * PR[1]) * (precise::tanh(u * PR[2]) * PR[3]);
+            ACT[size_t(p0) * I + row0] = T(capped / (1.0f + precise::exp(-g)));
+        }
+        return;
+    }
 
     for (uint k = sub * 16u; k < K; k += 256u) {
         const uint c = k >> 4;
@@ -118,29 +200,49 @@ if (FMT == 0) {
         if (cnt > 1u) ACC_UP(r1, ag1, au1);
         if (cnt > 2u) ACC_UP(r2, ag2, au2);
         if (cnt > 3u) ACC_UP(r3, ag3, au3);
+        if constexpr (BM > 4) {
+            if (cnt > 4u) ACC_UP(r4, ag4, au4);
+            if (cnt > 5u) ACC_UP(r5, ag5, au5);
+            if (cnt > 6u) ACC_UP(r6, ag6, au6);
+            if (cnt > 7u) ACC_UP(r7, ag7, au7);
+        }
         #undef ACC_UP
     }
 }
-
-#define SUM16(v) do { \
-    v += simd_shuffle_xor(v, 8); \
-    v += simd_shuffle_xor(v, 4); \
-    v += simd_shuffle_xor(v, 2); \
-    v += simd_shuffle_xor(v, 1); \
-} while (0)
 
 SUM16(ag0); SUM16(au0);
 if (cnt > 1u) { SUM16(ag1); SUM16(au1); }
 if (cnt > 2u) { SUM16(ag2); SUM16(au2); }
 if (cnt > 3u) { SUM16(ag3); SUM16(au3); }
+if constexpr (BM > 4) {
+    if (cnt > 4u) { SUM16(ag4); SUM16(au4); }
+    if (cnt > 5u) { SUM16(ag5); SUM16(au5); }
+    if (cnt > 6u) { SUM16(ag6); SUM16(au6); }
+    if (cnt > 7u) { SUM16(ag7); SUM16(au7); }
+}
 #undef SUM16
 
 const float sc = SCALED ? SC[exp_id] : 1.0f;
 const float f_mul = (FMT == 0 ? 4194304.0f : 1.0f);
 if (sub < cnt) {
-    const float raw_g = (sub == 0u) ? ag0 : ((sub == 1u) ? ag1 : ((sub == 2u) ? ag2 : ag3));
-    const float raw_u = (sub == 0u) ? au0 : ((sub == 1u) ? au1 : ((sub == 2u) ? au2 : au3));
-    const uint pk = (sub == 0u) ? p0 : ((sub == 1u) ? p1 : ((sub == 2u) ? p2 : p3));
+    float raw_g, raw_u;
+    uint pk;
+    if constexpr (BM > 4) {
+        switch (sub) {
+            case 0u: raw_g = ag0; raw_u = au0; pk = p0; break;
+            case 1u: raw_g = ag1; raw_u = au1; pk = p1; break;
+            case 2u: raw_g = ag2; raw_u = au2; pk = p2; break;
+            case 3u: raw_g = ag3; raw_u = au3; pk = p3; break;
+            case 4u: raw_g = ag4; raw_u = au4; pk = p4; break;
+            case 5u: raw_g = ag5; raw_u = au5; pk = p5; break;
+            case 6u: raw_g = ag6; raw_u = au6; pk = p6; break;
+            default: raw_g = ag7; raw_u = au7; pk = p7; break;
+        }
+    } else {
+        raw_g = (sub == 0u) ? ag0 : ((sub == 1u) ? ag1 : ((sub == 2u) ? ag2 : ag3));
+        raw_u = (sub == 0u) ? au0 : ((sub == 1u) ? au1 : ((sub == 2u) ? au2 : au3));
+        pk = (sub == 0u) ? p0 : ((sub == 1u) ? p1 : ((sub == 2u) ? p2 : p3));
+    }
     const float g = PRESCALE ? (raw_g * f_mul * sc) : (float(T(raw_g * f_mul)) * sc);
     const float u = PRESCALE ? (raw_u * f_mul * sc) : (float(T(raw_u * f_mul)) * sc);
     const float capped = (precise::tanh(g * PR[0]) * PR[1]) * (precise::tanh(u * PR[2]) * PR[3]);

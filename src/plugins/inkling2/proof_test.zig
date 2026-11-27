@@ -14,6 +14,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const conformance = @import("../../sdk/testing/conformance.zig");
 const test_cache = @import("../../sdk/testing/cache_ops.zig");
 const fixture = @import("../../sdk/testing/fixture.zig");
+const Tensors = @import("../../sdk/testing/tensors.zig").Tensors;
 const parity = @import("../../sdk/testing/parity.zig");
 const run = @import("../../sdk/bases/run.zig");
 const head_block = @import("../../sdk/bases/blocks/head.zig");
@@ -205,6 +206,166 @@ test "inkling2 pack: a quantized joined projection is whole tiles and serves eac
             try expectClose(try L.join_q.part(&g, y, i), try layers.projectRows(&g, part, x), 2e-2, "joined part");
         }
     }
+}
+
+/// The fixture's tensors (mlx-lm's layout) as oMLX's oQ layout stores them: renamed, the projections off one input
+/// joined along their rows, a looped layer's gates and message queries stacked under the layer.
+fn oqLayout(a: std.mem.Allocator, tensors: []const fixture.Tensor) ![]fixture.Tensor {
+    const H = 64;
+    const RANK = 8;
+    const lm = "model.language_model.";
+    const Pack = struct {
+        a: std.mem.Allocator,
+        by: std.StringHashMap(fixture.Tensor),
+        out: std.ArrayList(fixture.Tensor) = .empty,
+
+        fn get(p: *@This(), layer: ?usize, leaf: []const u8) !?fixture.Tensor {
+            const name = if (layer) |i| try std.fmt.allocPrint(p.a, lm ++ "layers.{d}.{s}", .{ i, leaf }) else try std.fmt.allocPrint(p.a, lm ++ "{s}", .{leaf});
+            return p.by.get(name);
+        }
+
+        fn put(p: *@This(), layer: ?usize, leaf: []const u8, shape: []const u64, data: []const f32) !void {
+            const name = if (layer) |i| try std.fmt.allocPrint(p.a, "model.layers.{d}.{s}", .{ i, leaf }) else try p.a.dupe(u8, leaf);
+            try p.out.append(p.a, .{ .name = name, .shape = try p.a.dupe(u64, shape), .data = data });
+        }
+
+        /// `leaves` joined along their rows as `dst`.
+        fn join(p: *@This(), layer: usize, dst: []const u8, leaves: []const []const u8) !void {
+            var data: std.ArrayList(f32) = .empty;
+            for (leaves) |leaf| try data.appendSlice(p.a, (try p.get(layer, leaf)).?.data);
+            try p.put(layer, dst, &.{ data.items.len / H, H }, data.items);
+        }
+    };
+    var p: Pack = .{ .a = a, .by = .init(a) };
+    for (tensors) |t| try p.by.put(t.name, t);
+    try p.put(null, "lm_head.weight", &.{ 64, H }, p.by.get("lm_head.weight").?.data);
+    inline for (.{ .{ "embed_tokens.weight", "model.embed.weight" }, .{ "embed_norm.weight", "model.embed_norm.weight" }, .{ "norm.weight", "model.norm.weight" } }) |r| {
+        const t = (try p.get(null, r[0])).?;
+        try p.put(null, r[1], t.shape, t.data);
+    }
+    try p.put(null, "model.final_input.query", &.{ 1, H }, (try p.get(null, "final_input.query")).?.data);
+    const message = (try p.get(null, "message_input.query")).?.data;
+    const renames = [_][2][]const u8{
+        .{ "attention_input.query", "attn_input.query" },             .{ "mlp_input.query", "mlp_input.query" },
+        .{ "input_layernorm.weight", "attn_norm.weight" },            .{ "q_input_layernorm.weight", "q_input_norm.weight" },
+        .{ "k_input_layernorm.weight", "k_input_norm.weight" },       .{ "v_input_layernorm.weight", "v_input_norm.weight" },
+        .{ "post_attention_layernorm.weight", "mlp_norm.weight" },    .{ "self_attn.o_proj.weight", "attn.o_proj.weight" },
+        .{ "self_attn.q_l2_clip.scale", "attn.q_scale" },             .{ "self_attn.rel_l2_clip.scale", "attn.r_scale" },
+        .{ "self_attn.rel_logits_proj.proj", "attn.rel_proj" },       .{ "self_attn.k_sconv.static_weight", "attn.k_static" },
+        .{ "self_attn.v_sconv.static_weight", "attn.v_static" },      .{ "self_attn.k_sconv.conv1d.weight", "attn.k_conv" },
+        .{ "self_attn.v_sconv.conv1d.weight", "attn.v_conv" },        .{ "post_attention_convolution.conv1d.weight", "attn_conv" },
+        .{ "post_mlp_convolution.conv1d.weight", "mlp_conv" },        .{ "mlp.gate.weight", "mlp.router_weight" },
+        .{ "mlp.gate.e_score_correction_bias", "mlp.router_bias" },   .{ "mlp.experts.gate_up_proj.weight", "mlp.experts.w13.weight" },
+        .{ "mlp.experts.down_proj.weight", "mlp.experts.w2.weight" },
+    };
+    for (0..8) |i| {
+        for (renames) |r| if (try p.get(i, r[0])) |t| {
+            // oQ drops a kernel's trailing axis and keeps a lone query as one row.
+            const shape: []const u64 = if (std.mem.endsWith(u8, r[0], "conv1d.weight")) t.shape[0..2] else if (t.shape.len == 1 and std.mem.endsWith(u8, r[0], "query")) &.{ 1, H } else t.shape;
+            try p.put(i, r[1], shape, t.data);
+        };
+        const A = "self_attn.";
+        if (try p.get(i, "input_layernorm.weight") != null) {
+            try p.join(i, "attn.in_proj.weight", &.{ A ++ "q_proj.weight", A ++ "k_proj.weight", A ++ "v_proj.weight", A ++ "r_proj.weight", A ++ "gate_proj.weight", A ++ "sink_proj.weight" });
+        } else {
+            try p.join(i, "attn.q_proj.weight", &.{ A ++ "q_proj.weight", A ++ "r_proj.weight", A ++ "gate_proj.weight", A ++ "sink_proj.weight" });
+            try p.join(i, "attn.k_proj.weight", &.{ A ++ "k_proj.weight", A ++ "k_sconv.weight_proj.weight" });
+            try p.join(i, "attn.v_proj.weight", &.{ A ++ "v_proj.weight", A ++ "v_sconv.weight_proj.weight" });
+        }
+        if (try p.get(i, "q_message_gate.down_proj.weight") == null) continue;
+        const down = try a.alloc(f32, 4 * 2 * H * RANK);
+        const both = try a.alloc(f32, 4 * RANK * 2 * H);
+        inline for (.{ "q", "k", "v", "mlp" }, 0..) |x, g| {
+            const d = (try p.get(i, x ++ "_message_gate.down_proj.weight")).?.data;
+            const gain = (try p.get(i, x ++ "_message_gate.message_gate_proj.weight")).?.data;
+            const forget = (try p.get(i, x ++ "_message_gate.forget_gate_proj.weight")).?.data;
+            for (0..RANK) |r| for (0..2 * H) |c| {
+                down[((g * 2 + c / H) * H + c % H) * RANK + r] = d[r * 2 * H + c];
+                both[(g * RANK + r) * 2 * H + c] = if (c < H) gain[c * RANK + r] else forget[(c - H) * RANK + r];
+            };
+        }
+        try p.put(i, "loop_down", &.{ 4, 2, H, RANK }, down);
+        try p.put(i, "loop_gain_forget", &.{ 4, RANK, 2 * H }, both);
+        try p.put(i, "loop_message.query", &.{ 4, H }, message[(i - 2) * 4 * H ..][0 .. 4 * H]);
+    }
+    return p.out.items;
+}
+
+/// `tensors` as a quantized pack stores them: the attention projections, the embedding and the head affine in groups
+/// of 32 (4 bits in layers 1 and 4, 8 elsewhere; bf16 scales and biases), the norms and the message gates' down
+/// projections bf16 (oQ's `loop_down` holds those bf16 values as f32), the rest f32.
+fn quantizedPack(a: std.mem.Allocator, tensors: []const fixture.Tensor) ![]u8 {
+    var t = Tensors.init(a, 0);
+    for (tensors) |x| {
+        const n = x.name;
+        const attn_proj = std.mem.indexOf(u8, n, "attn.") != null and std.mem.endsWith(u8, n, "_proj.weight");
+        if (attn_proj or std.mem.endsWith(u8, n, "embed.weight") or std.mem.endsWith(u8, n, "embed_tokens.weight") or std.mem.eql(u8, n, "lm_head.weight")) {
+            const bits: u32 = if (std.mem.indexOf(u8, n, "layers.1.") != null or std.mem.indexOf(u8, n, "layers.4.") != null) 4 else 8;
+            const levels: f32 = @floatFromInt((@as(u32, 1) << @intCast(bits)) - 1);
+            const codes = try a.alloc(u32, x.data.len * bits / 32);
+            @memset(codes, 0);
+            const scales = try a.alloc(f32, x.data.len / 32);
+            const biases = try a.alloc(f32, x.data.len / 32);
+            for (scales, biases, 0..) |*s, *b, g| {
+                const v = x.data[g * 32 ..][0..32];
+                b.* = std.mem.min(f32, v);
+                s.* = (std.mem.max(f32, v) - b.*) / levels;
+                for (v, g * 32..) |e, k| codes[k * bits / 32] |= @as(u32, @intFromFloat(@min(levels, @round((e - b.*) / s.*)))) << @intCast(k * bits % 32);
+            }
+            const base = n[0 .. n.len - ".weight".len];
+            try t.put("{s}.weight", .{base}, .U32, &.{ x.shape[0], x.shape[1] * bits / 32 }, std.mem.sliceAsBytes(codes));
+            try t.values("{s}.scales", .{base}, &.{ x.shape[0], x.shape[1] / 32 }, .BF16, scales);
+            try t.values("{s}.biases", .{base}, &.{ x.shape[0], x.shape[1] / 32 }, .BF16, biases);
+        } else if (std.mem.endsWith(u8, n, "norm.weight") or std.mem.endsWith(u8, n, "message_gate.down_proj.weight")) {
+            try t.values("{s}", .{n}, x.shape, .BF16, x.data);
+        } else if (std.mem.endsWith(u8, n, "loop_down")) {
+            // Rounded to bf16 (nearest even), as the bf16 file holds it.
+            const wide = try a.alloc(f32, x.data.len);
+            for (wide, x.data) |*w, e| {
+                const u: u32 = @bitCast(e);
+                w.* = @bitCast((u + 0x7fff + ((u >> 16) & 1)) & 0xffff_0000);
+            }
+            try t.values("{s}", .{n}, x.shape, .F32, wide);
+        } else try t.values("{s}", .{n}, x.shape, .F32, x.data);
+    }
+    return t.bytes();
+}
+
+/// The whole prompt's rows from the fixture with `weights` (safetensors bytes) in place of its own.
+fn wholeRows(a: std.mem.Allocator, gpu: bool, weights: []const u8) ![]f32 {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var fx = try plugin.conformanceFixture(arena.allocator());
+    const files = try arena.allocator().dupe(fixture.File, fx.files);
+    files[1].bytes = weights;
+    fx.files = files;
+    var pack = try conformance.Loaded.openWith(testing.io, arena.allocator(), plugin.plugin.name, &plugin.table, fx, .{ .gpu = gpu });
+    defer pack.close();
+    var cache = try test_cache.TestCache.init(a, pack.parsed.shell.num_hidden_layers);
+    defer cache.deinit();
+    return step(a, &pack, &cache, &prompt, 0, .all_rows);
+}
+
+// Bar: the fixture as oMLX's oQ layout stores it serves the bytes the mlx-lm layout serves for a prompt's rows, dense
+// and quantized as packs ship, on the CPU's stream and the GPU's.
+test "inkling2 proof: oMLX's oQ layout serves the mlx-lm layout's rows, bit for bit" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ar = arena.allocator();
+    const lm = try plugin.fixtureTensors(ar);
+    const oq = try oqLayout(ar, lm);
+    const packs = [_][2][]const u8{
+        .{ try fixture.safetensors(ar, lm), try fixture.safetensors(ar, oq) },
+        .{ try quantizedPack(ar, lm), try quantizedPack(ar, oq) },
+    };
+    for (streams()) |gpu| for (packs) |p| {
+        const want = try wholeRows(a, gpu, p[0]);
+        defer a.free(want);
+        const got = try wholeRows(a, gpu, p[1]);
+        defer a.free(got);
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(got));
+    };
 }
 
 /// The release parsed and loaded through the plugin table (its defaults), for the tests that run it.
@@ -1205,6 +1366,52 @@ test "inkling2 kernels: the mid kernels serve the values of the chain they repla
     };
 }
 
+// Bar: wide forwards (`S >= 64`) use the 1-TG-per-row stream kernels (including multi-element-per-thread `D/TG > 1`)
+// and route looped visits via GEMM (`s > packed_rows`), matching the chain `layers.pre` and `layers.mid`.
+test "inkling2 kernels: wide prefill 1-TG stream kernels and looped router GEMM match the chain" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var s = try Stage.init(a);
+    defer s.deinit();
+    const body = s.body;
+    const cfg = &body.cfg;
+    const hidden: c_int = @intCast(cfg.hidden_size);
+    const taps: c_int = @intCast(cfg.sconv_kernel);
+    const q_dim: c_int = @intCast(cfg.num_attention_heads * cfg.head_dim);
+    const saved_tg = kernels.stream_threads;
+    defer kernels.stream_threads = saved_tg;
+    // Fixture hidden=64, so stream_threads=32 exercises D/TG = 2 in ONE_TG=1 mode.
+    kernels.stream_threads = 32;
+    const rows: c_int = kernels.packed_rows + 1;
+    var seed: u64 = 5700;
+    for (stage_cases) |case| {
+        const L = &body.layers[case.layer];
+        var g = ops.Graph.init(a, fx_stream);
+        defer g.deinit();
+        seed += 20;
+        const h = try randomRow(&g, a, seed, &.{ 1, rows, hidden }, 1.0, .bfloat16);
+        const blocks: ?ops.Array = if (case.blocks > 0) try randomRow(&g, a, seed + 1, &.{ 1, rows, case.blocks, hidden }, 1.0, .float32) else null;
+        const bank_arr: ?[2]ops.Array = if (case.messages) .{
+            try randomRow(&g, a, seed + 2, &.{ 1, rows, 3, hidden }, 1.0, .float32),
+            try randomRow(&g, a, seed + 3, &.{ 1, rows, hidden }, 1.0, .float32),
+        } else null;
+        const got_pre = try kernels.pre(&g, L, body, h, blocks, bank_arr);
+        const msgs_want: ?ops.Array = if (bank_arr) |bk| try layers.messagesFor(&g, L, bk[0], bk[1]) else null;
+        const want_pre = try layers.project(&g, L, body, h, blocks, msgs_want);
+        try expectClose(got_pre.normed, want_pre.normed, 1e-4, "wide pre normed");
+        try expectClose(got_pre.proj[0], want_pre.proj[0], 5e-2, "wide pre q_proj");
+
+        const attn = try randomRow(&g, a, seed + 4, &.{ 1, rows, q_dim }, 1.0, .bfloat16);
+        const st = try randomRow(&g, a, seed + 5, &.{ 1, taps - 1, 2 * @as(c_int, @intCast(cfg.kvDim())) + 2 * hidden }, 1.0, .float32);
+        const got_mid = try kernels.mid(&g, L, body, attn, null, h, got_pre.normed, blocks, st, got_pre.messages);
+        const want_mid = try layers.mid(&g, L, body, attn, try g.astype(h, .float32), want_pre.normed, blocks, st, msgs_want);
+        try expectClose(got_mid.residual, want_mid.residual, 0.1, "wide mid residual");
+        try expectClose(got_mid.x, want_mid.x, 0.1, "wide mid x");
+        const want_scores = try g.matmul(try g.astype(got_mid.x, .float32), try g.transpose(L.router, &.{ 1, 0 }));
+        try expectClose(got_mid.scores, want_scores, 1e-5, "wide looped router scores");
+    }
+}
+
 fn hostValues(a: std.mem.Allocator, g: *ops.Graph, x: ops.Array) ![]f32 {
     return conformance.consumeF32(a, .{ .ctx = g.escape(try g.astype(try g.contiguous(x), .float32)).ctx });
 }
@@ -1368,7 +1575,7 @@ test "inkling2 kernels: the gate_up launch ranks the router's picks as the top-k
 }
 
 // Bar: the packed kernels take an affine bank at every width a pack may be re-quantized to, read in place.
-// Bar: the pick grouping tiles every pick once, each tile holding at most four picks of one expert, the used tiles first.
+// Bar: the pick grouping tiles every pick once, each tile holding at most BM (4 for <= 128 picks, 8 past that) picks of one expert, the used tiles first.
 test "inkling2 kernels: the pick grouping tiles each pick once, an expert at a time" {
     if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const a = testing.allocator;
@@ -1376,20 +1583,22 @@ test "inkling2 kernels: the pick grouping tiles each pick once, an expert at a t
     var prng = std.Random.DefaultPrng.init(0x6d1);
     const rng = prng.random();
     const experts = 128;
-    for ([_]usize{ 16, 40, 64, 128 }) |n| for ([_]u32{ 1, 3, 9, experts }) |pool| {
+    for ([_]usize{ 16, 40, 64, 128, 160, 256 }) |n| for ([_]u32{ 1, 3, 9, experts }) |pool| {
         var g = ops.Graph.init(a, fx_stream);
         defer g.deinit();
-        var picks: [128]i32 = undefined;
+        var picks: [256]i32 = undefined;
         for (picks[0..n]) |*p| p.* = @intCast(rng.uintLessThan(u32, pool));
         const sel = try g.astype(try g.fromSlice(i32, picks[0..n], &.{@intCast(n)}), .uint32);
+        const bm: usize = @intCast(kernels.groupTileWidth(@intCast(n)));
         const grp = try kernels.groupPicks(&g, sel, experts);
         try ops.evalMany(&grp);
-        const tile_expert = mlx.mlx_array_data_uint32(grp[0]).?[0..n];
-        const tile_picks = mlx.mlx_array_data_uint32(grp[1]).?[0..n];
-        const pick_at = mlx.mlx_array_data_uint32(grp[2]).?[0 .. 4 * n];
-        var seen: [128]bool = @splat(false);
+        const max_tiles: usize = @intCast(ops.shape(grp[0])[0]);
+        const tile_expert = mlx.mlx_array_data_uint32(grp[0]).?[0..max_tiles];
+        const tile_picks = mlx.mlx_array_data_uint32(grp[1]).?[0..max_tiles];
+        const pick_at = mlx.mlx_array_data_uint32(grp[2]).?[0 .. bm * max_tiles];
+        var seen: [256]bool = @splat(false);
         var tiles: usize = 0;
-        for (0..n) |t| {
+        for (0..max_tiles) |t| {
             if (tile_expert[t] == 0xFFFFFFFF) {
                 try testing.expectEqual(@as(u32, 0), tile_picks[t]);
                 continue;
@@ -1397,8 +1606,8 @@ test "inkling2 kernels: the pick grouping tiles each pick once, an expert at a t
             // The used tiles come first.
             try testing.expectEqual(t, tiles);
             tiles += 1;
-            try testing.expect(tile_picks[t] >= 1 and tile_picks[t] <= 4);
-            for (pick_at[4 * t ..][0..tile_picks[t]]) |p| {
+            try testing.expect(tile_picks[t] >= 1 and tile_picks[t] <= bm);
+            for (pick_at[bm * t ..][0..tile_picks[t]]) |p| {
                 try testing.expect(p < n and !seen[p]);
                 seen[p] = true;
                 try testing.expectEqual(tile_expert[t], @as(u32, @intCast(picks[p])));
@@ -1408,7 +1617,7 @@ test "inkling2 kernels: the pick grouping tiles each pick once, an expert at a t
         var count: [experts]usize = @splat(0);
         for (picks[0..n]) |p| count[@intCast(p)] += 1;
         var want: usize = 0;
-        for (count) |c| want += (c + 3) / 4;
+        for (count) |c| want += (c + bm - 1) / bm;
         try testing.expectEqual(want, tiles);
     };
 }
@@ -2001,11 +2210,21 @@ test "inkling2 draft: rounds that carry the context keys and values draft what f
     };
     const one = try g.ones(&.{H}, dt);
     var layer: draft.Layer = .{
-        .in_norm = one, .post_norm = one, .mix_norm = one,
-        .q = try lin.of(&g, a, &seed, 2 * HD, H), .k = try lin.of(&g, a, &seed, HD, H), .v = try lin.of(&g, a, &seed, HD, H), .o = try lin.of(&g, a, &seed, H, 2 * HD),
-        .k_ctx = try lin.of(&g, a, &seed, HD, H), .v_ctx = try lin.of(&g, a, &seed, HD, H),
-        .q_norm = try g.ones(&.{HD}, dt), .k_norm = try g.ones(&.{HD}, dt), .k_norm_ctx = try g.ones(&.{HD}, dt),
-        .gate = try lin.of(&g, a, &seed, 48, H), .up = try lin.of(&g, a, &seed, 48, H), .down = try lin.of(&g, a, &seed, H, 48),
+        .in_norm = one,
+        .post_norm = one,
+        .mix_norm = one,
+        .q = try lin.of(&g, a, &seed, 2 * HD, H),
+        .k = try lin.of(&g, a, &seed, HD, H),
+        .v = try lin.of(&g, a, &seed, HD, H),
+        .o = try lin.of(&g, a, &seed, H, 2 * HD),
+        .k_ctx = try lin.of(&g, a, &seed, HD, H),
+        .v_ctx = try lin.of(&g, a, &seed, HD, H),
+        .q_norm = try g.ones(&.{HD}, dt),
+        .k_norm = try g.ones(&.{HD}, dt),
+        .k_norm_ctx = try g.ones(&.{HD}, dt),
+        .gate = try lin.of(&g, a, &seed, 48, H),
+        .up = try lin.of(&g, a, &seed, 48, H),
+        .down = try lin.of(&g, a, &seed, H, 48),
     };
     var d: draft.Drafter = .{
         .cfg = .{ .layers = 1, .heads = 2, .kv_heads = 1, .head_dim = HD, .intermediate = 48, .window = 13, .block = 4, .rank = R, .tap_count = 2 },
@@ -2066,11 +2285,21 @@ test "inkling2 draft: a layer outside local_layer_ids reads every committed posi
         }
         fn layer(gr: *ops.Graph, al: std.mem.Allocator, sd: *u64, one: ops.Array, ones_hd: ops.Array) !draft.Layer {
             return .{
-                .in_norm = one, .post_norm = one, .mix_norm = one,
-                .q = try lin(gr, al, sd, 2 * HD, H), .k = try lin(gr, al, sd, HD, H), .v = try lin(gr, al, sd, HD, H), .o = try lin(gr, al, sd, H, 2 * HD),
-                .k_ctx = try lin(gr, al, sd, HD, H), .v_ctx = try lin(gr, al, sd, HD, H),
-                .q_norm = ones_hd, .k_norm = ones_hd, .k_norm_ctx = ones_hd,
-                .gate = try lin(gr, al, sd, 48, H), .up = try lin(gr, al, sd, 48, H), .down = try lin(gr, al, sd, H, 48),
+                .in_norm = one,
+                .post_norm = one,
+                .mix_norm = one,
+                .q = try lin(gr, al, sd, 2 * HD, H),
+                .k = try lin(gr, al, sd, HD, H),
+                .v = try lin(gr, al, sd, HD, H),
+                .o = try lin(gr, al, sd, H, 2 * HD),
+                .k_ctx = try lin(gr, al, sd, HD, H),
+                .v_ctx = try lin(gr, al, sd, HD, H),
+                .q_norm = ones_hd,
+                .k_norm = ones_hd,
+                .k_norm_ctx = ones_hd,
+                .gate = try lin(gr, al, sd, 48, H),
+                .up = try lin(gr, al, sd, 48, H),
+                .down = try lin(gr, al, sd, H, 48),
             };
         }
     };
@@ -2730,10 +2959,9 @@ test "inkling2 kernels: sampleAndAcceptTree greedy, filtering, and exact multi-c
     }
 }
 
-// Bar: the bundled head keeps too few drafts a round for a group past two slots to beat plain batched decode; the
-// DFlash2 draft's groups pay to the GPU's width.
-test "inkling2 plugin: a group of the bundled head's slots is two wide, of DFlash2's the GPU's" {
-    try testing.expectEqual(@as(u32, 2), plugin.groupWidth(false, true));
+// Bar: the bundled head's groups run up to 8 slots on NAX (2 elsewhere); DFlash2's run to the GPU's width.
+test "inkling2 plugin: a group of the bundled head's slots is 8 wide on NAX (2 elsewhere), of DFlash2's the GPU's" {
+    try testing.expectEqual(@as(u32, 8), plugin.groupWidth(false, true));
     try testing.expectEqual(@as(u32, 2), plugin.groupWidth(false, false));
     try testing.expectEqual(@as(u32, 16), plugin.groupWidth(true, true));
     try testing.expectEqual(@as(u32, 8), plugin.groupWidth(true, false));
@@ -2808,6 +3036,778 @@ test "inkling2 load: decode steps lift the command-buffer MB split, prompts and 
     } else |_| {}
     try testing.expectEqual(@as(i32, 77), Limits.mb_split);
     try testing.expectEqual(@as(i32, 50), Limits.op_split);
+}
+
+// Bar: `draftBatchPacked` matches serial `draft()` across 4 lanes on GPU (bf16 fused Markov path) with carried
+// `ContextKv` caches and different positions, and produces valid normalized distributions in sampled mode.
+test "inkling2 draft: draftBatchPacked matches serial draft across lanes (greedy and sampled)" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const saved = fx_stream;
+    fx_stream = mlx.gpuStream();
+    defer fx_stream = saved;
+    var g = ops.Graph.init(a, fx_stream);
+    defer g.deinit();
+    const H = 64;
+    const HD = 16;
+    const V = 64;
+    const R = 16;
+    const dt: ops.Dtype = .bfloat16;
+    var seed: u64 = 93000;
+    const W = struct {
+        fn of(gr: *ops.Graph, al: std.mem.Allocator, sd: *u64, shape: []const c_int, scale: f32) !ops.Array {
+            sd.* += 1;
+            return randomRow(gr, al, sd.*, shape, scale, dt);
+        }
+    };
+    const lin = struct {
+        fn of(gr: *ops.Graph, al: std.mem.Allocator, sd: *u64, out: c_int, in: c_int) !layers.Linear {
+            return .{ .w = try W.of(gr, al, sd, &.{ out, in }, 0.15) };
+        }
+    };
+    const one = try g.ones(&.{H}, dt);
+    const one32 = try g.ones(&.{H}, .float32);
+    var layer: draft.Layer = .{
+        .in_norm = one,
+        .post_norm = one,
+        .mix_norm = one32,
+        .q = try lin.of(&g, a, &seed, 2 * HD, H),
+        .k = try lin.of(&g, a, &seed, HD, H),
+        .v = try lin.of(&g, a, &seed, HD, H),
+        .o = try lin.of(&g, a, &seed, H, 2 * HD),
+        .k_ctx = try lin.of(&g, a, &seed, HD, H),
+        .v_ctx = try lin.of(&g, a, &seed, HD, H),
+        .q_norm = try g.ones(&.{HD}, dt),
+        .k_norm = try g.ones(&.{HD}, dt),
+        .k_norm_ctx = try g.ones(&.{HD}, dt),
+        .gate = try lin.of(&g, a, &seed, 96, H),
+        .up = try lin.of(&g, a, &seed, 96, H),
+        .down = try lin.of(&g, a, &seed, H, 96),
+    };
+    layer.qkv = .{ .w = try g.concat(&.{ layer.q.w, layer.k.w, layer.v.w }, 0) };
+    layer.kv_ctx = .{ .w = try g.concat(&.{ layer.k_ctx.w, layer.v_ctx.w }, 0) };
+    layer.gate_up = .{ .w = try g.concat(&.{ layer.gate.w, layer.up.w }, 0) };
+    var d: draft.Drafter = .{
+        .cfg = .{ .layers = 1, .heads = 2, .kv_heads = 1, .head_dim = HD, .intermediate = 96, .window = 16, .block = 5, .rank = R, .tap_count = 2 },
+        .hidden = H,
+        .s = fx_stream,
+    };
+    d.layers = (&layer)[0..1];
+    d.norm = one;
+    d.mask = try W.of(&g, a, &seed, &.{ 1, 1, H }, 0.8);
+    d.alpha = try g.softmax(try randomRow(&g, a, seed + 1, &.{ 2, 2, 1 }, 1.0, .float32), 1, true);
+    d.prev_rows = try W.of(&g, a, &seed, &.{ V, R }, 0.4);
+    d.rnn = .{ .w = try W.of(&g, a, &seed, &.{ 3 * R, 2 * R + 2 * H }, 0.08) };
+    d.rnn_bias = try W.of(&g, a, &seed, &.{3 * R}, 0.08);
+    d.rnn_norm = one32;
+    d.fold = try W.of(&g, a, &seed, &.{ R, V }, 0.25);
+    d.fold_bias = try W.of(&g, a, &seed, &.{ 1, 1, V }, 0.25);
+    const head = try lin.of(&g, a, &seed, V, H);
+
+    const B = 4;
+    var anchors: [B]ops.Array = undefined;
+    var t1s: [B]ops.Array = undefined;
+    var fulls: [B]ops.Array = undefined;
+    var batch_ctxs: [B]draft.ContextKv = @splat(.{});
+    var solo_ctxs: [B]draft.ContextKv = @splat(.{});
+    defer for (&batch_ctxs, &solo_ctxs) |*bc, *sc| {
+        bc.release();
+        sc.release();
+    };
+    for (0..B) |j| {
+        anchors[j] = try W.of(&g, a, &seed, &.{ 1, 1, H }, 1.0);
+        t1s[j] = try g.fromSlice(i32, &.{@intCast(3 + j * 5)}, &.{1});
+        fulls[j] = try W.of(&g, a, &seed, &.{ 1, 24, 2 * H }, 1.0);
+    }
+    const spans = [_][2]c_int{ .{ 0, 6 }, .{ 0, 10 }, .{ 4, 16 } };
+    for (spans) |sp| {
+        var lanes: [B]draft.Drafter.DraftLane = undefined;
+        for (0..B) |j| {
+            const hi = sp[1] + @as(c_int, @intCast(j));
+            const lo = @max(0, hi - 15);
+            lanes[j] = .{
+                .t1 = t1s[j],
+                .anchor = anchors[j],
+                .taps = try g.sliceAxis(fulls[j], 1, lo, hi),
+                .position = hi,
+                .cache = &batch_ctxs[j],
+                .steps = 4,
+            };
+        }
+        const got = try d.draftBatchPacked(&g, &lanes, &head, V - 4, 30, null);
+        try ops.evalMany(&.{ got.tokens, got.confidence });
+        const got_t = mlx.mlx_array_data_int32(got.tokens).?;
+        const got_c = mlx.mlx_array_data_float32(got.confidence).?;
+        for (0..B) |j| {
+            const want = try d.draft(&g, lanes[j].t1, lanes[j].anchor, lanes[j].taps, lanes[j].position, &head, V - 4, 30, &solo_ctxs[j], null);
+            try ops.evalMany(&.{ want.tokens, want.confidence });
+            const wt = mlx.mlx_array_data_int32(want.tokens).?;
+            const wc = mlx.mlx_array_data_float32(want.confidence).?;
+            for (0..4) |k| {
+                try testing.expectEqual(wt[k], got_t[j * 4 + k]);
+                try testing.expectApproxEqAbs(wc[k], got_c[j * 4 + k], 5e-2);
+            }
+        }
+    }
+    // Sampled path: probabilities normalize to 1 and each drawn token has positive probability.
+    var slanes: [B]draft.Drafter.DraftLane = undefined;
+    for (0..B) |j| slanes[j] = .{ .t1 = t1s[j], .anchor = anchors[j], .taps = try g.sliceAxis(fulls[j], 1, 0, 12), .position = 12, .cache = &batch_ctxs[j], .steps = 3 };
+    var blocks: [B]draft.Drafter.Block = undefined;
+    try d.draftBatch(&g, &slanes, &head, V - 4, 30, .{ .temperatures = &.{ 0.8, 1.0, 0.7, 1.2 }, .seed = 99 }, &blocks);
+    const vocab: usize = V - 4;
+    for (blocks) |blk| {
+        try ops.evalMany(&.{ blk.tokens, blk.probs });
+        const toks = mlx.mlx_array_data_int32(blk.tokens).?[0..3];
+        const law = mlx.mlx_array_data_float32(blk.probs).?;
+        for (0..3) |r| {
+            var sum: f32 = 0;
+            for (law[r * vocab ..][0..vocab]) |x| sum += x;
+            try testing.expectApproxEqAbs(@as(f32, 1.0), sum, 1e-3);
+            try testing.expect(law[r * vocab + @as(usize, @intCast(toks[r]))] > 0);
+        }
+    }
+    // GPU-fused sparse top-K sampled path: normalized proposal probs, drawn token matches candidate, mixed greedy+sampled.
+    if (kernels.markovRuns(&g, d.rnn.w, d.fold, R)) {
+        const s_params = [B]kernels.SampleLane{
+            .{ .temperature = 0.0 },
+            .{ .temperature = 1.0, .top_p = 0.95 },
+            .{ .temperature = 0.8, .top_k = 8 },
+            .{ .temperature = 1.2, .min_p = 0.05 },
+        };
+        const sb = try d.draftBatchSampled(&g, &slanes, &s_params, &.{ 11, 22, 33, 44 }, &head, V - 4, 30);
+        try ops.evalMany(&.{ sb.tokens, sb.cands, sb.probs, sb.draws });
+        const stoks = mlx.mlx_array_data_int32(sb.tokens).?;
+        const scands = mlx.mlx_array_data_int32(sb.cands).?;
+        const sprobs = mlx.mlx_array_data_float32(sb.probs).?;
+        const sdraws = mlx.mlx_array_data_uint8(sb.draws).?;
+        const K: usize = @intCast(sb.k);
+        for (0..B) |j| for (0..3) |r| {
+            const di = sdraws[j * 3 + r];
+            try testing.expect(di < K);
+            const row_c = scands[(j * 3 + r) * K ..][0..K];
+            const row_p = sprobs[(j * 3 + r) * K ..][0..K];
+            try testing.expectEqual(row_c[di], stoks[j * 3 + r]);
+            var sum: f32 = 0;
+            for (row_p) |p| sum += p;
+            try testing.expectApproxEqAbs(@as(f32, 1.0), sum, 1e-4);
+            try testing.expect(row_p[di] > 0);
+        };
+        // Dense common-token block: 4 peaks inside the first 16 tokens must all appear in top-K for both NB=2 and NB=8.
+        for ([_]c_int{ 2, 6 }) |nb_test| {
+            const tv: c_int = 128;
+            const p0 = try g.zeros(&.{ nb_test, 3 * R }, .float32);
+            const fold0 = try g.zeros(&.{ R, tv }, .bfloat16);
+            const fb0 = try g.zeros(&.{ 1, 1, tv }, .bfloat16);
+            const base_buf = try a.alloc(f32, @intCast(nb_test * tv));
+            defer a.free(base_buf);
+            @memset(base_buf, -5.0);
+            for (0..@intCast(nb_test)) |b_i| {
+                base_buf[b_i * @as(usize, @intCast(tv)) + 3] = 9.0;
+                base_buf[b_i * @as(usize, @intCast(tv)) + 7] = 8.5;
+                base_buf[b_i * @as(usize, @intCast(tv)) + 11] = 8.0;
+                base_buf[b_i * @as(usize, @intCast(tv)) + 15] = 7.5;
+            }
+            const base0 = try g.fromSlice(f32, base_buf, &.{ nb_test, 1, tv });
+            const step0 = try g.fromSlice(i32, &.{0}, &.{1});
+            const cap0 = try g.fromSlice(f32, &.{30.0}, &.{1});
+            const part = try kernels.markovFoldBatchSg(&g, p0, fold0, fb0, base0, step0, tv, cap0);
+            var lp6: [6 * 4]f32 = undefined;
+            for (0..6) |bi| {
+                lp6[bi * 4 + 0] = 1.0;
+                lp6[bi * 4 + 1] = 0.0;
+                lp6[bi * 4 + 2] = 0.95;
+                lp6[bi * 4 + 3] = 0.0;
+            }
+            const lparams_arr = try g.fromSlice(f32, lp6[0..@intCast(nb_test * 4)], &.{ nb_test, 4 });
+            const seeds_arr = try g.zeros(&.{ nb_test, 2 }, .uint32);
+            const st0 = try g.zeros(&.{ nb_test, 1, R }, .bfloat16);
+            const picked = try kernels.markovPickSample(&g, part[0], part[1], p0, st0, cap0, lparams_arr, seeds_arr, step0, kernels.markov_sample_k);
+            try ops.eval(picked.cands);
+            const cdata = mlx.mlx_array_data_int32(picked.cands).?;
+            for (0..@intCast(nb_test)) |b_i| {
+                const lane_c = cdata[b_i * K ..][0..4];
+                try testing.expectEqual(@as(i32, 3), lane_c[0]);
+                try testing.expectEqual(@as(i32, 7), lane_c[1]);
+                try testing.expectEqual(@as(i32, 11), lane_c[2]);
+                try testing.expectEqual(@as(i32, 15), lane_c[3]);
+            }
+        }
+    }
+}
+
+// Bar: `step_group` on the bundled drafter (`stepGroupBundled`) generates the exact same greedy tokens as plain
+// serial decode across 4 concurrent slots on the real Inkling-2-Mini pack.
+test "inkling2 draft: stepGroupBundled matches plain decode on the release pack" {
+    const env = @import("../../env.zig");
+    const pack_dir = std.mem.span(env.get(.INKLING2_RELEASE) orelse return error.SkipZigTest);
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var rel = try Release.open(a, pack_dir);
+    defer rel.close();
+    if (rel.m.drafter == null or rel.m.drafter2 != null) return error.SkipZigTest;
+    const nd = plugin.table.spec.?.native_drafter.?;
+    const step_group = nd.step_group.?;
+    const n_layers = rel.parsed.shell.num_hidden_layers;
+
+    const B = 4;
+    const gen_n = 16;
+    const prompts = [B][]const u32{
+        quokka_def[0..24],
+        quokka_def[0..28],
+        quokka_def[0..32],
+        quokka_def[0..36],
+    };
+
+    var want_toks: [B][gen_n]u32 = undefined;
+    var step_logits: [B][gen_n][]f32 = undefined;
+    var first_toks: [B]u32 = undefined;
+    for (0..B) |i| {
+        var c = try test_cache.TestCache.init(std.heap.c_allocator, n_layers);
+        defer c.deinit();
+        var h = [_]abi.Handle{c.handle()};
+        var out: abi.ForwardOut = .{};
+        try testing.expect(plugin.table.forward(rel.m, &.{ .mode = .prefill, .logits = .last_row, .rows = @intCast(prompts[i].len), .tokens = .of(prompts[i]), .slots = .of(&[_]u32{@intCast(100 + i)}), .positions = .of(&[_]u32{0}), .caches = .of(&h), .cache_ops = &test_cache.ops }, &out).isOk());
+        step_logits[i][0] = try conformance.consumeF32(a, out.logits);
+        first_toks[i] = argmaxOf(step_logits[i][0]);
+        var tok = first_toks[i];
+        var pos: u32 = @intCast(prompts[i].len);
+        for (0..gen_n) |t| {
+            want_toks[i][t] = tok;
+            if (t + 1 < gen_n) {
+                var o2: abi.ForwardOut = .{};
+                try testing.expect(plugin.table.forward(rel.m, &.{ .mode = .decode, .logits = .last_row, .rows = 1, .tokens = .of(&[_]u32{tok}), .slots = .of(&[_]u32{@intCast(100 + i)}), .positions = .of(&[_]u32{pos}), .caches = .of(&h), .cache_ops = &test_cache.ops }, &o2).isOk());
+                step_logits[i][t + 1] = try conformance.consumeF32(a, o2.logits);
+                tok = argmaxOf(step_logits[i][t + 1]);
+                pos += 1;
+            }
+        }
+    }
+
+    var caches: [B]test_cache.TestCache = undefined;
+    var cur_pos: [B]u32 = undefined;
+    for (0..B) |i| {
+        caches[i] = try test_cache.TestCache.init(std.heap.c_allocator, n_layers);
+        cur_pos[i] = @intCast(prompts[i].len);
+        var h = [_]abi.Handle{caches[i].handle()};
+        var out: abi.ForwardOut = .{};
+        try testing.expect(plugin.table.forward(rel.m, &.{ .mode = .prefill, .logits = .last_row, .rows = @intCast(prompts[i].len), .tokens = .of(prompts[i]), .slots = .of(&[_]u32{@intCast(200 + i)}), .positions = .of(&[_]u32{0}), .caches = .of(&h), .cache_ops = &test_cache.ops }, &out).isOk());
+        try ops.eval(.{ .ctx = out.logits.ctx });
+        _ = mlx.mlx_array_free(.{ .ctx = out.logits.ctx });
+    }
+    defer for (&caches) |*c| c.deinit();
+
+    var cur_tok: [B]u32 = first_toks;
+    var got_n: [B]usize = @splat(0);
+    var got_toks: [B][gen_n]u32 = undefined;
+    var rounds_run: usize = 0;
+    while (rounds_run < gen_n) : (rounds_run += 1) {
+        var active: [B]usize = undefined;
+        var n_act: usize = 0;
+        for (0..B) |i| if (got_n[i] < gen_n) {
+            active[n_act] = i;
+            n_act += 1;
+        };
+        if (n_act < 2) break;
+        var fs: [B]abi.Forward = undefined;
+        var outs: [B]abi.ForwardOut = @splat(.{});
+        var h_arr: [B]abi.Handle = undefined;
+        var s_arr: [B]u32 = undefined;
+        var p_arr: [B]u32 = undefined;
+        var t_arr: [B]u32 = undefined;
+        var all_cap = true;
+        for (0..n_act) |k| {
+            const i = active[k];
+            h_arr[k] = caches[i].handle();
+            s_arr[k] = @intCast(200 + i);
+            p_arr[k] = cur_pos[i];
+            t_arr[k] = cur_tok[i];
+            const rem: u32 = @intCast(gen_n - got_n[i]);
+            if (rem <= 1) all_cap = false;
+            fs[k] = .{
+                .mode = .verify,
+                .logits = .all_rows,
+                .rows = 1,
+                .tokens = .of(t_arr[k .. k + 1]),
+                .slots = .of(s_arr[k .. k + 1]),
+                .positions = .of(p_arr[k .. k + 1]),
+                .caches = .of(h_arr[k .. k + 1]),
+                .cache_ops = &test_cache.ops,
+                .accept_cap = rem -| 1,
+            };
+        }
+        if (!all_cap) break;
+        const v = step_group(rel.m, &fs, &outs, @intCast(n_act));
+        try testing.expect(v.isOk());
+        for (0..n_act) |k| {
+            const i = active[k];
+            const rd = outs[k].round;
+            try testing.expect(rd.n >= 1);
+            for (0..rd.n) |j| {
+                if (got_n[i] < gen_n) {
+                    got_toks[i][got_n[i]] = rd.tokens[j];
+                    got_n[i] += 1;
+                }
+            }
+            cur_tok[i] = rd.next_token;
+            cur_pos[i] = @intCast(rd.position);
+        }
+    }
+    for (0..B) |i| {
+        try testing.expect(got_n[i] >= 8);
+        var same: usize = 0;
+        while (same < got_n[i] and want_toks[i][same] == got_toks[i][same]) same += 1;
+        if (same < got_n[i]) {
+            try testing.expect(same >= 1);
+            const lg = step_logits[i][same];
+            const gap = lg[want_toks[i][same]] - lg[got_toks[i][same]];
+            try testing.expect(gap <= 0.01 * @abs(lg[want_toks[i][same]]));
+        }
+    }
+    // Sampled + mixed greedy/sampled bundled group: runs cleanly, accepts drafts, and respects valid vocab ids.
+    for (0..B) |i| {
+        caches[i].deinit();
+        caches[i] = try test_cache.TestCache.init(std.heap.c_allocator, n_layers);
+        cur_pos[i] = @intCast(prompts[i].len);
+        var h = [_]abi.Handle{caches[i].handle()};
+        var out: abi.ForwardOut = .{};
+        try testing.expect(plugin.table.forward(rel.m, &.{ .mode = .prefill, .logits = .last_row, .rows = @intCast(prompts[i].len), .tokens = .of(prompts[i]), .slots = .of(&[_]u32{@intCast(300 + i)}), .positions = .of(&[_]u32{0}), .caches = .of(&h), .cache_ops = &test_cache.ops }, &out).isOk());
+        try ops.eval(.{ .ctx = out.logits.ctx });
+        _ = mlx.mlx_array_free(.{ .ctx = out.logits.ctx });
+    }
+    var scur_tok: [B]u32 = first_toks;
+    var s_accepted: usize = 0;
+    const vocab_size: u32 = rel.parsed.shell.vocab_size;
+    for (0..4) |rd_i| {
+        var fs: [B]abi.Forward = undefined;
+        var outs: [B]abi.ForwardOut = @splat(.{});
+        var h_arr: [B]abi.Handle = undefined;
+        var s_arr: [B]u32 = undefined;
+        var p_arr: [B]u32 = undefined;
+        var t_arr: [B]u32 = undefined;
+        for (0..B) |i| {
+            h_arr[i] = caches[i].handle();
+            s_arr[i] = @intCast(300 + i);
+            p_arr[i] = cur_pos[i];
+            t_arr[i] = scur_tok[i];
+            fs[i] = .{
+                .mode = .verify,
+                .logits = .all_rows,
+                .rows = 1,
+                .tokens = .of(t_arr[i .. i + 1]),
+                .slots = .of(s_arr[i .. i + 1]),
+                .positions = .of(p_arr[i .. i + 1]),
+                .caches = .of(h_arr[i .. i + 1]),
+                .cache_ops = &test_cache.ops,
+                .accept_cap = 7,
+                .draft_temperature = if (i == 0) 0.0 else 1.0,
+                .draft_seed = 0x12345678 +% @as(u64, @intCast(rd_i * 17 + i)),
+                .top_p = 0.95,
+            };
+        }
+        try testing.expect(step_group(rel.m, &fs, &outs, B).isOk());
+        for (0..B) |i| {
+            const rd = outs[i].round;
+            try testing.expect(rd.n >= 1);
+            try testing.expect(rd.next_token < vocab_size);
+            for (0..rd.n) |j| try testing.expect(rd.tokens[j] < vocab_size);
+            s_accepted += rd.accepted;
+            scur_tok[i] = rd.next_token;
+            cur_pos[i] = @intCast(rd.position);
+        }
+    }
+    try testing.expect(s_accepted >= 4);
+}
+
+// Bar: when the host provides `Host.kernel` + `HostGpu.launch`, `kernels.launchGrid` builds the kernel once via the
+// host and dispatches through `HostGpu.launch` with bit-identical results; when a host refuses `launch` as unsupported,
+// it falls back to MLX's direct apply.
+test "inkling2 kernels: HostGpu.launch cache dispatches bit-identically and falls back when unsupported" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const host_abi = @import("../../abi/host.zig");
+    const FakeHost = @import("../../sdk/testing/fake_host.zig").FakeHost;
+    const Hook = struct {
+        var created: usize = 0;
+        var launched: usize = 0;
+        var made_handle: mlx.mlx_fast_metal_kernel = .{};
+        fn makeKernel(_: ?*anyopaque, desc: *const host_abi.KernelDesc) callconv(.c) ?*anyopaque {
+            created += 1;
+            if (made_handle.ctx != null) return made_handle.ctx;
+            var ins_z: [8][*:0]const u8 = undefined;
+            var outs_z: [8][*:0]const u8 = undefined;
+            var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            defer arena.deinit();
+            const aa = arena.allocator();
+            const toZ = struct {
+                fn f(al: std.mem.Allocator, bytes: []const u8) ?[*:0]const u8 {
+                    const buf = al.allocSentinel(u8, bytes.len, 0) catch return null;
+                    @memcpy(buf, bytes);
+                    return buf.ptr;
+                }
+            }.f;
+            for (desc.inputs.slice(), 0..) |s, i| ins_z[i] = toZ(aa, s.slice()) orelse return null;
+            for (desc.outputs.slice(), 0..) |s, i| outs_z[i] = toZ(aa, s.slice()) orelse return null;
+            const iv = mlx.mlx_vector_string_new_data(&ins_z, desc.inputs.len);
+            defer _ = mlx.mlx_vector_string_free(iv);
+            const ov = mlx.mlx_vector_string_new_data(&outs_z, desc.outputs.len);
+            defer _ = mlx.mlx_vector_string_free(ov);
+            const name_z = toZ(aa, desc.name.slice()) orelse return null;
+            const src_z = toZ(aa, desc.source.slice()) orelse return null;
+            const hdr_z = toZ(aa, desc.header.slice()) orelse return null;
+            made_handle = mlx.mlx_fast_metal_kernel_new(name_z, iv, ov, src_z, hdr_z, desc.ensure_row_contiguous, desc.atomic_outputs);
+            return made_handle.ctx;
+        }
+        fn runLaunch(_: ?*anyopaque, outputs: *host_abi.VectorArray, k: ?*anyopaque, inputs: host_abi.VectorArray, config: host_abi.KernelConfig, s_: host_abi.Stream) callconv(.c) host_abi.Verdict {
+            launched += 1;
+            var ov: mlx.mlx_vector_array = .{ .ctx = outputs.ctx };
+            const rc = mlx.mlx_fast_metal_kernel_apply(&ov, .{ .ctx = k }, .{ .ctx = inputs.ctx }, .{ .ctx = config.ctx }, .{ .ctx = s_.ctx });
+            outputs.ctx = ov.ctx;
+            return if (rc == 0) .ok else host_abi.Verdict.refuse(.failed, "apply failed");
+        }
+    };
+    Hook.created = 0;
+    Hook.launched = 0;
+    Hook.made_handle = .{};
+    defer if (Hook.made_handle.ctx != null) {
+        kernels.gated_kernel.host_src = null;
+        kernels.gated_kernel.host_built = null;
+        _ = mlx.mlx_fast_metal_kernel_free(Hook.made_handle);
+        Hook.made_handle = .{};
+    };
+
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = ops.Graph.init(a, s);
+    defer g.deinit();
+    const x = try randomRow(&g, a, 7100, &.{ 1, 1, 64 }, 1.0, .bfloat16);
+    const gate = try g.sigmoid(try randomRow(&g, a, 7101, &.{64}, 1.0, .float32));
+
+    // Direct baseline (no host).
+    kernels.clearHost(null);
+    const direct = try hostValues(a, &g, try kernels.gated(&g, x, gate, 1));
+    defer a.free(direct);
+
+    // Working Host.kernel + HostGpu.launch: kernel built once, both launches go through HostGpu.launch.
+    var good: FakeHost = undefined;
+    good.init(.{});
+    good.table.kernel = Hook.makeKernel;
+    good.gpu_table.launch = Hook.runLaunch;
+    kernels.setHost(good.host());
+    defer kernels.clearHost(good.host());
+    const h1 = try hostValues(a, &g, try kernels.gated(&g, x, gate, 1));
+    defer a.free(h1);
+    const h2 = try hostValues(a, &g, try kernels.gated(&g, x, gate, 1));
+    defer a.free(h2);
+    try testing.expectEqual(@as(usize, 1), Hook.created);
+    try testing.expectEqual(@as(usize, 2), Hook.launched);
+    try testing.expectEqualSlices(f32, direct, h1);
+    try testing.expectEqualSlices(f32, direct, h2);
+
+    // Refusing FakeHost falls back cleanly to MLX's direct apply.
+    var refusing: FakeHost = undefined;
+    refusing.init(.{});
+    kernels.setHost(refusing.host());
+    defer kernels.clearHost(refusing.host());
+    const fb = try hostValues(a, &g, try kernels.gated(&g, x, gate, 1));
+    defer a.free(fb);
+    try testing.expectEqualSlices(f32, direct, fb);
+}
+
+// Bar: non-NAX wide-tile sorted MoE (`tileScan` + `moeWide`) serves NVFP4, MXFP4, MXFP8 and affine banks across BM=32
+// and BM=64, with fused soft-capped SwiGLU + RMAP gather and non-multiple-of-64 N tails, matching MLX's gather chain.
+test "inkling2 kernels: moeWide serves NVFP4, MXFP4, MXFP8 and affine banks with fused SwiGLU and rmap" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable() or device.deviceGeneration().gen < 15) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = ops.Graph.init(a, s);
+    defer g.deinit();
+
+    const E: c_int = 8;
+    const S: c_int = 96;
+    const top_k: c_int = 4;
+    const M: c_int = S * top_k;
+    const K: c_int = 128;
+    const I: c_int = 64;
+    const DN_OUT: c_int = 96; // non-multiple of 64 to exercise N-tail guard
+    const x = try randomRow(&g, a, 7200, &.{ 1, S, K }, 0.5, .bfloat16);
+    var prng = std.Random.DefaultPrng.init(7201);
+    const rng = prng.random();
+    const picks_host = try a.alloc(u32, @intCast(M));
+    defer a.free(picks_host);
+    for (picks_host) |*p| p.* = rng.uintLessThan(u32, @intCast(E));
+    const flat = try g.fromSlice(u32, picks_host, &.{M});
+    const order = try g.argsort(flat, 0);
+    const token = try g.call(mlx.mlx_floor_divide, .{ order, try g.astype(try g.scalar(@floatFromInt(top_k), .float32), ops.dtype(order)) });
+    const sel = try g.take(flat, order, 0);
+    const rmap = try g.astype(token, .uint32);
+    const x_sorted = try g.reshape(try g.take(try g.reshape(x, &.{ S, K }), token, 0), &.{ M, 1, K });
+    const caps = try g.fromSlice(f32, &.{ 1.0 / 30.0, 30.0, 1.0 / 30.0, 30.0 }, &.{4});
+    const gu_scale = try randomRow(&g, a, 7202, &.{E}, 0.5, .float32);
+
+    const formats = [_]struct { mode: QuantMode, bits: u32, group: u32, scaled: bool }{
+        .{ .mode = .nvfp4, .bits = 4, .group = 16, .scaled = true },
+        .{ .mode = .mxfp4, .bits = 4, .group = 32, .scaled = false },
+        .{ .mode = .mxfp8, .bits = 8, .group = 32, .scaled = false },
+        .{ .mode = .affine, .bits = 4, .group = 64, .scaled = false },
+        .{ .mode = .affine, .bits = 8, .group = 64, .scaled = true },
+    };
+    for (formats, 0..) |f, fi| {
+        const gu = try packedBank(&g, a, 7210 + fi * 2, &.{ E, 2 * I, K }, f.bits, f.group, f.mode);
+        const dn = try packedBank(&g, a, 7211 + fi * 2, &.{ E, DN_OUT, I }, f.bits, f.group, f.mode);
+        const sc: ops.Array = if (f.scaled) gu_scale else .{};
+
+        const gu_ref = try layers.gather(&g, x_sorted, &gu, sel, true);
+        const act_ref = try kernels.activation(&g, gu_ref, sel, if (f.scaled) gu_scale else caps, caps, f.scaled);
+        const dn_ref = try layers.gather(&g, act_ref, &dn, sel, true);
+
+        for ([_]c_int{ 32, 64 }) |bm| {
+            const tiles = try kernels.tileScan(&g, sel, @intCast(E), bm);
+            const act_got = try kernels.moeWide(&g, x, &gu, sc, tiles, rmap, caps, true);
+            const dn_got = try kernels.moeWide(&g, act_got, &dn, .{}, tiles, null, caps, false);
+            try testing.expect((try parity.maxAbsDiffF32(act_got, act_ref, s)) <= 5e-2);
+            try testing.expect((try parity.maxAbsDiffF32(dn_got, dn_ref, s)) <= 5e-2);
+        }
+    }
+}
+
+// Bar: `relativeWith` with a fused output gate matches `gated(relative(...))` bit-for-bit on both global layers past
+// distance R (exercising the plain tile loop) and sliding-window layers.
+test "inkling2 kernels: relativeWith fuses output gate and runs global plain loop past R" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = ops.Graph.init(a, s);
+    defer g.deinit();
+
+    var cfg = std.mem.zeroes(@import("config.zig").Config);
+    cfg.vocab_size = 64;
+    cfg.hidden_size = 256;
+    cfg.num_hidden_layers = 2;
+    cfg.num_attention_heads = 4;
+    cfg.num_key_value_heads = 2;
+    cfg.head_dim = 64;
+    cfg.sliding_window = 128;
+    cfg.log_n_floor = 256;
+    cfg.log_alpha = 0.0;
+    const S: c_int = 192;
+    const q = try randomRow(&g, a, 7300, &.{ 1, S, 4, 64 }, 0.3, .bfloat16);
+    const k = try randomRow(&g, a, 7301, &.{ 1, 2, S, 64 }, 0.3, .bfloat16);
+    const v = try randomRow(&g, a, 7302, &.{ 1, 2, S, 64 }, 0.3, .bfloat16);
+    const rel_states = try randomRow(&g, a, 7303, &.{ 1, S, 4, 16 }, 0.2, .bfloat16);
+    const sinks = try randomRow(&g, a, 7304, &.{ 1, S, 4 }, 0.2, .bfloat16);
+    const gate = try g.sigmoid(try randomRow(&g, a, 7305, &.{S * 4 * 64}, 1.0, .float32));
+    var L: layers.Layer = undefined;
+    L.rel_proj = try randomRow(&g, a, 7306, &.{ 16, 64 }, 0.1, .float32);
+    L.rel_proj_t = .{};
+
+    for ([_]bool{ true, false }) |is_global| {
+        L.global = is_global;
+        const raw = try kernels.relative(&g, &L, &cfg, q, rel_states, sinks, k, v, 0, true);
+        const ref = try hostValues(a, &g, try kernels.gated(&g, raw, gate, S));
+        defer a.free(ref);
+        const got = try hostValues(a, &g, try kernels.relativeWith(&g, &L, &cfg, q, rel_states, sinks, k, v, 0, true, gate));
+        defer a.free(got);
+        try testing.expectEqualSlices(f32, ref, got);
+    }
+}
+
+// Bar: fused `topKGroup` produces bit-identical picks, weights and expert tile descriptors to `topK` + `groupPicks`.
+test "inkling2 kernels: topKGroup matches topK + groupPicks bit-for-bit" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = ops.Graph.init(a, s);
+    defer g.deinit();
+
+    const E: c_int = 128;
+    const KSEL: c_int = 8;
+    const rb = try randomRow(&g, a, 7500, &.{E}, 0.1, .float32);
+    const rs = try g.fromSlice(f32, &.{1.25}, &.{1});
+    for ([_]c_int{ 2, 3, 4, 8 }) |rows| {
+        const scores = try randomRow(&g, a, 7510 + @as(u64, @intCast(rows)), &.{ rows, E }, 1.0, .float32);
+        const ref_tk = try kernels.topK(&g, scores, rb, rs, KSEL);
+        const ref_gr = try kernels.groupPicks(&g, try g.reshape(ref_tk[0], &.{rows * KSEL}), @intCast(E));
+        const got = try kernels.topKGroup(&g, scores, rb, rs, KSEL, @intCast(E));
+        for ([_][2]ops.Array{
+            .{ ref_tk[0], got[0] }, .{ ref_tk[1], got[1] }, .{ ref_gr[0], got[2] }, .{ ref_gr[1], got[3] },
+        }) |pair| {
+            const rv = try hostValues(a, &g, pair[0]);
+            defer a.free(rv);
+            const gv = try hostValues(a, &g, pair[1]);
+            defer a.free(gv);
+            try testing.expectEqualSlices(f32, rv, gv);
+        }
+        const tcnt = try hostValues(a, &g, got[3]);
+        defer a.free(tcnt);
+        const rpick = try hostValues(a, &g, ref_gr[2]);
+        defer a.free(rpick);
+        const gpick = try hostValues(a, &g, got[4]);
+        defer a.free(gpick);
+        for (tcnt, 0..) |cnt_f, tile| {
+            const cnt: usize = @intFromFloat(cnt_f);
+            try testing.expectEqualSlices(f32, rpick[tile * 4 ..][0..cnt], gpick[tile * 4 ..][0..cnt]);
+        }
+    }
+}
+
+// Bar: group-64 8-bit quantized fold (`markovFoldQ8`) and fused `markovPickRnn` draft the op chain's tokens and
+// probabilities (within 2e-2) across bf16 and f16, exercising both `quantizeFold` and the 15-launch fused chain.
+test "inkling2 kernels: quantized markovFoldQ8 and fused markovPickRnn match the op chain" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const rank = 128;
+    const hidden = 128;
+    const vpad = 4096;
+    const vocab = 4000;
+    const steps = 7;
+    for ([_]ops.Dtype{ .bfloat16, .float16 }) |dt| {
+        var g = ops.Graph.init(a, s);
+        defer g.deinit();
+        const seed: u64 = if (dt == .bfloat16) 19100 else 19200;
+        var d: draft.Drafter = .{
+            .cfg = .{ .layers = 0, .heads = 1, .kv_heads = 1, .head_dim = 64, .intermediate = 1, .window = 2, .block = steps + 1, .rank = rank, .tap_count = 1 },
+            .hidden = hidden,
+            .s = s,
+        };
+        d.norm = try g.ones(&.{hidden}, dt);
+        d.prev_rows = try randomRow(&g, a, seed, &.{ vpad, rank }, 0.5, dt);
+        d.rnn = .{ .w = try randomRow(&g, a, seed + 1, &.{ 3 * rank, 2 * rank + 2 * hidden }, 0.05, dt) };
+        d.rnn_bias = try randomRow(&g, a, seed + 2, &.{3 * rank}, 0.2, dt);
+        d.fold = try randomRow(&g, a, seed + 3, &.{ rank, vpad }, 0.3, dt);
+        d.fold_bias = try randomRow(&g, a, seed + 4, &.{ 1, 1, vpad }, 0.3, dt);
+        const qf = try draft.quantizeFold(&g, d.fold, 64);
+        d.fold_q = qf[0];
+        d.fold_s = qf[1];
+        d.fold_qb = qf[2];
+        const rows = try randomRow(&g, a, seed + 5, &.{ 1, steps, hidden }, 1.0, dt);
+        const newest = try randomRow(&g, a, seed + 6, &.{ 1, 1, hidden }, 1.0, dt);
+        const base = try g.astype(try randomRow(&g, a, seed + 7, &.{ 1, steps, vpad }, 4.0, dt), .float32);
+        const t1 = try g.fromSlice(i32, &.{1777}, &.{1});
+        const want = try d.markov(&g, t1, rows, newest, base, vocab, 30, false, null);
+        const got = try d.markov(&g, t1, rows, newest, base, vocab, 30, true, null);
+        try testing.expectEqual(@as(f32, 0), try parity.maxAbsDiffF32(try g.astype(got.tokens, .float32), try g.astype(want.tokens, .float32), s));
+        try testing.expect((try parity.maxAbsDiffF32(got.confidence, want.confidence, s)) <= 2e-2);
+    }
+}
+
+// Bar: `downs_grp` fast `cnt == 1` path matches `layers.gather` across NVFP4, MXFP8 and affine 8-bit banks.
+test "inkling2 kernels: downs_grp cnt == 1 fast path matches gather across packed formats" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const E: c_int = 16;
+    const I: c_int = 256;
+    const D: c_int = 256;
+    const N: c_int = 4;
+    const ModeCase = struct { mode: QuantMode, bits: u32, gs: u32, name: [*:0]const u8 };
+    const cases = [_]ModeCase{
+        .{ .mode = .nvfp4, .bits = 4, .gs = 16, .name = "nvfp4" },
+        .{ .mode = .mxfp8, .bits = 8, .gs = 32, .name = "mxfp8" },
+        .{ .mode = .affine, .bits = 8, .gs = 64, .name = "affine" },
+    };
+    for (cases, 0..) |mc, ci| {
+        var g = ops.Graph.init(a, s);
+        defer g.deinit();
+        const raw = try randomRow(&g, a, 21000 + ci * 10, &.{ E, D, I }, 0.25, .bfloat16);
+        var parts = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(parts);
+        try mlx.check(mlx.mlx_quantize(&parts, raw, mlx.mlx_optional_int.some(@intCast(mc.gs)), mlx.mlx_optional_int.some(@intCast(mc.bits)), mc.name, .{}, s));
+        var bank: @import("../../sdk/bases/blocks/moe.zig").Bank = .{ .w = .{}, .qp = .{ .mode = mc.mode, .bits = mc.bits, .group_size = mc.gs } };
+        var w0 = mlx.mlx_array_new();
+        var s0 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(&w0, parts, 0));
+        try mlx.check(mlx.mlx_vector_array_get(&s0, parts, 1));
+        bank.w = try g.adopt(w0);
+        bank.s = try g.adopt(s0);
+        if (mc.mode == .affine) {
+            var b0 = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(&b0, parts, 2));
+            bank.b = try g.adopt(b0);
+        }
+        const act = try randomRow(&g, a, 21050 + ci * 10, &.{ N, 1, I }, 0.5, .bfloat16);
+        // Distinct experts so every tile has cnt == 1.
+        const sel = try g.fromSlice(u32, &.{ 1, 5, 9, 13 }, &.{N});
+        const grp = try kernels.groupPicks(&g, sel, @intCast(E));
+        const fmt = kernels.packedFormat(&bank, I).?;
+        const wb = if (bank.b.ctx != null) bank.b else bank.s;
+        const got = (try kernels.launchGrid(&g, &kernels.downs_grp_kernel, &.{ act, bank.w, bank.s, wb, grp[0], grp[1], grp[2], wb }, 1, .{.{ .shape = &.{ N, 1, D }, .dtype = .bfloat16 }}, .{ 32 * N, @divExact(D, 4), 1 }, .{ 32, 4, 1 }, &.{
+            .{ "T", .{ .dtype = .bfloat16 } },         .{ "I", .{ .int = I } },                          .{ "D", .{ .int = D } },
+            .{ "GS", .{ .int = @intCast(mc.gs) } },    .{ "FMT", .{ .int = fmt } },                      .{ "BITS", .{ .int = @intCast(mc.bits) } },
+            .{ "S", .{ .dtype = ops.dtype(bank.s) } }, .{ "BM", .{ .int = kernels.groupTileWidth(N) } },
+            .{ "SCALED", .{ .int = 0 } },              .{ "SUB8", .{ .int = 0 } },
+        }))[0];
+        const want = try layers.gather(&g, act, &bank, sel, false);
+        try testing.expect((try parity.maxAbsDiffF32(got, want, s)) <= 5e-2);
+    }
+}
+
+// Bar: fused sampled Markov chain (`LAW=1`: `markovFoldQ8Law` + `markovPickRnnLaw` + parallel `exp(scaled - lse)`)
+// returns valid probability rows summing to 1, assigns positive mass to each drawn token, reports `max(probs)` as
+// confidence, and collapses to exact argmax at cold temperature (1e-4).
+test "inkling2 kernels: fused LAW=1 sampled Markov chain returns valid law and cold argmax" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const saved = fx_stream;
+    fx_stream = s;
+    defer fx_stream = saved;
+    var g = ops.Graph.init(a, s);
+    defer g.deinit();
+    const rank = 128;
+    const hidden = 128;
+    const vpad = 4096;
+    const vocab = 4000;
+    const steps = 5;
+    const dt: ops.Dtype = .bfloat16;
+    var d: draft.Drafter = .{
+        .cfg = .{ .layers = 0, .heads = 1, .kv_heads = 1, .head_dim = 64, .intermediate = 1, .window = 2, .block = steps + 1, .rank = rank, .tap_count = 1 },
+        .hidden = hidden,
+        .s = s,
+    };
+    d.norm = try g.ones(&.{hidden}, dt);
+    d.prev_rows = try randomRow(&g, a, 22100, &.{ vpad, rank }, 0.5, dt);
+    d.rnn = .{ .w = try randomRow(&g, a, 22101, &.{ 3 * rank, 2 * rank + 2 * hidden }, 0.05, dt) };
+    d.rnn_bias = try randomRow(&g, a, 22102, &.{3 * rank}, 0.2, dt);
+    d.fold = try randomRow(&g, a, 22103, &.{ rank, vpad }, 0.3, dt);
+    d.fold_bias = try randomRow(&g, a, 22104, &.{ 1, 1, vpad }, 0.3, dt);
+    const qf = try draft.quantizeFold(&g, d.fold, 64);
+    d.fold_q = qf[0];
+    d.fold_s = qf[1];
+    d.fold_qb = qf[2];
+    const rows = try randomRow(&g, a, 22105, &.{ 1, steps, hidden }, 1.0, dt);
+    const newest = try randomRow(&g, a, 22106, &.{ 1, 1, hidden }, 1.0, dt);
+    const base = try g.astype(try randomRow(&g, a, 22107, &.{ 1, steps, vpad }, 4.0, dt), .float32);
+    const t1 = try g.fromSlice(i32, &.{1777}, &.{1});
+
+    const argmax = try d.markov(&g, t1, rows, newest, base, vocab, 30, true, null);
+    const cold = try d.markov(&g, t1, rows, newest, base, vocab, 30, true, .{ .temperature = 1e-4, .seed = 7 });
+    try testing.expectEqual(@as(f32, 0), try parity.maxAbsDiffF32(try g.astype(cold.tokens, .float32), try g.astype(argmax.tokens, .float32), s));
+
+    const warm = try d.markov(&g, t1, rows, newest, base, vocab, 30, true, .{ .temperature = 1.0, .seed = 11 });
+    const law = try hostValues(a, &g, warm.probs);
+    defer a.free(law);
+    const sure = try hostValues(a, &g, warm.confidence);
+    defer a.free(sure);
+    const ids = try hostValues(a, &g, try g.astype(warm.tokens, .float32));
+    defer a.free(ids);
+    try testing.expectEqual(@as(usize, steps * vocab), law.len);
+    for (0..steps) |i| {
+        const row = law[i * vocab ..][0..vocab];
+        var sum: f32 = 0;
+        for (row) |x| sum += x;
+        try testing.expectApproxEqAbs(@as(f32, 1), sum, 1e-4);
+        try testing.expect(row[@intFromFloat(ids[i])] > 0);
+        try testing.expectApproxEqAbs(std.mem.max(f32, row), sure[i], 1e-4);
+    }
 }
 
 // Bar: native FP16 NVFP4 prefill expert GEMM matches BF16 gather_qmm + f32 global_scale on skewed routing (including

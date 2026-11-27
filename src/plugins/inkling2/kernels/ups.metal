@@ -18,6 +18,7 @@ if (ROUTE) {
         sig[j] = 1.0f / (1.0f + exp(-SCR[srow0 + f]));
         key[f] = sig[j] + RB[f];
     }
+    // A NaN score ranks nowhere: every slot keeps an expert that exists.
     if (tid < KSEL) { pick[tid] = tid; raw[tid] = 0.0f; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint f = tid, j = 0; f < E; f += TGN, j++) {
@@ -92,8 +93,12 @@ if (SUB16) {
     float acc[2 * ROWS];
     for (uint r = 0; r < 2 * ROWS; r++) acc[r] = 0.0f;
     for (uint k = lane * 16; k < K; k += 512) {
-        float xr[16];
-        for (uint i = 0; i < 16; i++) xr[i] = float(x[k + i]);
+        const device vec<T, 4>* xp = (const device vec<T, 4>*)(x + k);
+        const float4 v0 = float4(xp[0]), v1 = float4(xp[1]), v2 = float4(xp[2]), v3 = float4(xp[3]);
+        float xr[16] = {
+            v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w,
+            v2.x, v2.y, v2.z, v2.w, v3.x, v3.y, v3.z, v3.w,
+        };
         for (uint r = 0; r < 2 * ROWS; r++)
             acc[r] += FMT == 3 ? msv_ink2_affine_chunk<S, BITS, GS>(arow + r * WBR, sa + r * SPR, ba + r * SPR, k / 16, xr)
                                : msv_ink2_chunk(FMT, wrow + r * WPR, srow + r * SPR, k / 16, xr);
@@ -102,6 +107,7 @@ if (SUB16) {
     for (uint r = 0; r < ROWS; r++) {
         const float g = PRESCALE ? (simd_sum(acc[2 * r]) * sc) : (float(T(simd_sum(acc[2 * r]))) * sc);
         const float u = PRESCALE ? (simd_sum(acc[2 * r + 1]) * sc) : (float(T(simd_sum(acc[2 * r + 1]))) * sc);
+        // The precise variants: the fast tanh is NaN at an infinity and a percent off near zero.
         const float capped = (precise::tanh(g * PR[0]) * PR[1]) * (precise::tanh(u * PR[2]) * PR[3]);
         if (lane == r) ACT[e * I + row0 + r] = T(capped / (1.0f + precise::exp(-g)));
     }
